@@ -173,6 +173,7 @@ void Gfx::SetTexture(u32 index, const AbstractTexture* texture)
   {
     const auto* d3d9_tex = static_cast<const D3D9Texture*>(texture);
     D3D9::device->SetTexture(index, d3d9_tex->GetD3DTexture());
+    VertexManager::s_textures_set_this_frame++;
   }
   else
   {
@@ -244,26 +245,32 @@ void Gfx::PresentBackbuffer()
   if (!D3D9::device)
     return;
 
-  // Debug: write frame stats to file
+  // Debug: write frame stats to file (every frame)
   {
     static u32 s_frame_count = 0;
     s_frame_count++;
-    if (s_frame_count <= 10)
+
+    FILE* f = fopen("d3d9_debug.txt", "a");
+    if (f)
     {
-      FILE* f = fopen("d3d9_debug.txt", "a");
-      if (f)
-      {
-        fprintf(f, "Frame %u: draws=%u, uploads=%u, indices=%u\n", s_frame_count,
-                VertexManager::s_draw_calls_this_frame, VertexManager::s_upload_calls_this_frame,
-                VertexManager::s_total_indices_this_frame);
-        fclose(f);
-      }
+      fprintf(f, "Frame %u: draws=%u, uploads=%u, indices=%u, vb_bytes=%u, ib_bytes=%u, textures=%u\n",
+              s_frame_count, VertexManager::s_draw_calls_this_frame,
+              VertexManager::s_upload_calls_this_frame,
+              VertexManager::s_total_indices_this_frame,
+              VertexManager::s_total_vb_bytes_this_frame,
+              VertexManager::s_total_ib_bytes_this_frame,
+              VertexManager::s_textures_set_this_frame);
+      fclose(f);
     }
 
     // Reset counters for next frame
     VertexManager::s_draw_calls_this_frame = 0;
     VertexManager::s_upload_calls_this_frame = 0;
     VertexManager::s_total_indices_this_frame = 0;
+    VertexManager::s_total_vb_bytes_this_frame = 0;
+    VertexManager::s_total_ib_bytes_this_frame = 0;
+    VertexManager::s_textures_set_this_frame = 0;
+    VertexManager::s_first_lock_of_frame = true;
   }
 
   // End the current frame's scene and present

@@ -26,6 +26,10 @@ namespace DX9Remix
 u32 VertexManager::s_draw_calls_this_frame = 0;
 u32 VertexManager::s_upload_calls_this_frame = 0;
 u32 VertexManager::s_total_indices_this_frame = 0;
+u32 VertexManager::s_total_vb_bytes_this_frame = 0;
+u32 VertexManager::s_total_ib_bytes_this_frame = 0;
+u32 VertexManager::s_textures_set_this_frame = 0;
+bool VertexManager::s_first_lock_of_frame = true;
 
 VertexManager::VertexManager()
 {
@@ -104,12 +108,39 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
     }
   }
 
-  // Upload vertex data
   const u32 vertex_data_size = num_vertices * vertex_stride;
+  const u32 index_data_size = num_indices * sizeof(u16);
+  s_total_vb_bytes_this_frame += vertex_data_size;
+  s_total_ib_bytes_this_frame += index_data_size;
+
+  // Ring buffer: DISCARD once at frame start (or when full), NOOVERWRITE after.
+  // This avoids the driver internally allocating a new 16 MB buffer copy on
+  // every single draw call, which was causing RTX Remix to hold ~41 GB.
+  const u32 ib_total_size = MAXIBUFFERSIZE * sizeof(u16);
+  const bool need_discard = s_first_lock_of_frame ||
+                            (m_vb_write_offset + vertex_data_size > MAXVBUFFERSIZE) ||
+                            (m_ib_write_offset + index_data_size > ib_total_size);
+
+  if (need_discard)
+  {
+    m_vb_write_offset = 0;
+    m_ib_write_offset = 0;
+    s_first_lock_of_frame = false;
+  }
+
+  const DWORD lock_flags = need_discard ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
+
+  // Record where this batch starts in the ring buffer
+  m_current_vb_stream_offset = m_vb_write_offset;
+  *out_base_vertex = 0;  // VB position handled via SetStreamSource byte offset
+  *out_base_index = m_ib_write_offset / sizeof(u16);
+
+  // Upload vertex data at current ring buffer position
   if (m_d3d9_vertex_buffer && vertex_data_size > 0)
   {
     void* vb_data = nullptr;
-    HRESULT hr = m_d3d9_vertex_buffer->Lock(0, vertex_data_size, &vb_data, D3DLOCK_DISCARD);
+    HRESULT hr = m_d3d9_vertex_buffer->Lock(m_vb_write_offset, vertex_data_size, &vb_data,
+                                            lock_flags);
     if (SUCCEEDED(hr))
     {
       std::memcpy(vb_data, m_vertex_buffer.data(), vertex_data_size);
@@ -117,18 +148,22 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
     }
   }
 
-  // Upload index data
-  const u32 index_data_size = num_indices * sizeof(u16);
+  // Upload index data at current ring buffer position
   if (m_d3d9_index_buffer && index_data_size > 0)
   {
     void* ib_data = nullptr;
-    HRESULT hr = m_d3d9_index_buffer->Lock(0, index_data_size, &ib_data, D3DLOCK_DISCARD);
+    HRESULT hr = m_d3d9_index_buffer->Lock(m_ib_write_offset, index_data_size, &ib_data,
+                                           lock_flags);
     if (SUCCEEDED(hr))
     {
       std::memcpy(ib_data, m_index_buffer.data(), index_data_size);
       m_d3d9_index_buffer->Unlock();
     }
   }
+
+  // Advance write positions for next batch
+  m_vb_write_offset += vertex_data_size;
+  m_ib_write_offset += index_data_size;
 }
 
 void VertexManager::UploadUniforms()
@@ -157,23 +192,21 @@ void VertexManager::UploadUniforms()
   D3DMATRIX proj = m_transform_decomposer.GetProjectionMatrix(xfmem.projection);
   D3D9::device->SetTransform(D3DTS_PROJECTION, &proj);
 
-  // Debug: write transforms to file
-  static u32 s_upload_count = 0;
-  s_upload_count++;
-  if (s_upload_count <= 5)
+  // Debug: write transforms to file (first upload per frame only, to avoid spam)
+  if (s_upload_calls_this_frame == 1)
   {
     FILE* f = fopen("d3d9_debug.txt", "a");
     if (f)
     {
       fprintf(f,
-              "UploadUniforms #%u: mtx_idx=%u, proj_type=%u\n"
+              "  Upload: mtx_idx=%u, proj_type=%u\n"
               "  View: [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f "
               "%.3f %.3f %.3f]\n"
               "  World: [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f "
               "%.3f %.3f %.3f]\n"
               "  Proj: [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] [%.3f "
-              "%.3f %.3f %.3f]\n\n",
-              s_upload_count, pos_mtx_idx, static_cast<u32>(xfmem.projection.type),
+              "%.3f %.3f %.3f]\n",
+              pos_mtx_idx, static_cast<u32>(xfmem.projection.type),
               view._11, view._12, view._13, view._14, view._21, view._22, view._23, view._24,
               view._31, view._32, view._33, view._34, view._41, view._42, view._43, view._44,
               world._11, world._12, world._13, world._14, world._21, world._22, world._23,
@@ -208,8 +241,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       D3D9::device->SetVertexDeclaration(d3d9_format->GetDeclaration());
   }
 
-  // Set stream source and indices
-  D3D9::device->SetStreamSource(0, m_d3d9_vertex_buffer.Get(), 0, m_current_stride);
+  // Set stream source with byte offset into ring buffer for this batch
+  D3D9::device->SetStreamSource(0, m_d3d9_vertex_buffer.Get(), m_current_vb_stream_offset,
+                                m_current_stride);
   D3D9::device->SetIndices(m_d3d9_index_buffer.Get());
 
   // Determine primitive count from indices
@@ -219,6 +253,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   // Get the number of vertices from the index generator
   const u32 num_vertices = m_index_generator.GetNumVerts();
+
+  // Per-draw debug logging
+  {
+    FILE* f = fopen("d3d9_debug.txt", "a");
+    if (f)
+    {
+      fprintf(f, "  Draw #%u: verts=%u, indices=%u, prims=%u, stride=%u, base_vtx=%u, base_idx=%u\n",
+              s_draw_calls_this_frame, num_vertices, num_indices, prim_count, m_current_stride,
+              base_vertex, base_index);
+      fclose(f);
+    }
+  }
 
   HRESULT hr = D3D9::device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, base_vertex, 0, num_vertices,
                                                    base_index, prim_count);
