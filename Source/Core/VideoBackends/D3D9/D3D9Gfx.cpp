@@ -270,7 +270,6 @@ void Gfx::PresentBackbuffer()
     VertexManager::s_total_vb_bytes_this_frame = 0;
     VertexManager::s_total_ib_bytes_this_frame = 0;
     VertexManager::s_textures_set_this_frame = 0;
-    VertexManager::s_first_lock_of_frame = true;
   }
 
   // End the current frame's scene and present

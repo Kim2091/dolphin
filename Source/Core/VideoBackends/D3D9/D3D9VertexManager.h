@@ -43,12 +43,14 @@ private:
   // Current vertex stride for the batch
   u32 m_current_stride = 0;
 
-  // Ring buffer state — pack multiple batches per frame into one VB/IB
-  // to avoid D3DLOCK_DISCARD on every draw (which causes RTX Remix to
-  // allocate a new internal copy of the full buffer each time).
-  u32 m_vb_write_offset = 0;            // current byte position in VB
-  u32 m_ib_write_offset = 0;            // current byte position in IB
-  u32 m_current_vb_stream_offset = 0;   // byte offset for SetStreamSource
+  // GPU buffer sizes — kept small so RTX Remix only copies a small buffer
+  // per draw call.  Grown on demand if a single draw exceeds the current size.
+  static constexpr u32 INITIAL_VB_SIZE = 64 * 1024;   // 64 KB
+  static constexpr u32 INITIAL_IB_SIZE = 16 * 1024;   // 16 KB
+  u32 m_gpu_vb_size = 0;
+  u32 m_gpu_ib_size = 0;
+
+  bool EnsureGPUBufferSizes(u32 vb_bytes_needed, u32 ib_bytes_needed);
 
 public:
   // Debug counters (reset each frame)
@@ -58,6 +60,5 @@ public:
   static u32 s_total_vb_bytes_this_frame;
   static u32 s_total_ib_bytes_this_frame;
   static u32 s_textures_set_this_frame;
-  static bool s_first_lock_of_frame;
 };
 }  // namespace DX9Remix

@@ -29,7 +29,6 @@ u32 VertexManager::s_total_indices_this_frame = 0;
 u32 VertexManager::s_total_vb_bytes_this_frame = 0;
 u32 VertexManager::s_total_ib_bytes_this_frame = 0;
 u32 VertexManager::s_textures_set_this_frame = 0;
-bool VertexManager::s_first_lock_of_frame = true;
 
 VertexManager::VertexManager()
 {
@@ -47,24 +46,55 @@ bool VertexManager::Initialize()
   if (!D3D9::device)
     return false;
 
-  // Create dynamic vertex buffer
-  HRESULT hr = D3D9::device->CreateVertexBuffer(
-      MAXVBUFFERSIZE, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
-      &m_d3d9_vertex_buffer, nullptr);
-  if (FAILED(hr))
-  {
-    ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 vertex buffer: {:#010x}", static_cast<u32>(hr));
+  // Create small GPU buffers.  RTX Remix snapshots the entire buffer for
+  // every draw call that references it, so a large buffer (e.g. 16 MB)
+  // multiplied by thousands of draws per frame causes tens of GB of
+  // Remix-internal copies.  We keep these small and grow on demand.
+  if (!EnsureGPUBufferSizes(INITIAL_VB_SIZE, INITIAL_IB_SIZE))
     return false;
+
+  return true;
+}
+
+bool VertexManager::EnsureGPUBufferSizes(u32 vb_bytes_needed, u32 ib_bytes_needed)
+{
+  if (vb_bytes_needed > m_gpu_vb_size)
+  {
+    m_d3d9_vertex_buffer.Reset();
+    // Round up to next power of 2 for some headroom
+    u32 new_size = INITIAL_VB_SIZE;
+    while (new_size < vb_bytes_needed)
+      new_size *= 2;
+    HRESULT hr = D3D9::device->CreateVertexBuffer(
+        new_size, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
+        &m_d3d9_vertex_buffer, nullptr);
+    if (FAILED(hr))
+    {
+      ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 vertex buffer ({}): {:#010x}", new_size,
+                    static_cast<u32>(hr));
+      m_gpu_vb_size = 0;
+      return false;
+    }
+    m_gpu_vb_size = new_size;
   }
 
-  // Create dynamic index buffer
-  hr = D3D9::device->CreateIndexBuffer(MAXIBUFFERSIZE * sizeof(u16),
-                                       D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16,
-                                       D3DPOOL_DEFAULT, &m_d3d9_index_buffer, nullptr);
-  if (FAILED(hr))
+  if (ib_bytes_needed > m_gpu_ib_size)
   {
-    ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 index buffer: {:#010x}", static_cast<u32>(hr));
-    return false;
+    m_d3d9_index_buffer.Reset();
+    u32 new_size = INITIAL_IB_SIZE;
+    while (new_size < ib_bytes_needed)
+      new_size *= 2;
+    HRESULT hr = D3D9::device->CreateIndexBuffer(
+        new_size, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT,
+        &m_d3d9_index_buffer, nullptr);
+    if (FAILED(hr))
+    {
+      ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 index buffer ({}): {:#010x}", new_size,
+                    static_cast<u32>(hr));
+      m_gpu_ib_size = 0;
+      return false;
+    }
+    m_gpu_ib_size = new_size;
   }
 
   return true;
@@ -113,34 +143,17 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
   s_total_vb_bytes_this_frame += vertex_data_size;
   s_total_ib_bytes_this_frame += index_data_size;
 
-  // Ring buffer: DISCARD once at frame start (or when full), NOOVERWRITE after.
-  // This avoids the driver internally allocating a new 16 MB buffer copy on
-  // every single draw call, which was causing RTX Remix to hold ~41 GB.
-  const u32 ib_total_size = MAXIBUFFERSIZE * sizeof(u16);
-  const bool need_discard = s_first_lock_of_frame ||
-                            (m_vb_write_offset + vertex_data_size > MAXVBUFFERSIZE) ||
-                            (m_ib_write_offset + index_data_size > ib_total_size);
+  // Grow GPU buffers if this draw exceeds current capacity.
+  if (!EnsureGPUBufferSizes(vertex_data_size, index_data_size))
+    return;
 
-  if (need_discard)
-  {
-    m_vb_write_offset = 0;
-    m_ib_write_offset = 0;
-    s_first_lock_of_frame = false;
-  }
-
-  const DWORD lock_flags = need_discard ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
-
-  // Record where this batch starts in the ring buffer
-  m_current_vb_stream_offset = m_vb_write_offset;
-  *out_base_vertex = 0;  // VB position handled via SetStreamSource byte offset
-  *out_base_index = m_ib_write_offset / sizeof(u16);
-
-  // Upload vertex data at current ring buffer position
+  // DISCARD every draw — write at offset 0 each time.
+  // RTX Remix snapshots the entire buffer for each draw call, so we keep
+  // the buffers small (initially 64 KB / 16 KB) to limit per-draw copies.
   if (m_d3d9_vertex_buffer && vertex_data_size > 0)
   {
     void* vb_data = nullptr;
-    HRESULT hr = m_d3d9_vertex_buffer->Lock(m_vb_write_offset, vertex_data_size, &vb_data,
-                                            lock_flags);
+    HRESULT hr = m_d3d9_vertex_buffer->Lock(0, vertex_data_size, &vb_data, D3DLOCK_DISCARD);
     if (SUCCEEDED(hr))
     {
       std::memcpy(vb_data, m_vertex_buffer.data(), vertex_data_size);
@@ -148,22 +161,16 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
     }
   }
 
-  // Upload index data at current ring buffer position
   if (m_d3d9_index_buffer && index_data_size > 0)
   {
     void* ib_data = nullptr;
-    HRESULT hr = m_d3d9_index_buffer->Lock(m_ib_write_offset, index_data_size, &ib_data,
-                                           lock_flags);
+    HRESULT hr = m_d3d9_index_buffer->Lock(0, index_data_size, &ib_data, D3DLOCK_DISCARD);
     if (SUCCEEDED(hr))
     {
       std::memcpy(ib_data, m_index_buffer.data(), index_data_size);
       m_d3d9_index_buffer->Unlock();
     }
   }
-
-  // Advance write positions for next batch
-  m_vb_write_offset += vertex_data_size;
-  m_ib_write_offset += index_data_size;
 }
 
 void VertexManager::UploadUniforms()
@@ -241,9 +248,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       D3D9::device->SetVertexDeclaration(d3d9_format->GetDeclaration());
   }
 
-  // Set stream source with byte offset into ring buffer for this batch
-  D3D9::device->SetStreamSource(0, m_d3d9_vertex_buffer.Get(), m_current_vb_stream_offset,
-                                m_current_stride);
+  // Stream source at offset 0 — each draw DISCARDs and writes from the start
+  D3D9::device->SetStreamSource(0, m_d3d9_vertex_buffer.Get(), 0, m_current_stride);
   D3D9::device->SetIndices(m_d3d9_index_buffer.Get());
 
   // Determine primitive count from indices
