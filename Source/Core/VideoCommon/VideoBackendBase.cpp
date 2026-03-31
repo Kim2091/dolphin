@@ -28,6 +28,7 @@
 // TODO: ugly
 #ifdef _WIN32
 #include "VideoBackends/D3D/VideoBackend.h"
+#include "VideoBackends/D3D9/VideoBackend.h"
 #include "VideoBackends/D3D12/VideoBackend.h"
 #endif
 #include "VideoBackends/Null/VideoBackend.h"
@@ -206,6 +207,7 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
 
 #ifdef _WIN32
     backends.push_back(std::make_unique<DX11::VideoBackend>());
+    backends.push_back(std::make_unique<DX9Remix::VideoBackend>());
     backends.push_back(std::make_unique<DX12::VideoBackend>());
 #endif
 #ifdef HAS_OPENGL

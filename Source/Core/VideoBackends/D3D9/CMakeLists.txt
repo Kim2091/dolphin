@@ -1,0 +1,36 @@
+add_library(videod3d9
+  D3D9BoundingBox.cpp
+  D3D9BoundingBox.h
+  D3D9Device.cpp
+  D3D9Device.h
+  D3D9Gfx.cpp
+  D3D9Gfx.h
+  D3D9Main.cpp
+  D3D9NativeVertexFormat.cpp
+  D3D9NativeVertexFormat.h
+  D3D9PerfQuery.h
+  D3D9Pipeline.cpp
+  D3D9Pipeline.h
+  D3D9Shader.cpp
+  D3D9Shader.h
+  D3D9State.cpp
+  D3D9State.h
+  D3D9SwapChain.cpp
+  D3D9SwapChain.h
+  D3D9TEVMapper.cpp
+  D3D9TEVMapper.h
+  D3D9TextureCache.h
+  D3D9Texture.cpp
+  D3D9Texture.h
+  D3D9TransformDecomposer.cpp
+  D3D9TransformDecomposer.h
+  D3D9VertexManager.cpp
+  D3D9VertexManager.h
+  VideoBackend.h
+)
+
+target_link_libraries(videod3d9
+PUBLIC
+  common
+  videocommon
+)
