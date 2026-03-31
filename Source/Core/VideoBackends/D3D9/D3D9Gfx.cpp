@@ -16,6 +16,7 @@
 #include "VideoCommon/AbstractPipeline.h"
 #include "VideoCommon/AbstractShader.h"
 #include "VideoCommon/NativeVertexFormat.h"
+#include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoConfig.h"
 
 namespace DX9Remix
@@ -271,6 +272,10 @@ void Gfx::PresentBackbuffer()
     VertexManager::s_total_ib_bytes_this_frame = 0;
     VertexManager::s_textures_set_this_frame = 0;
   }
+
+  // Reset ring buffer offsets for the next frame
+  if (g_vertex_manager)
+    static_cast<VertexManager*>(g_vertex_manager.get())->ResetRingBuffer();
 
   // End the current frame's scene and present
   D3D9::device->EndScene();

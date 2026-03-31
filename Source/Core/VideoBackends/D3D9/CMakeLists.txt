@@ -19,6 +19,7 @@ add_library(videod3d9
   D3D9SwapChain.h
   D3D9TEVMapper.cpp
   D3D9TEVMapper.h
+  D3D9TextureCache.cpp
   D3D9TextureCache.h
   D3D9Texture.cpp
   D3D9Texture.h

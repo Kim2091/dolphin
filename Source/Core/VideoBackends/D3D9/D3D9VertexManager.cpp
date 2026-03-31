@@ -46,56 +46,35 @@ bool VertexManager::Initialize()
   if (!D3D9::device)
     return false;
 
-  // Create small GPU buffers.  RTX Remix snapshots the entire buffer for
-  // every draw call that references it, so a large buffer (e.g. 16 MB)
-  // multiplied by thousands of draws per frame causes tens of GB of
-  // Remix-internal copies.  We keep these small and grow on demand.
-  if (!EnsureGPUBufferSizes(INITIAL_VB_SIZE, INITIAL_IB_SIZE))
+  if (!CreateGPUBuffers())
     return false;
 
   return true;
 }
 
-bool VertexManager::EnsureGPUBufferSizes(u32 vb_bytes_needed, u32 ib_bytes_needed)
+bool VertexManager::CreateGPUBuffers()
 {
-  if (vb_bytes_needed > m_gpu_vb_size)
+  HRESULT hr = D3D9::device->CreateVertexBuffer(
+      VB_SIZE, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
+      &m_d3d9_vertex_buffer, nullptr);
+  if (FAILED(hr))
   {
-    m_d3d9_vertex_buffer.Reset();
-    // Round up to next power of 2 for some headroom
-    u32 new_size = INITIAL_VB_SIZE;
-    while (new_size < vb_bytes_needed)
-      new_size *= 2;
-    HRESULT hr = D3D9::device->CreateVertexBuffer(
-        new_size, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
-        &m_d3d9_vertex_buffer, nullptr);
-    if (FAILED(hr))
-    {
-      ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 vertex buffer ({}): {:#010x}", new_size,
-                    static_cast<u32>(hr));
-      m_gpu_vb_size = 0;
-      return false;
-    }
-    m_gpu_vb_size = new_size;
+    ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 vertex buffer ({}): {:#010x}", VB_SIZE,
+                  static_cast<u32>(hr));
+    return false;
   }
+  m_gpu_vb_size = VB_SIZE;
 
-  if (ib_bytes_needed > m_gpu_ib_size)
+  hr = D3D9::device->CreateIndexBuffer(
+      IB_SIZE, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT,
+      &m_d3d9_index_buffer, nullptr);
+  if (FAILED(hr))
   {
-    m_d3d9_index_buffer.Reset();
-    u32 new_size = INITIAL_IB_SIZE;
-    while (new_size < ib_bytes_needed)
-      new_size *= 2;
-    HRESULT hr = D3D9::device->CreateIndexBuffer(
-        new_size, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT,
-        &m_d3d9_index_buffer, nullptr);
-    if (FAILED(hr))
-    {
-      ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 index buffer ({}): {:#010x}", new_size,
-                    static_cast<u32>(hr));
-      m_gpu_ib_size = 0;
-      return false;
-    }
-    m_gpu_ib_size = new_size;
+    ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 index buffer ({}): {:#010x}", IB_SIZE,
+                  static_cast<u32>(hr));
+    return false;
   }
+  m_gpu_ib_size = IB_SIZE;
 
   return true;
 }
@@ -143,17 +122,25 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
   s_total_vb_bytes_this_frame += vertex_data_size;
   s_total_ib_bytes_this_frame += index_data_size;
 
-  // Grow GPU buffers if this draw exceeds current capacity.
-  if (!EnsureGPUBufferSizes(vertex_data_size, index_data_size))
-    return;
+  // Check if we need to wrap (not enough space left in the ring buffer).
+  // If so, DISCARD to reset to the beginning.
+  if (m_vb_write_offset + vertex_data_size > m_gpu_vb_size ||
+      m_ib_write_offset + index_data_size > m_gpu_ib_size)
+  {
+    m_first_commit_of_frame = true;
+    m_vb_write_offset = 0;
+    m_ib_write_offset = 0;
+  }
 
-  // DISCARD every draw — write at offset 0 each time.
-  // RTX Remix snapshots the entire buffer for each draw call, so we keep
-  // the buffers small (initially 64 KB / 16 KB) to limit per-draw copies.
+  // First commit of the frame: DISCARD to orphan the old buffer.
+  // Subsequent commits: NOOVERWRITE to append without creating new copies.
+  const DWORD lock_flags = m_first_commit_of_frame ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
+
   if (m_d3d9_vertex_buffer && vertex_data_size > 0)
   {
     void* vb_data = nullptr;
-    HRESULT hr = m_d3d9_vertex_buffer->Lock(0, vertex_data_size, &vb_data, D3DLOCK_DISCARD);
+    HRESULT hr = m_d3d9_vertex_buffer->Lock(m_vb_write_offset, vertex_data_size, &vb_data,
+                                            lock_flags);
     if (SUCCEEDED(hr))
     {
       std::memcpy(vb_data, m_vertex_buffer.data(), vertex_data_size);
@@ -164,13 +151,23 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
   if (m_d3d9_index_buffer && index_data_size > 0)
   {
     void* ib_data = nullptr;
-    HRESULT hr = m_d3d9_index_buffer->Lock(0, index_data_size, &ib_data, D3DLOCK_DISCARD);
+    HRESULT hr = m_d3d9_index_buffer->Lock(m_ib_write_offset, index_data_size, &ib_data,
+                                           lock_flags);
     if (SUCCEEDED(hr))
     {
       std::memcpy(ib_data, m_index_buffer.data(), index_data_size);
       m_d3d9_index_buffer->Unlock();
     }
   }
+
+  // Return the base vertex/index so DrawCurrentBatch draws from the right offset.
+  *out_base_vertex = m_vb_write_offset / vertex_stride;
+  *out_base_index = m_ib_write_offset / sizeof(u16);
+
+  // Advance the write cursors.
+  m_vb_write_offset += vertex_data_size;
+  m_ib_write_offset += index_data_size;
+  m_first_commit_of_frame = false;
 }
 
 void VertexManager::UploadUniforms()
@@ -248,7 +245,6 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       D3D9::device->SetVertexDeclaration(d3d9_format->GetDeclaration());
   }
 
-  // Stream source at offset 0 — each draw DISCARDs and writes from the start
   D3D9::device->SetStreamSource(0, m_d3d9_vertex_buffer.Get(), 0, m_current_stride);
   D3D9::device->SetIndices(m_d3d9_index_buffer.Get());
 
@@ -279,5 +275,11 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   {
     ERROR_LOG_FMT(VIDEO, "DrawIndexedPrimitive failed: {:#010x}", static_cast<u32>(hr));
   }
+}
+void VertexManager::ResetRingBuffer()
+{
+  m_vb_write_offset = 0;
+  m_ib_write_offset = 0;
+  m_first_commit_of_frame = true;
 }
 }  // namespace DX9Remix

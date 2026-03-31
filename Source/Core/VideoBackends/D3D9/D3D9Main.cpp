@@ -50,7 +50,7 @@ void VideoBackend::FillBackendInfo()
   g_backend_info.bSupportsReversedDepthRange = false;
   g_backend_info.bSupportsMultithreading = false;
   g_backend_info.bSupportsGPUTextureDecoding = false;
-  g_backend_info.bSupportsCopyToVram = false;
+  g_backend_info.bSupportsCopyToVram = true;
   g_backend_info.bSupportsLargePoints = false;
   g_backend_info.bSupportsDepthReadback = false;
   g_backend_info.bSupportsPartialDepthCopies = false;
