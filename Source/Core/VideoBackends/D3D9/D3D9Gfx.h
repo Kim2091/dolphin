@@ -65,6 +65,8 @@ public:
 
   SurfaceInfo GetSurfaceInfo() const override;
 
+  static u32 s_frame_count;
+
 private:
   float m_backbuffer_scale = 1.0f;
 };

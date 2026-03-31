@@ -33,9 +33,14 @@ private:
   std::vector<u8> m_vertex_buffer;
   std::vector<u16> m_index_buffer;
 
-  // D3D9 vertex/index buffers
-  ComPtr<IDirect3DVertexBuffer9> m_d3d9_vertex_buffer;
-  ComPtr<IDirect3DIndexBuffer9> m_d3d9_index_buffer;
+  // Single reusable GPU buffers — kept small so each DISCARD allocation is cheap.
+  // Remix sees the same buffer handle every frame, keeping its geometry cache bounded.
+  ComPtr<IDirect3DVertexBuffer9> m_d3d9_vb;
+  ComPtr<IDirect3DIndexBuffer9> m_d3d9_ib;
+  u32 m_d3d9_vb_size = 0;
+  u32 m_d3d9_ib_size = 0;
+
+  void EnsureBufferSizes(u32 vb_bytes, u32 ib_bytes);
 
   // Transform decomposition for camera extraction
   TransformDecomposer m_transform_decomposer;
@@ -43,24 +48,7 @@ private:
   // Current vertex stride for the batch
   u32 m_current_stride = 0;
 
-  // Ring-buffer sizes — large enough for a full frame's geometry.
-  // All draws within a frame append into the same buffer using NOOVERWRITE,
-  // so RTX Remix sees one buffer per frame instead of thousands of DISCARD copies.
-  static constexpr u32 VB_SIZE = 32 * 1024 * 1024;  // 32 MB
-  static constexpr u32 IB_SIZE = 4 * 1024 * 1024;   // 4 MB
-  u32 m_gpu_vb_size = 0;
-  u32 m_gpu_ib_size = 0;
-
-  // Current write offset within the ring buffer for this frame
-  u32 m_vb_write_offset = 0;
-  u32 m_ib_write_offset = 0;
-  bool m_first_commit_of_frame = true;
-
-  bool CreateGPUBuffers();
-
 public:
-  // Called at frame boundaries to reset ring buffer offsets
-  void ResetRingBuffer();
 
   // Debug counters (reset each frame)
   static u32 s_draw_calls_this_frame;

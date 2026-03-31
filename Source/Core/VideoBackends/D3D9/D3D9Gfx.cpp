@@ -3,6 +3,7 @@
 
 #include "VideoBackends/D3D9/D3D9Gfx.h"
 
+#include <chrono>
 #include <cstdio>
 
 #include "VideoBackends/D3D9/D3D9Device.h"
@@ -21,24 +22,57 @@
 
 namespace DX9Remix
 {
+// ── Diagnostic log helper ──────────────────────────────────────────────
+// Writes to d3d9_diag.txt, flushed every write so data survives a hang.
+static FILE* OpenDiag()
+{
+  FILE* f = fopen("d3d9_diag.txt", "a");
+  return f;
+}
+
+static double TimeSec()
+{
+  static auto s_start = std::chrono::steady_clock::now();
+  auto now = std::chrono::steady_clock::now();
+  return std::chrono::duration<double>(now - s_start).count();
+}
+
+#define DIAG(fmt, ...)                                                                             \
+  do                                                                                               \
+  {                                                                                                \
+    FILE* _f = OpenDiag();                                                                         \
+    if (_f)                                                                                        \
+    {                                                                                              \
+      fprintf(_f, "[%8.3f] " fmt "\n", TimeSec(), ##__VA_ARGS__);                                  \
+      fclose(_f);                                                                                  \
+    }                                                                                              \
+  } while (0)
+
+// Global frame counter accessible from VertexManager too.
+u32 Gfx::s_frame_count = 0;
+
 Gfx::Gfx(float backbuffer_scale) : m_backbuffer_scale(backbuffer_scale)
 {
+  // Truncate the diag log on startup
+  if (FILE* f = fopen("d3d9_diag.txt", "w"))
+    fclose(f);
+
+  DIAG("=== Gfx::Gfx  constructor ===");
   UpdateActiveConfig();
 
   // Set initial D3D9 render states for fixed-function
   if (D3D9::device)
   {
+    DIAG("  Setting initial render states");
     D3D9::device->SetRenderState(D3DRS_LIGHTING, FALSE);
     D3D9::device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     D3D9::device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
     D3D9::device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 
-    // Set up fixed-function vertex processing
     D3D9::device->SetRenderState(D3DRS_SHADEMODE, D3DSHADE_GOURAUD);
     D3D9::device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     D3D9::device->SetRenderState(D3DRS_FOGENABLE, FALSE);
 
-    // Default texture stage: modulate texture with vertex color
     D3D9::device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
     D3D9::device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     D3D9::device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
@@ -46,28 +80,38 @@ Gfx::Gfx(float backbuffer_scale) : m_backbuffer_scale(backbuffer_scale)
     D3D9::device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
     D3D9::device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
 
-    // Disable remaining stages
     for (int i = 1; i < 8; i++)
     {
       D3D9::device->SetTextureStageState(i, D3DTSS_COLOROP, D3DTOP_DISABLE);
       D3D9::device->SetTextureStageState(i, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
     }
 
-    // Start the first scene immediately so game draws (which happen BEFORE
-    // BindBackbuffer in Dolphin's frame lifecycle) are inside a valid
-    // BeginScene/EndScene pair.  D3D9 silently rejects draws outside a scene.
-    D3D9::device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-                        D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
-    D3D9::device->BeginScene();
+    DIAG("  Clear...");
+    HRESULT hr = D3D9::device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                                     D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
+    DIAG("  Clear => %#010x", static_cast<u32>(hr));
+
+    DIAG("  BeginScene...");
+    hr = D3D9::device->BeginScene();
+    DIAG("  BeginScene => %#010x", static_cast<u32>(hr));
   }
+  else
+  {
+    DIAG("  WARNING: D3D9::device is NULL in constructor!");
+  }
+  DIAG("=== Gfx::Gfx done ===");
 }
 
 Gfx::~Gfx()
 {
-  // End the scene we started in the constructor (or after the last Present)
+  DIAG("=== Gfx::~Gfx destructor ===");
   if (D3D9::device)
-    D3D9::device->EndScene();
+  {
+    HRESULT hr = D3D9::device->EndScene();
+    DIAG("  EndScene => %#010x", static_cast<u32>(hr));
+  }
   UpdateActiveConfig();
+  DIAG("=== Gfx::~Gfx done ===");
 }
 
 bool Gfx::IsHeadless() const
@@ -135,8 +179,6 @@ std::unique_ptr<AbstractPipeline> Gfx::CreatePipeline(const AbstractPipelineConf
 }
 
 // Framebuffer overrides: intentionally keep D3D9 render target as the backbuffer.
-// Dolphin's renderer switches to EFB framebuffers for game draws, but for RTX Remix
-// we need all draws to go through the D3D9 backbuffer so Remix can capture them.
 void Gfx::SetFramebuffer(AbstractFramebuffer* framebuffer)
 {
   m_current_framebuffer = framebuffer;
@@ -222,88 +264,103 @@ void Gfx::SetScissorRect(const MathUtil::Rectangle<int>& rc)
 
 void Gfx::Draw(u32 base_vertex, u32 num_vertices)
 {
+  DIAG("   Gfx::Draw  base_vertex=%u  num_vertices=%u", base_vertex, num_vertices);
   if (D3D9::device)
-    D3D9::device->DrawPrimitive(D3DPT_TRIANGLELIST, base_vertex, num_vertices / 3);
+  {
+    HRESULT hr = D3D9::device->DrawPrimitive(D3DPT_TRIANGLELIST, base_vertex, num_vertices / 3);
+    if (FAILED(hr))
+      DIAG("   !! DrawPrimitive FAILED => %#010x", static_cast<u32>(hr));
+  }
 }
 
 void Gfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
 {
-  // This is called from DrawCurrentBatch via the base VertexManager.
   // The actual D3D9 DrawIndexedPrimitive call happens in D3D9VertexManager::DrawCurrentBatch.
 }
 
 bool Gfx::BindBackbuffer(const ClearColor& clear_color)
 {
-  // In Dolphin's frame lifecycle, game draws happen BEFORE BindBackbuffer.
-  // The scene is already active (started in constructor / after last Present).
-  // Don't Clear here — that would wipe the game draws we just rendered.
-  // Don't BeginScene here — we're already in a scene.
+  DIAG(">> BindBackbuffer  frame=%u  device=%p", s_frame_count + 1,
+       static_cast<void*>(D3D9::device.Get()));
   return D3D9::device != nullptr;
 }
 
 void Gfx::PresentBackbuffer()
 {
   if (!D3D9::device)
-    return;
-
-  // Debug: write frame stats to file (every frame)
   {
-    static u32 s_frame_count = 0;
-    s_frame_count++;
+    DIAG("!! PresentBackbuffer: device is NULL");
+    return;
+  }
 
+  s_frame_count++;
+  DIAG(">> PresentBackbuffer  frame=%u  draws=%u  uploads=%u  indices=%u  vb=%u  ib=%u  tex=%u",
+       s_frame_count, VertexManager::s_draw_calls_this_frame,
+       VertexManager::s_upload_calls_this_frame, VertexManager::s_total_indices_this_frame,
+       VertexManager::s_total_vb_bytes_this_frame, VertexManager::s_total_ib_bytes_this_frame,
+       VertexManager::s_textures_set_this_frame);
+
+  // Also write to the human-friendly debug file
+  {
     FILE* f = fopen("d3d9_debug.txt", "a");
     if (f)
     {
-      fprintf(f, "Frame %u: draws=%u, uploads=%u, indices=%u, vb_bytes=%u, ib_bytes=%u, textures=%u\n",
-              s_frame_count, VertexManager::s_draw_calls_this_frame,
-              VertexManager::s_upload_calls_this_frame,
-              VertexManager::s_total_indices_this_frame,
-              VertexManager::s_total_vb_bytes_this_frame,
-              VertexManager::s_total_ib_bytes_this_frame,
-              VertexManager::s_textures_set_this_frame);
+      fprintf(
+          f,
+          "Frame %u: draws=%u, uploads=%u, indices=%u, vb_bytes=%u, ib_bytes=%u, textures=%u\n",
+          s_frame_count, VertexManager::s_draw_calls_this_frame,
+          VertexManager::s_upload_calls_this_frame, VertexManager::s_total_indices_this_frame,
+          VertexManager::s_total_vb_bytes_this_frame, VertexManager::s_total_ib_bytes_this_frame,
+          VertexManager::s_textures_set_this_frame);
       fclose(f);
     }
-
-    // Reset counters for next frame
-    VertexManager::s_draw_calls_this_frame = 0;
-    VertexManager::s_upload_calls_this_frame = 0;
-    VertexManager::s_total_indices_this_frame = 0;
-    VertexManager::s_total_vb_bytes_this_frame = 0;
-    VertexManager::s_total_ib_bytes_this_frame = 0;
-    VertexManager::s_textures_set_this_frame = 0;
   }
 
-  // Reset ring buffer offsets for the next frame
-  if (g_vertex_manager)
-    static_cast<VertexManager*>(g_vertex_manager.get())->ResetRingBuffer();
+  // Reset counters for next frame
+  VertexManager::s_draw_calls_this_frame = 0;
+  VertexManager::s_upload_calls_this_frame = 0;
+  VertexManager::s_total_indices_this_frame = 0;
+  VertexManager::s_total_vb_bytes_this_frame = 0;
+  VertexManager::s_total_ib_bytes_this_frame = 0;
+  VertexManager::s_textures_set_this_frame = 0;
 
-  // End the current frame's scene and present
-  D3D9::device->EndScene();
-  D3D9::device->Present(nullptr, nullptr, nullptr, nullptr);
+  DIAG("   EndScene...");
+  HRESULT hr = D3D9::device->EndScene();
+  DIAG("   EndScene => %#010x", static_cast<u32>(hr));
 
-  // Immediately start the next frame: clear and begin a new scene so that
-  // game draws (which happen before the next BindBackbuffer) are valid.
-  D3D9::device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
-                      D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
-  D3D9::device->BeginScene();
+  DIAG("   Present...");
+  hr = D3D9::device->Present(nullptr, nullptr, nullptr, nullptr);
+  DIAG("   Present => %#010x", static_cast<u32>(hr));
+  if (hr == D3DERR_DEVICELOST)
+    DIAG("   !! DEVICE LOST during Present");
+
+  DIAG("   Clear...");
+  hr = D3D9::device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER,
+                           D3DCOLOR_XRGB(0, 0, 0), 1.0f, 0);
+  DIAG("   Clear => %#010x", static_cast<u32>(hr));
+
+  DIAG("   BeginScene...");
+  hr = D3D9::device->BeginScene();
+  DIAG("   BeginScene => %#010x", static_cast<u32>(hr));
+
+  DIAG("<< PresentBackbuffer done  frame=%u", s_frame_count);
 }
 
 void Gfx::ShowImage(const AbstractTexture* /*source_texture*/,
                     const MathUtil::Rectangle<int>& /*source_rc*/)
 {
-  // Called by the Presenter when SupportsUtilityDrawing() is false.
-  // Game draws are already on the D3D9 backbuffer — just present them.
+  DIAG(">> ShowImage (calls PresentBackbuffer)");
   PresentBackbuffer();
 }
 
 void Gfx::Flush()
 {
-  // D3D9 has no explicit flush mechanism
+  DIAG(">> Flush");
 }
 
 void Gfx::WaitForGPUIdle()
 {
-  // D3D9 has no explicit GPU idle wait
+  DIAG(">> WaitForGPUIdle");
 }
 
 SurfaceInfo Gfx::GetSurfaceInfo() const
@@ -332,11 +389,13 @@ void D3D9EFBInterface::PokeDepth(u16 x, u16 y, u32 depth)
 
 u32 D3D9EFBInterface::PeekColorInternal(u16 x, u16 y)
 {
-  return 0;
+  DIAG("   !! PeekColor(%u, %u) called", x, y);
+  return 0xFFFFFFFF;  // opaque white — 0 (transparent black) can stall game logic
 }
 
 u32 D3D9EFBInterface::PeekDepthInternal(u16 x, u16 y)
 {
-  return 0;
+  DIAG("   !! PeekDepth(%u, %u) called", x, y);
+  return 0x00FFFFFF;  // max 24-bit depth (far plane) — 0 (near plane) can deadlock games
 }
 }  // namespace DX9Remix

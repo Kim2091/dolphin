@@ -3,10 +3,14 @@
 
 #include "VideoBackends/D3D9/D3D9VertexManager.h"
 
+#include <chrono>
+#include <cstdio>
+
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
 
 #include "VideoBackends/D3D9/D3D9Device.h"
+#include "VideoBackends/D3D9/D3D9Gfx.h"
 #include "VideoBackends/D3D9/D3D9NativeVertexFormat.h"
 #include "VideoBackends/D3D9/D3D9TEVMapper.h"
 #include "VideoBackends/D3D9/D3D9Texture.h"
@@ -20,6 +24,27 @@
 #include "VideoCommon/VertexShaderManager.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/XFMemory.h"
+
+// Reuse the same diag logger as D3D9Gfx
+static FILE* OpenDiag()
+{
+  return fopen("d3d9_diag.txt", "a");
+}
+static double TimeSec()
+{
+  static auto s_start = std::chrono::steady_clock::now();
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - s_start).count();
+}
+#define DIAG(fmt, ...)                                                                             \
+  do                                                                                               \
+  {                                                                                                \
+    FILE* _f = OpenDiag();                                                                         \
+    if (_f)                                                                                        \
+    {                                                                                              \
+      fprintf(_f, "[%8.3f] " fmt "\n", TimeSec(), ##__VA_ARGS__);                                  \
+      fclose(_f);                                                                                  \
+    }                                                                                              \
+  } while (0)
 
 namespace DX9Remix
 {
@@ -46,37 +71,49 @@ bool VertexManager::Initialize()
   if (!D3D9::device)
     return false;
 
-  if (!CreateGPUBuffers())
-    return false;
+  // Create initial GPU buffers at a small default size.
+  // They grow on-demand if a batch exceeds the current capacity.
+  static constexpr u32 INITIAL_VB_SIZE = 256 * 1024;  // 256 KB
+  static constexpr u32 INITIAL_IB_SIZE = 128 * 1024;  // 128 KB
+  EnsureBufferSizes(INITIAL_VB_SIZE, INITIAL_IB_SIZE);
 
   return true;
 }
 
-bool VertexManager::CreateGPUBuffers()
+void VertexManager::EnsureBufferSizes(u32 vb_bytes, u32 ib_bytes)
 {
-  HRESULT hr = D3D9::device->CreateVertexBuffer(
-      VB_SIZE, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT,
-      &m_d3d9_vertex_buffer, nullptr);
-  if (FAILED(hr))
+  if (vb_bytes > m_d3d9_vb_size)
   {
-    ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 vertex buffer ({}): {:#010x}", VB_SIZE,
-                  static_cast<u32>(hr));
-    return false;
+    m_d3d9_vb.Reset();
+    u32 new_size = 1;
+    while (new_size < vb_bytes)
+      new_size <<= 1;
+    DIAG("   !! VB RESIZE: %u -> %u (need %u)", m_d3d9_vb_size, new_size, vb_bytes);
+    HRESULT hr = D3D9::device->CreateVertexBuffer(
+        new_size, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT, &m_d3d9_vb, nullptr);
+    DIAG("   CreateVertexBuffer(%u) => %#010x", new_size, static_cast<u32>(hr));
+    if (SUCCEEDED(hr))
+      m_d3d9_vb_size = new_size;
+    else
+      m_d3d9_vb_size = 0;
   }
-  m_gpu_vb_size = VB_SIZE;
 
-  hr = D3D9::device->CreateIndexBuffer(
-      IB_SIZE, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT,
-      &m_d3d9_index_buffer, nullptr);
-  if (FAILED(hr))
+  if (ib_bytes > m_d3d9_ib_size)
   {
-    ERROR_LOG_FMT(VIDEO, "Failed to create D3D9 index buffer ({}): {:#010x}", IB_SIZE,
-                  static_cast<u32>(hr));
-    return false;
+    m_d3d9_ib.Reset();
+    u32 new_size = 1;
+    while (new_size < ib_bytes)
+      new_size <<= 1;
+    DIAG("   !! IB RESIZE: %u -> %u (need %u)", m_d3d9_ib_size, new_size, ib_bytes);
+    HRESULT hr = D3D9::device->CreateIndexBuffer(
+        new_size, D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT,
+        &m_d3d9_ib, nullptr);
+    DIAG("   CreateIndexBuffer(%u) => %#010x", new_size, static_cast<u32>(hr));
+    if (SUCCEEDED(hr))
+      m_d3d9_ib_size = new_size;
+    else
+      m_d3d9_ib_size = 0;
   }
-  m_gpu_ib_size = IB_SIZE;
-
-  return true;
 }
 
 void VertexManager::ResetBuffer(u32 vertex_stride)
@@ -96,7 +133,7 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
   if (!D3D9::device || num_vertices == 0)
     return;
 
-  // Swizzle vertex colors from RGBA to BGRA (D3DCOLOR format) before upload.
+  // Swizzle vertex colors from RGBA to BGRA (D3DCOLOR format).
   // D3D9's D3DDECLTYPE_D3DCOLOR expects BGRA byte order.
   const auto* vtx_format = VertexLoaderManager::GetCurrentVertexFormat();
   if (vtx_format)
@@ -121,64 +158,22 @@ void VertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_in
   const u32 index_data_size = num_indices * sizeof(u16);
   s_total_vb_bytes_this_frame += vertex_data_size;
   s_total_ib_bytes_this_frame += index_data_size;
-
-  // Check if we need to wrap (not enough space left in the ring buffer).
-  // If so, DISCARD to reset to the beginning.
-  if (m_vb_write_offset + vertex_data_size > m_gpu_vb_size ||
-      m_ib_write_offset + index_data_size > m_gpu_ib_size)
-  {
-    m_first_commit_of_frame = true;
-    m_vb_write_offset = 0;
-    m_ib_write_offset = 0;
-  }
-
-  // First commit of the frame: DISCARD to orphan the old buffer.
-  // Subsequent commits: NOOVERWRITE to append without creating new copies.
-  const DWORD lock_flags = m_first_commit_of_frame ? D3DLOCK_DISCARD : D3DLOCK_NOOVERWRITE;
-
-  if (m_d3d9_vertex_buffer && vertex_data_size > 0)
-  {
-    void* vb_data = nullptr;
-    HRESULT hr = m_d3d9_vertex_buffer->Lock(m_vb_write_offset, vertex_data_size, &vb_data,
-                                            lock_flags);
-    if (SUCCEEDED(hr))
-    {
-      std::memcpy(vb_data, m_vertex_buffer.data(), vertex_data_size);
-      m_d3d9_vertex_buffer->Unlock();
-    }
-  }
-
-  if (m_d3d9_index_buffer && index_data_size > 0)
-  {
-    void* ib_data = nullptr;
-    HRESULT hr = m_d3d9_index_buffer->Lock(m_ib_write_offset, index_data_size, &ib_data,
-                                           lock_flags);
-    if (SUCCEEDED(hr))
-    {
-      std::memcpy(ib_data, m_index_buffer.data(), index_data_size);
-      m_d3d9_index_buffer->Unlock();
-    }
-  }
-
-  // Return the base vertex/index so DrawCurrentBatch draws from the right offset.
-  *out_base_vertex = m_vb_write_offset / vertex_stride;
-  *out_base_index = m_ib_write_offset / sizeof(u16);
-
-  // Advance the write cursors.
-  m_vb_write_offset += vertex_data_size;
-  m_ib_write_offset += index_data_size;
-  m_first_commit_of_frame = false;
 }
 
 void VertexManager::UploadUniforms()
 {
   if (!D3D9::device)
+  {
+    DIAG("   !! UploadUniforms: device is NULL");
     return;
+  }
 
   s_upload_calls_this_frame++;
 
-  // Set up transforms for RTX Remix
-  // Get the active position matrix index
+  // Log first upload of each frame
+  if (s_upload_calls_this_frame == 1)
+    DIAG("   UploadUniforms  first of frame %u", Gfx::s_frame_count);
+
   const u32 pos_mtx_idx = g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
 
   // Update the view matrix from posMatrices
@@ -236,7 +231,6 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   s_draw_calls_this_frame++;
   s_total_indices_this_frame += num_indices;
 
-  // Set the vertex declaration from the current vertex format
   const auto* vtx_format = VertexLoaderManager::GetCurrentVertexFormat();
   if (vtx_format)
   {
@@ -245,41 +239,67 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       D3D9::device->SetVertexDeclaration(d3d9_format->GetDeclaration());
   }
 
-  D3D9::device->SetStreamSource(0, m_d3d9_vertex_buffer.Get(), 0, m_current_stride);
-  D3D9::device->SetIndices(m_d3d9_index_buffer.Get());
-
-  // Determine primitive count from indices
   const u32 prim_count = num_indices / 3;
   if (prim_count == 0)
     return;
 
-  // Get the number of vertices from the index generator
   const u32 num_vertices = m_index_generator.GetNumVerts();
+  const u32 vb_bytes = num_vertices * m_current_stride;
+  const u32 ib_bytes = num_indices * sizeof(u16);
 
-  // Per-draw debug logging
+  EnsureBufferSizes(vb_bytes, ib_bytes);
+
+  if (!m_d3d9_vb || !m_d3d9_ib)
   {
-    FILE* f = fopen("d3d9_debug.txt", "a");
-    if (f)
-    {
-      fprintf(f, "  Draw #%u: verts=%u, indices=%u, prims=%u, stride=%u, base_vtx=%u, base_idx=%u\n",
-              s_draw_calls_this_frame, num_vertices, num_indices, prim_count, m_current_stride,
-              base_vertex, base_index);
-      fclose(f);
-    }
+    DIAG("   !! DrawCurrentBatch: NULL buffer  vb=%p ib=%p",
+         static_cast<void*>(m_d3d9_vb.Get()), static_cast<void*>(m_d3d9_ib.Get()));
+    return;
   }
 
-  HRESULT hr = D3D9::device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, base_vertex, 0, num_vertices,
-                                                   base_index, prim_count);
+  // Log every draw for the first few frames, then only first+last draw per frame
+  const bool verbose = Gfx::s_frame_count < 10 || s_draw_calls_this_frame <= 2;
+  if (verbose)
+  {
+    DIAG("   Draw #%u  frame=%u  verts=%u  indices=%u  prims=%u  stride=%u  vb=%u  ib=%u",
+         s_draw_calls_this_frame, Gfx::s_frame_count, num_vertices, num_indices, prim_count,
+         m_current_stride, vb_bytes, ib_bytes);
+  }
+
+  void* data = nullptr;
+  HRESULT hr = m_d3d9_vb->Lock(0, vb_bytes, &data, D3DLOCK_DISCARD);
+  if (FAILED(hr))
+  {
+    DIAG("   !! VB Lock FAILED => %#010x", static_cast<u32>(hr));
+    return;
+  }
+  std::memcpy(data, m_vertex_buffer.data(), vb_bytes);
+  m_d3d9_vb->Unlock();
+
+  hr = m_d3d9_ib->Lock(0, ib_bytes, &data, D3DLOCK_DISCARD);
+  if (FAILED(hr))
+  {
+    DIAG("   !! IB Lock FAILED => %#010x", static_cast<u32>(hr));
+    return;
+  }
+  std::memcpy(data, m_index_buffer.data(), ib_bytes);
+  m_d3d9_ib->Unlock();
+
+  D3D9::device->SetStreamSource(0, m_d3d9_vb.Get(), 0, m_current_stride);
+  D3D9::device->SetIndices(m_d3d9_ib.Get());
+
+  if (verbose)
+    DIAG("   DrawIndexedPrimitive...");
+
+  hr = D3D9::device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, num_vertices, 0, prim_count);
 
   if (FAILED(hr))
   {
-    ERROR_LOG_FMT(VIDEO, "DrawIndexedPrimitive failed: {:#010x}", static_cast<u32>(hr));
+    DIAG("   !! DrawIndexedPrimitive FAILED => %#010x  verts=%u prims=%u stride=%u",
+         static_cast<u32>(hr), num_vertices, prim_count, m_current_stride);
   }
-}
-void VertexManager::ResetRingBuffer()
-{
-  m_vb_write_offset = 0;
-  m_ib_write_offset = 0;
-  m_first_commit_of_frame = true;
+  else if (verbose)
+  {
+    DIAG("   DrawIndexedPrimitive OK");
+  }
 }
 }  // namespace DX9Remix
