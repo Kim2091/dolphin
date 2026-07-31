@@ -29,6 +29,7 @@
 #ifdef _WIN32
 #include "VideoBackends/D3D/VideoBackend.h"
 #include "VideoBackends/D3D12/VideoBackend.h"
+#include "VideoBackends/Remix/VideoBackend.h"
 #endif
 #include "VideoBackends/Null/VideoBackend.h"
 #ifdef HAS_OPENGL
@@ -207,6 +208,7 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
 #ifdef _WIN32
     backends.push_back(std::make_unique<DX11::VideoBackend>());
     backends.push_back(std::make_unique<DX12::VideoBackend>());
+    backends.push_back(std::make_unique<Remix::VideoBackend>());
 #endif
 #ifdef HAS_OPENGL
     backends.push_back(std::make_unique<OGL::VideoBackend>());

@@ -115,6 +115,12 @@ extern const Info<bool> GFX_PREFER_GLES;
 
 extern const Info<bool> GFX_MODS_ENABLE;
 
+// Remix video backend
+extern const Info<std::string> GFX_REMIX_DLL_PATH;
+extern const Info<float> GFX_REMIX_SCENE_SCALE;
+extern const Info<float> GFX_REMIX_LIGHT_SCALE;
+extern const Info<bool> GFX_REMIX_LOG_STATS;
+
 // Graphics.Enhancements
 
 extern const Info<TextureFilteringMode> GFX_ENHANCE_FORCE_TEXTURE_FILTERING;

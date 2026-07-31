@@ -132,6 +132,15 @@ const Info<bool> GFX_PREFER_GLES{{System::GFX, "Settings", "PreferGLES"}, false}
 
 const Info<bool> GFX_MODS_ENABLE{{System::GFX, "Settings", "EnableMods"}, false};
 
+// Remix video backend. RemixDllPath is passed straight to LoadLibrary, so the
+// bare name resolves next to Dolphin.exe; RemixSceneScale is pushed to the
+// runtime as rtx.sceneScale (centimetres per GC world unit) and RemixLightScale
+// multiplies the radiance derived from XF lights.
+const Info<std::string> GFX_REMIX_DLL_PATH{{System::GFX, "Settings", "RemixDllPath"}, "d3d9.dll"};
+const Info<float> GFX_REMIX_SCENE_SCALE{{System::GFX, "Settings", "RemixSceneScale"}, 1.0f};
+const Info<float> GFX_REMIX_LIGHT_SCALE{{System::GFX, "Settings", "RemixLightScale"}, 1.0f};
+const Info<bool> GFX_REMIX_LOG_STATS{{System::GFX, "Settings", "RemixLogStats"}, true};
+
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
 const Info<VertexLoaderType> GFX_VERTEX_LOADER_TYPE{{System::GFX, "Settings", "VertexLoaderType"},
