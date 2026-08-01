@@ -405,10 +405,20 @@ public:
 
   // True when this stage-0 texture was listed in GFX_REMIX_SKY_TEXTURES. This
   // is the reliable route to sky: the runtime's texture-grid categories never
-  // reach API draws, but the SKY bit passed on the instance does.
+  // reach API draws, but the SKY bit passed on the instance does. The veto list
+  // outranks it, so one setting can turn off a wrong verdict from any source.
   bool IsSkyTexture(u64 content_hash) const
   {
+    if (IsSkyVetoed(content_hash))
+      return false;
     return !m_sky_textures.empty() && m_sky_textures.count(content_hash) != 0;
+  }
+
+  // Precedence is veto > manual > auto: a hash named here is never sky, however
+  // it was nominated.
+  bool IsSkyVetoed(u64 hash) const
+  {
+    return !m_sky_veto_hashes.empty() && m_sky_veto_hashes.count(hash) != 0;
   }
 
   // True on the occasional frame we dump per-draw depth state on, so the sky
@@ -599,6 +609,7 @@ private:
   // flickers in and out is worse than sky that is occasionally wrong, and a
   // restart clears it.
   std::unordered_set<u64> m_sky_classified;
+  std::unordered_set<u64> m_sky_veto_hashes;
   // Per-frame object-picking id. Must be non-zero for the runtime to record a
   // pick, and must differ per draw for clicks to resolve to one surface.
   u32 m_next_picking_value = 1;

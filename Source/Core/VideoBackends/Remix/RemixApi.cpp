@@ -500,6 +500,35 @@ u64 NonZeroHash(u64 hash)
 {
   return hash != 0 ? hash : 0xD6E8FEB86659FD93ULL;
 }
+
+// "0xabc,0xdef" -> a set of hashes. Separators are anything that is not a hex
+// digit or an 'x', so commas, spaces and newlines all work.
+void ParseHashList(const std::string& text, std::unordered_set<u64>& out)
+{
+  out.clear();
+  for (size_t i = 0; i < text.size();)
+  {
+    if (std::isxdigit(static_cast<unsigned char>(text[i])) == 0)
+    {
+      ++i;
+      continue;
+    }
+    size_t consumed = 0;
+    try
+    {
+      const u64 hash = std::stoull(text.substr(i), &consumed, 16);
+      if (hash != 0)
+        out.insert(hash);
+    }
+    catch (const std::exception&)
+    {
+      // Malformed or out-of-range entry: skip this token rather than take the
+      // whole backend down over a typo in a config string.
+      consumed = 0;
+    }
+    i += std::max<size_t>(consumed, 1);
+  }
+}
 }  // namespace
 
 RemixApi::RemixApi() = default;
@@ -539,35 +568,15 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_sky_candidates.clear();
   m_sky_classified.clear();
 
-  // "0xabc,0xdef" -> the set of stage-0 texture hashes to treat as skybox.
-  // Separators are anything that is not a hex digit or an 'x', so commas,
-  // spaces and newlines all work.
-  m_sky_textures.clear();
-  const std::string sky_list = Config::Get(Config::GFX_REMIX_SKY_TEXTURES);
-  for (size_t i = 0; i < sky_list.size();)
+  // The stage-0 texture hashes to treat as skybox, and the hashes never to treat
+  // as skybox whatever anything else says.
+  ParseHashList(Config::Get(Config::GFX_REMIX_SKY_TEXTURES), m_sky_textures);
+  ParseHashList(Config::Get(Config::GFX_REMIX_SKY_VETO_HASHES), m_sky_veto_hashes);
+  if (!m_sky_textures.empty() || !m_sky_veto_hashes.empty())
   {
-    if (std::isxdigit(static_cast<unsigned char>(sky_list[i])) == 0)
-    {
-      ++i;
-      continue;
-    }
-    size_t consumed = 0;
-    try
-    {
-      const u64 hash = std::stoull(sky_list.substr(i), &consumed, 16);
-      if (hash != 0)
-        m_sky_textures.insert(hash);
-    }
-    catch (const std::exception&)
-    {
-      // Malformed or out-of-range entry: skip this token rather than take the
-      // whole backend down over a typo in a config string.
-      consumed = 0;
-    }
-    i += std::max<size_t>(consumed, 1);
+    INFO_LOG_FMT(VIDEO, "Remix: {} sky texture hash(es), {} veto hash(es) configured",
+                 m_sky_textures.size(), m_sky_veto_hashes.size());
   }
-  if (!m_sky_textures.empty())
-    INFO_LOG_FMT(VIDEO, "Remix: {} sky texture hash(es) configured", m_sky_textures.size());
   m_light_scale = Config::Get(Config::GFX_REMIX_LIGHT_SCALE);
 
   const std::string dll_path_utf8 = Config::Get(Config::GFX_REMIX_DLL_PATH);
@@ -1294,11 +1303,23 @@ void RemixApi::FlushPendingInstances()
     blend.alphaBlendOp = pending.blend.alpha_blend_op;
     blend.writeMask = pending.blend.write_mask;
 
+    // Auto-detected sky. This runs after EstimateView by design, so the sticky
+    // set is up to date by the time instances are placed. The runtime then
+    // treats these exactly as it treats a manually tagged draw: SKY category ->
+    // CameraType::Sky -> skipped entirely under rtx.skyMode = 1, which is the
+    // mechanism by which Numos replaces the game's sky rather than fighting it.
+    remixapi_InstanceCategoryFlags category_flags = pending.category_flags;
+    if (m_sky_auto_detect >= 2 && m_sky_classified.count(pending.mesh_hash) != 0)
+    {
+      category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+      ++m_stats.sky_auto_tagged;
+    }
+
     remixapi_InstanceInfo instance = {};
     instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
     const bool need_blend_ext = m_gx_color || m_gx_blend;
     instance.pNext = need_blend_ext ? static_cast<void*>(&blend) : static_cast<void*>(&picking);
-    instance.categoryFlags = pending.category_flags;
+    instance.categoryFlags = category_flags;
     instance.mesh = pending.mesh;
     // The submitted transform is V^-1 * (C * MV), and the camera is V, so Remix
     // computes P * V * V^-1 * C * MV = P * C * MV. The rendered image is
@@ -1345,6 +1366,17 @@ void RemixApi::EstimateView()
   {
     for (const u64 hash : m_view_duplicate_hashes)
       m_stats.view_dup_excluded += static_cast<u32>(m_view_samples.erase(hash));
+  }
+
+  // A classified skybox votes for the camera's ROTATION delta with the
+  // translation missing - not a useless hypothesis but an actively wrong one,
+  // which poisons the translation consensus every time the camera moves. Drop
+  // it. Only in tagging mode: mode 1 has to leave the estimate untouched, or its
+  // log-only promise is not worth anything.
+  if (m_sky_auto_detect >= 2)
+  {
+    for (const u64 hash : m_sky_classified)
+      m_stats.view_sky_excluded += static_cast<u32>(m_view_samples.erase(hash));
   }
 
   // GX gives us no view matrix, only combined modelviews. But for STATIC
@@ -1568,6 +1600,8 @@ void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affin
   // means a classified mesh costs nothing to re-test.
   if (m_sky_classified.count(mesh_hash) != 0)
     return;
+  if (IsSkyVetoed(mesh_hash))
+    return;
 
   // Informative-frame gate. With the camera parked, or turning without
   // translating, a skybox and the static world produce the SAME ratio and the
@@ -1646,6 +1680,11 @@ void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affin
   if (candidate.streak < m_sky_auto_frames)
     return;
 
+  // The veto list names textures as readily as meshes, and the texture hash is
+  // only known once the mesh has been seen at least once.
+  if (mesh != m_meshes.end() && IsSkyVetoed(mesh->second.diagnostics.texture_hash))
+    return;
+
   m_sky_classified.insert(mesh_hash);
   if (!m_log_stats || s_sky_classify_log_count >= SKY_CLASSIFY_LOG_CAP)
     return;
@@ -1689,13 +1728,13 @@ void RemixApi::LogCameraRecovery()
 
   INFO_LOG_FMT(VIDEO,
                "Remix frame {} camera: samples {} (dup {}, excluded {}) | inliers {}/{} "
-               "(runner-up {}, tie-breaks {}) | stable W {}/{} ({}%) "
+               "(runner-up {}, tie-breaks {}) | sky excluded {} | stable W {}/{} ({}%) "
                "| pos ({:.1f} {:.1f} {:.1f}) fwd ({:.3f} {:.3f} {:.3f}) up ({:.3f} {:.3f} {:.3f}) "
                "| drift fwd {:.2f} deg up {:.2f} deg | max delta rot {:.3f} deg trans {:.2f}",
                m_frame_index, m_stats.view_samples, m_stats.view_duplicates,
                m_stats.view_dup_excluded, m_stats.view_inliers, m_stats.view_candidates,
-               m_stats.view_runnerup_inliers, m_stats.view_tie_breaks, m_stats.w_stable,
-               m_stats.w_compared, stable_pct,
+               m_stats.view_runnerup_inliers, m_stats.view_tie_breaks, m_stats.view_sky_excluded,
+               m_stats.w_stable, m_stats.w_compared, stable_pct,
                position[0], position[1], position[2], forward[0], forward[1], forward[2], up[0],
                up[1], up[2], AngleBetweenDegrees(forward, VIEW_REFERENCE_FORWARD),
                AngleBetweenDegrees(up, VIEW_REFERENCE_UP), m_view_max_rotation_deg,

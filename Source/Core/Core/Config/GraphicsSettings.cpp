@@ -255,6 +255,11 @@ const Info<int> GFX_REMIX_SKY_AUTO_FRAMES{{System::GFX, "Settings", "RemixSkyAut
 // the only thing separating them.
 const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT{
     {System::GFX, "Settings", "RemixSkyAutoMinExtent"}, 0.25f};
+// Hashes - texture or mesh, same format as RemixSkyTextures - that are never
+// treated as sky, for the day the classifier is wrong about something. Highest
+// precedence: veto beats the manual list, which beats auto-detection.
+const Info<std::string> GFX_REMIX_SKY_VETO_HASHES{
+    {System::GFX, "Settings", "RemixSkyVetoHashes"}, ""};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
