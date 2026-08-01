@@ -94,6 +94,12 @@ struct FrameStats
   u32 alpha_tested = 0;
   u32 logic_op = 0;
 
+  // Draws that had no normals and so got generated flat ones, and how many of
+  // those needed the cross product negating - a positive viewport, a mirroring
+  // modelview, or a game culling front faces rather than back.
+  u32 normals_generated = 0;
+  u32 normals_flipped = 0;
+
   // XF lights by the kind they resolved to. Distant vs sphere is the whole
   // point of reading the attenuation function - a game whose suns show up as
   // spheres is a game rendering nearly black.

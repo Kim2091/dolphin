@@ -255,6 +255,56 @@ void TransformNormal(const float* matrix, const float* in, float* out)
   out[2] = in[0] * matrix[8] + in[1] * matrix[9] + in[2] * matrix[10];
 }
 
+// Determinant of a GX 3x4 modelview's rotation part. Negative means the
+// transform mirrors, and a mirror swaps which side of a triangle its
+// cross-product normal comes out on.
+float RotationDeterminant(const float* m)
+{
+  return m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) +
+         m[2] * (m[4] * m[9] - m[5] * m[8]);
+}
+
+// Whether cross(p1 - p0, p2 - p0) over this draw's vertices points AWAY from the
+// side the game means to light, so a generated flat normal has to be negated.
+//
+// The rule comes out of Clipper.cpp:519-545. In GX clip space the backface test
+// is a signed area, normalZDir <= 0, inverted when xfmem.viewport.ht > 0. Since
+// clip.x = raw0*x + raw1*z, clip.y = raw2*y + raw3*z and clip.w = -z, that area
+// equals -raw0*raw2 * (n . v0) with n = cross(e0, e1) and v0 the view-space
+// position; raw0 and raw2 are positive on any real frustum, so a front face is
+// exactly one whose n points back at the camera - which is what the existing
+// cross product already computes.
+//
+// So the CCW assumption is RIGHT for the ordinary negative-viewport case, not
+// backwards. (Reading it off Vulkan's VK_FRONT_FACE_CLOCKWISE gives the opposite
+// answer only if you miss VertexShaderGen.cpp:876, which negates clip y before
+// the API ever sees it; put that back and the two references agree exactly.)
+// What was actually missing is everything that can flip it:
+//
+//   - the positive-viewport inversion Clipper applies,
+//   - a mirroring modelview, on the path where the vertices are still in object
+//     space and the sign has to survive the instance transform,
+//   - and cull_mode Front, where the game is telling us the back is the side
+//     meant to be seen. cull_mode All never arrives: VertexManagerBase::Flush
+//     gates DrawCurrentBatch on !m_cull_all.
+bool ShouldFlipGeneratedNormals(const float* modelview)
+{
+  bool flip = false;
+
+  // Jimmie Johnson's Anything with an Engine is the known positive-viewport
+  // title; everything else is negative.
+  if (xfmem.viewport.ht > 0.0f)
+    flip = !flip;
+
+  if (modelview != nullptr && RotationDeterminant(modelview) < 0.0f)
+    flip = !flip;
+
+  if (bpmem.genMode.cull_mode == CullMode::Front)
+    flip = !flip;
+
+  return flip;
+}
+
 void Normalize(float* v)
 {
   const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -1093,10 +1143,25 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // requires splitting shared vertices - a shared vertex cannot carry two
     // face normals.
     //
-    // Winding convention: cross(p1 - p0, p2 - p0) assumes counter-clockwise
-    // front faces. If lighting reads inverted across the whole scene, swapping
-    // the two edge vectors here is the one-line fix. Instances are submitted
-    // double-sided, so a wrong guess costs shading, never visibility.
+    // Instances are submitted double-sided, so the sign costs shading rather
+    // than visibility - but a normal on the wrong side is the side that receives
+    // light and GI, so it is not cosmetic either.
+    //
+    // On the baked path the vertices are already in view space and the instance
+    // transform is identity, so there is no modelview to un-mirror.
+    const float* const winding_matrix =
+        bake_vertices ? nullptr :
+                        &xfmem.posMatrices[(uniform_matrix ?
+                                                uniform_matrix_index :
+                                                static_cast<u32>(
+                                                    g_main_cp_state.matrix_index_a.PosNormalMtxIdx)) *
+                                           4];
+    const bool flip = ShouldFlipGeneratedNormals(winding_matrix);
+    const float normal_sign = flip ? -1.0f : 1.0f;
+    ++stats.normals_generated;
+    if (flip)
+      ++stats.normals_flipped;
+
     const size_t triangle_count = m_indices.size() / 3;
     m_flat_vertices.clear();
     m_flat_vertices.reserve(triangle_count * 3);
@@ -1113,8 +1178,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                            v1.position[2] - v0.position[2]};
       const float e1[3] = {v2.position[0] - v0.position[0], v2.position[1] - v0.position[1],
                            v2.position[2] - v0.position[2]};
-      float normal[3] = {e0[1] * e1[2] - e0[2] * e1[1], e0[2] * e1[0] - e0[0] * e1[2],
-                         e0[0] * e1[1] - e0[1] * e1[0]};
+      float normal[3] = {normal_sign * (e0[1] * e1[2] - e0[2] * e1[1]),
+                         normal_sign * (e0[2] * e1[0] - e0[0] * e1[2]),
+                         normal_sign * (e0[0] * e1[1] - e0[1] * e1[0])};
       Normalize(normal);
 
       for (const remixapi_HardcodedVertex* source : {&v0, &v1, &v2})
