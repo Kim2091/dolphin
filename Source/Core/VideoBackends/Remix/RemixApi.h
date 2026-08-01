@@ -80,6 +80,9 @@ struct FrameStats
   // cross-frame correspondence, so the delta built from it pairs two arbitrary
   // instances - Wind Waker's ocean tiles and repeated props are exactly this.
   u32 view_duplicates = 0;
+  // How many of those were actually dropped from the electorate. Zero with the
+  // electorate fix off, which is what makes the two counters worth separating.
+  u32 view_dup_excluded = 0;
 
   // Where TEV stage 0's rasterized colour came from, by GX's own rules.
   // `color_register` is the case that was being dropped outright - a game
@@ -418,7 +421,14 @@ private:
   };
   // How many draws may vote on the camera delta, and how many of those the
   // O(n^2) consensus pass will consider as candidates.
-  static constexpr size_t MAX_VIEW_SAMPLES = 256;
+  //
+  // 256 was a cap on the ELECTORATE, and the samples live in an unordered_map -
+  // so on a scene submitting well over a thousand instances it was an arbitrary
+  // submission-order slice, and a slice full of moving objects outvotes a static
+  // world. The vote is O(48*n), so 2048 costs about 80 KB and a few hundred
+  // thousand small matrix compares. The old value is kept for the A/B.
+  static constexpr size_t MAX_VIEW_SAMPLES = 2048;
+  static constexpr size_t LEGACY_MAX_VIEW_SAMPLES = 256;
   static constexpr size_t MAX_VIEW_CANDIDATES = 48;
   // Draws below this vertex count are more likely to be effects or overlays
   // than world geometry, and a bad vote costs more than a missing one.
@@ -498,6 +508,7 @@ private:
   Affine m_view_inverse_previous = {};
   u32 m_view_miss_streak = 0;
   bool m_camera_recovery = false;
+  bool m_view_electorate_fix = true;
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;

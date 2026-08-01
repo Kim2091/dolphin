@@ -467,6 +467,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
+  m_view_electorate_fix = Config::Get(Config::GFX_REMIX_VIEW_ELECTORATE_FIX);
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
@@ -1147,7 +1148,8 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
   // same hash however the camera moves. Palette draws have no single modelview
   // and their baked view-space vertices re-hash every frame, so they cannot
   // take part either way.
-  if (raw_modelview != nullptr && m_view_samples.size() < MAX_VIEW_SAMPLES &&
+  const size_t sample_cap = m_view_electorate_fix ? MAX_VIEW_SAMPLES : LEGACY_MAX_VIEW_SAMPLES;
+  if (raw_modelview != nullptr && m_view_samples.size() < sample_cap &&
       vertices.size() >= MIN_VIEW_SAMPLE_VERTICES)
   {
     Affine modelview = {};
@@ -1247,6 +1249,18 @@ void RemixApi::EstimateView()
   m_view_delta_translation = 0.0f;
   if (!m_camera_recovery)
     return;
+
+  // A mesh hash submitted more than once this frame corresponds to nothing in
+  // particular: emplace kept whichever instance arrived first, so pairing it
+  // against last frame's first instance compares two arbitrary members of a set
+  // of identical props. The delta that falls out is neither the camera's nor any
+  // one object's, and Wind Waker's ocean tiles produce a lot of them. Drop them
+  // from the electorate entirely rather than letting them vote on noise.
+  if (m_view_electorate_fix)
+  {
+    for (const u64 hash : m_view_duplicate_hashes)
+      m_stats.view_dup_excluded += static_cast<u32>(m_view_samples.erase(hash));
+  }
 
   // GX gives us no view matrix, only combined modelviews. But for STATIC
   // geometry the world transform is constant, so it cancels across a frame
@@ -1414,11 +1428,13 @@ void RemixApi::LogCameraRecovery()
   const float up[3] = {v[4], v[5], v[6]};
 
   INFO_LOG_FMT(VIDEO,
-               "Remix frame {} camera: samples {} (dup {}) | inliers {}/{} | stable W {}/{} ({}%) "
+               "Remix frame {} camera: samples {} (dup {}, excluded {}) | inliers {}/{} | "
+               "stable W {}/{} ({}%) "
                "| pos ({:.1f} {:.1f} {:.1f}) fwd ({:.3f} {:.3f} {:.3f}) up ({:.3f} {:.3f} {:.3f}) "
                "| drift fwd {:.2f} deg up {:.2f} deg | max delta rot {:.3f} deg trans {:.2f}",
-               m_frame_index, m_stats.view_samples, m_stats.view_duplicates, m_stats.view_inliers,
-               m_stats.view_candidates, m_stats.w_stable, m_stats.w_compared, stable_pct,
+               m_frame_index, m_stats.view_samples, m_stats.view_duplicates,
+               m_stats.view_dup_excluded, m_stats.view_inliers, m_stats.view_candidates,
+               m_stats.w_stable, m_stats.w_compared, stable_pct,
                position[0], position[1], position[2], forward[0], forward[1], forward[2], up[0],
                up[1], up[2], AngleBetweenDegrees(forward, VIEW_REFERENCE_FORWARD),
                AngleBetweenDegrees(up, VIEW_REFERENCE_UP), m_view_max_rotation_deg,

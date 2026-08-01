@@ -207,6 +207,15 @@ const Info<bool> GFX_REMIX_GX_LIGHT_FIX{{System::GFX, "Settings", "RemixGxLightF
 // considered to have ended. It stands in for D3D9's Light.Range, which the
 // radiance conversion needs and GX simply does not have.
 const Info<float> GFX_REMIX_LIGHT_RANGE{{System::GFX, "Settings", "RemixLightRange"}, 5000.0f};
+// Let every persisting draw vote on the camera delta, and drop the ones that
+// cannot mean anything. The sample map was capped at 256 entries, which on a
+// scene submitting well over a thousand instances makes the electorate an
+// arbitrary submission-order slice; and a mesh hash submitted more than once in
+// a frame (ocean tiles, repeated props) has no unique cross-frame
+// correspondence, so the delta built from it pairs two arbitrary instances.
+// Off is the 256-entry cap plus keep-first, exactly the pre-fix behaviour.
+const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX{
+    {System::GFX, "Settings", "RemixViewElectorateFix"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
