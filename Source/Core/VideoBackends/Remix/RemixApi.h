@@ -191,6 +191,15 @@ struct FrameStats
   // memcpy inside the runtime.
   u64 ui_raster_us = 0;
   u64 ui_upload_us = 0;
+  // UI draws whose final alpha was resolved from the TEV chain rather than
+  // guessed from stage-0 texture alpha. A game whose HUD is drawn when it should
+  // be hidden, with this at zero, is a game whose chain the evaluator gave up on.
+  u32 ui_tev_alpha = 0;
+  // Why the TEV alpha evaluator gave up, when it did.
+  u32 tev_bail_stages = 0;
+  u32 tev_bail_konst = 0;
+  u32 tev_bail_compare = 0;
+  u32 tev_bail_rasterized = 0;
   // A lit draw whose channel ambient register was bright enough to matter. GX
   // ambient has no Remix analogue at all - the path tracer's GI has to stand in
   // for it - so this quantifies how much of the frame's light was ambient before
@@ -318,6 +327,25 @@ struct DrawBlendState
   bool alpha_test_enabled = false;
   u8 alpha_test_compare = 7;   // VK_COMPARE_OP_ALWAYS, and GX's Always
   u8 alpha_test_reference = 0;
+
+  // The RAW GX alpha test, both comparators and the op joining them. The three
+  // fields above are the single-comparator reduction Remix's material state can
+  // express; the software UI raster can run the real thing, and a draw the
+  // console rejects through an Or/Xor configuration must not be drawn just
+  // because the reduction had to give up and say Always.
+  u8 raw_alpha_compare0 = 7;
+  u8 raw_alpha_compare1 = 7;
+  u8 raw_alpha_logic = 0;
+  u8 raw_alpha_reference0 = 0;
+  u8 raw_alpha_reference1 = 0;
+
+  // Final alpha as the TEV chain resolves it, sampled at the four corners of
+  // (texture alpha, rasterized alpha) in the order (0,0) (1,0) (0,1) (1,1) and
+  // bilinearly interpolated between - which is exact for GX's modulate chains.
+  // False when the chain is not bilinear in that pair, in which case nothing
+  // downstream may rely on these.
+  bool tev_alpha_known = false;
+  std::array<float, 4> tev_alpha_corners = {1.0f, 1.0f, 1.0f, 1.0f};
   bool blend_enabled = false;
   u8 src_color_factor = 1;  // VK_BLEND_FACTOR_ONE
   u8 dst_color_factor = 0;  // VK_BLEND_FACTOR_ZERO
@@ -444,11 +472,14 @@ public:
   // the vertices have already been baked into view space. `viewport` is the
   // draw's viewport as an EFB-space rect (x, y, width, height) - a game is free
   // to put its HUD in a sub-rect and a full-screen assumption would misplace it.
+  // `clip` is the draw's scissor rect (left, top, right, bottom) in EFB space,
+  // from the same ComputeScissorRects every other backend uses.
   void SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                     const std::vector<u32>& indices, const float* modelview,
                     const std::array<float, 6>& ortho_projection,
-                    const std::array<float, 4>& viewport, const RemixTexture* texture,
-                    u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v, const DrawBlendState& blend);
+                    const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
+                    const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
+                    const DrawBlendState& blend);
 
   // Records which XF lights a draw switched on, and what each one MEANS to that
   // draw - GX puts the attenuation function on the referencing channel, not on

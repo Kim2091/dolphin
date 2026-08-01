@@ -28,7 +28,7 @@ constexpr u32 MulDiv255(u32 a, u32 b)
 // GX CompareMode, which is already Remix's and Vulkan's numbering. Alpha and
 // reference are both 0-255 here, so the test is exact rather than depending on
 // float equality for the == and != cases.
-bool AlphaPasses(u8 compare, u32 alpha, u32 reference)
+bool CompareAlpha(u8 compare, u32 alpha, u32 reference)
 {
   switch (compare)
   {
@@ -48,6 +48,27 @@ bool AlphaPasses(u8 compare, u32 alpha, u32 reference)
     return alpha >= reference;
   default:
     return true;  // Always
+  }
+}
+
+// The full GX alpha test: two comparators joined by a logic op (Tev.cpp
+// TevAlphaTest). Costs nothing extra in a software rasterizer, and reducing it
+// to comparator 0 alone turns every Or/Xor/Xnor configuration into "always
+// pass", which draws things the console rejects.
+bool AlphaPasses(u8 compare0, u32 reference0, u8 compare1, u32 reference1, u8 logic, u32 alpha)
+{
+  const bool first = CompareAlpha(compare0, alpha, reference0);
+  const bool second = CompareAlpha(compare1, alpha, reference1);
+  switch (logic)
+  {
+  case 0:
+    return first && second;
+  case 1:
+    return first || second;
+  case 2:
+    return first != second;
+  default:
+    return first == second;
   }
 }
 }  // namespace
@@ -286,12 +307,13 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
   int max_x = static_cast<int>(std::ceil(std::max({ax, bx, cx})));
   int min_y = static_cast<int>(std::floor(std::min({ay, by, cy})));
   int max_y = static_cast<int>(std::ceil(std::max({ay, by, cy})));
-  min_x = std::max(min_x, 0);
-  // Clipped to this thread's band as well as to the surface. Every thread sees
-  // every triangle; the band is what makes their writes disjoint.
-  min_y = std::max(min_y, clip_min_y);
-  max_x = std::min(max_x, static_cast<int>(m_width) - 1);
-  max_y = std::min(max_y, std::min(clip_max_y, static_cast<int>(m_height) - 1));
+  // Clipped to the surface, to the draw's own scissor rect, and to this thread's
+  // band. Every thread sees every triangle; the band is what makes their writes
+  // disjoint.
+  min_x = std::max({min_x, 0, call.clip_left});
+  min_y = std::max({min_y, clip_min_y, call.clip_top});
+  max_x = std::min({max_x, static_cast<int>(m_width) - 1, call.clip_right});
+  max_y = std::min({max_y, clip_max_y, static_cast<int>(m_height) - 1, call.clip_bottom});
   if (min_x > max_x || min_y > max_y)
     return;
 
@@ -322,6 +344,8 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
 
   const u32 alpha_reference =
       static_cast<u32>(std::clamp(call.alpha_reference, 0.0f, 1.0f) * 255.0f + 0.5f);
+  const u32 alpha_reference1 =
+      static_cast<u32>(std::clamp(call.alpha_reference1, 0.0f, 1.0f) * 255.0f + 0.5f);
 
   // A flat, opaque, untextured span is a fade, a letterbox bar or a solid panel,
   // and every pixel in it is the same value - so it becomes a fill rather than a
@@ -397,36 +421,64 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
                         w0 * a.v + w1 * b.v + w2 * c.v);
       }
 
-      if (!white)
+      u32 mr = flat_r, mg = flat_g, mb = flat_b, ma = flat_a;
+      if (!flat_color)
       {
-        u32 mr = flat_r, mg = flat_g, mb = flat_b, ma = flat_a;
-        if (!flat_color)
+        const auto lerp = [&](int i) {
+          return static_cast<u32>(
+              std::clamp(w0 * a.color[i] + w1 * b.color[i] + w2 * c.color[i], 0.0f, 1.0f) * 255.0f +
+              0.5f);
+        };
+        mr = lerp(0);
+        mg = lerp(1);
+        mb = lerp(2);
+        ma = lerp(3);
+      }
+
+      if (call.tev_alpha_known)
+      {
+        // GX's own answer for this draw's alpha, bilinear in (texture alpha,
+        // rasterized alpha). It REPLACES the product of the two rather than
+        // scaling it, because the chain already consumed both - modulating by
+        // the vertex alpha afterwards would apply it twice.
+        const float t = static_cast<float>(source >> 24) / 255.0f;
+        const float r = static_cast<float>(ma) / 255.0f;
+        const float low = call.tev_alpha_corners[0] +
+                          (call.tev_alpha_corners[1] - call.tev_alpha_corners[0]) * t;
+        const float high = call.tev_alpha_corners[2] +
+                           (call.tev_alpha_corners[3] - call.tev_alpha_corners[2]) * t;
+        const float resolved = std::clamp(low + (high - low) * r, 0.0f, 1.0f);
+        source = (source & 0x00FFFFFFu) | (static_cast<u32>(resolved * 255.0f + 0.5f) << 24);
+        // Colour still modulates; alpha is already final.
+        if (!white)
         {
-          const auto lerp = [&](int i) {
-            return static_cast<u32>(
-                std::clamp(w0 * a.color[i] + w1 * b.color[i] + w2 * c.color[i], 0.0f, 1.0f) *
-                    255.0f +
-                0.5f);
-          };
-          mr = lerp(0);
-          mg = lerp(1);
-          mb = lerp(2);
-          ma = lerp(3);
+          source = MulDiv255(source & 0xFF, mr) | (MulDiv255((source >> 8) & 0xFF, mg) << 8) |
+                   (MulDiv255((source >> 16) & 0xFF, mb) << 16) | (source & 0xFF000000u);
         }
+      }
+      else if (!white)
+      {
         source = MulDiv255(source & 0xFF, mr) | (MulDiv255((source >> 8) & 0xFF, mg) << 8) |
                  (MulDiv255((source >> 16) & 0xFF, mb) << 16) |
                  (MulDiv255((source >> 24) & 0xFF, ma) << 24);
       }
 
       const u32 source_alpha = source >> 24;
-      if (!AlphaPasses(call.alpha_compare, source_alpha, alpha_reference))
+      if (!AlphaPasses(call.alpha_compare, alpha_reference, call.alpha_compare1, alpha_reference1,
+                       call.alpha_logic, source_alpha))
         continue;
 
       u32& target = scanline[x];
       switch (call.blend)
       {
       case BlendMode::Opaque:
-        target = source | 0xFF000000u;
+        // Keep the source alpha rather than stamping 255. On console "opaque"
+        // writes into the framebuffer that IS the scene, so alpha is free to be
+        // meaningless; here the result is COMPOSITED over the traced frame, so
+        // alpha is coverage. Forcing it opaque printed every transparent texel
+        // of a UI texture as whatever garbage RGB sat in it - the speckled boxes
+        // behind Wind Waker's HUD icons were exactly this.
+        target = source;
         break;
       case BlendMode::Additive:
       {

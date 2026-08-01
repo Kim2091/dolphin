@@ -128,6 +128,7 @@ extern const Info<bool> GFX_REMIX_TRACE_MODELVIEWS;
 extern const Info<bool> GFX_REMIX_CAMERA_FROM_MODELVIEW;
 extern const Info<int> GFX_REMIX_UI_MODE;
 extern const Info<float> GFX_REMIX_UI_OVERLAY_SCALE;
+extern const Info<int> GFX_REMIX_UI_DUMP_FRAME;
 extern const Info<float> GFX_REMIX_WORLD_UI_DISTANCE;
 extern const Info<bool> GFX_REMIX_WORLD_UI_FLIP_Y;
 extern const Info<bool> GFX_REMIX_CAMERA_RECOVERY;

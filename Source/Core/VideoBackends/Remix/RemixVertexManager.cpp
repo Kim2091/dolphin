@@ -13,6 +13,14 @@
 #include "VideoBackends/Remix/RemixApi.h"
 #include "VideoBackends/Remix/RemixTexture.h"
 
+// For the TEV register/konst alpha constants, which are where a GX game puts the
+// per-draw fade that decides whether a HUD element is visible at all.
+#include "Core/System.h"
+#include "VideoCommon/PixelShaderManager.h"
+
+// For ComputeScissorRects: the UI overlay has to clip exactly the way every
+// other backend does, or geometry the game scissored away is drawn anyway.
+#include "VideoCommon/BPFunctions.h"
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/NativeVertexFormat.h"
@@ -412,6 +420,166 @@ DstBlendFactor RemoveSrcColorUsage(DstBlendFactor factor)
 // Without it every fire, glow, light shaft, window and water surface is opaque
 // geometry - and in a path tracer that is worse than in a rasterizer, because
 // those cards also cast full shadows.
+// Evaluate the TEV ALPHA chain far enough to learn what a draw's final alpha
+// actually is, which is not what this backend has been assuming.
+//
+// It read alpha as "stage 0's texture alpha times the vertex/register colour
+// alpha". GX resolves it through the whole stage chain, and the standard way a
+// game hides or fades a HUD element is to multiply in a per-draw CONSTANT held
+// in a TEV register (GXSetTevColor) or a konst - one BP write, no vertex edits.
+// Wind Waker's title screen does exactly this: one stage computing
+// lerp(ZERO, TEXA, A0), with an alpha test of >= 64. Set A0 to zero and every
+// pixel fails; miss A0 and the entire gameplay HUD renders over the title.
+//
+// The chain is evaluated TWICE, with texture alpha pinned to 0 and to 255, and
+// again with rasterized alpha at both extremes. If the result does not depend on
+// rasterized alpha, then alpha is affine in texture alpha and
+//   alpha(t) = bias + scale * t
+// describes it exactly - which covers lerp(ZERO, TEXA, K) with bias 0, scale K.
+// Anything this cannot resolve returns false and leaves the old behaviour alone;
+// being wrong in the conservative direction only costs what we already had.
+// Tev.h:196-198, copied rather than included so the software backend's private
+// header is not pulled into this one.
+constexpr std::array<int, 4> s_tev_bias = {0, 128, -128, 0};
+constexpr std::array<int, 4> s_tev_scale_left = {0, 1, 2, 0};
+constexpr std::array<int, 4> s_tev_scale_right = {0, 0, 0, 1};
+
+// Why the evaluator gave up, when it did. Purely so a low resolve rate can be
+// explained instead of guessed at.
+enum class TevAlphaBail
+{
+  None,
+  TooManyStages,
+  Konst,
+  CompareMode,
+  DependsOnRasterized,
+};
+TevAlphaBail g_tev_alpha_bail = TevAlphaBail::None;
+
+bool ResolveTevAlpha(std::array<float, 4>& out_corners)
+{
+  g_tev_alpha_bail = TevAlphaBail::None;
+  auto& system = Core::System::GetInstance();
+  const auto& constants = system.GetPixelShaderManager().constants;
+
+  const u32 stages = bpmem.genMode.numtevstages + 1;
+  if (stages > 16)
+  {
+    g_tev_alpha_bail = TevAlphaBail::TooManyStages;
+    return false;
+  }
+
+  // GX konst alpha selections, in KonstSel order: the eight fixed fractions and
+  // then the four K registers' components. Only the alpha-legal entries matter.
+  const auto konst_alpha = [&](u32 stage) -> int {
+    const u32 sel = static_cast<u32>(bpmem.tevksel.GetKonstAlpha(stage));
+    if (sel <= 7)  // 1, 7/8, 6/8 ... 1/8
+      return static_cast<int>(255 - sel * 32);
+    if (sel >= 16 && sel < 32)
+    {
+      const u32 reg = (sel - 16) % 4;
+      const u32 component = (sel - 16) / 4;  // 0 = R, 1 = G, 2 = B, 3 = A
+      return constants.kcolors[reg][component];
+    }
+    return -1;  // reserved / not alpha-legal
+  };
+
+  const auto evaluate = [&](int texture_alpha, int ras_alpha, int& result) {
+    // Registers start at whatever GXSetTevColor left, exactly as Tev.cpp:398-404
+    // seeds them, and each stage writes its own destination.
+    std::array<int, 4> reg = {constants.colors[0][3], constants.colors[1][3],
+                              constants.colors[2][3], constants.colors[3][3]};
+    for (u32 stage = 0; stage < stages; ++stage)
+    {
+      const auto& ac = bpmem.combiners[stage].alphaC;
+      const int konst = konst_alpha(stage);
+      const auto input = [&](u32 source) -> int {
+        switch (source)
+        {
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+          return reg[source];  // APREV, A0, A1, A2
+        case 4:
+          return texture_alpha;
+        case 5:
+          return ras_alpha;
+        case 6:
+          return konst;
+        default:
+          return 0;  // ZERO
+        }
+      };
+      const int a = input(static_cast<u32>(ac.a.Value()));
+      const int b = input(static_cast<u32>(ac.b.Value()));
+      const int c = input(static_cast<u32>(ac.c.Value()));
+      const int d = input(static_cast<u32>(ac.d.Value()));
+      if (a < 0 || b < 0 || c < 0 || d < 0)
+      {
+        g_tev_alpha_bail = TevAlphaBail::Konst;
+        return false;
+      }
+      // Comparison mode is a different formula entirely and is not worth
+      // modelling for UI; bail rather than guess.
+      if (ac.bias == TevBias::Compare)
+      {
+        g_tev_alpha_bail = TevAlphaBail::CompareMode;
+        return false;
+      }
+
+      // Tev.cpp:140-155, in the same order and with the same rounding.
+      const int cc = c + (c >> 7);
+      int temp = a * (256 - cc) + b * cc;
+      temp <<= s_tev_scale_left[static_cast<u32>(ac.scale.Value())];
+      temp += (ac.scale == TevScale::Divide2) ? 0 : (ac.op == TevOp::Sub) ? 127 : 128;
+      temp = ac.op == TevOp::Sub ? (-temp >> 8) : (temp >> 8);
+      int value = ((d + s_tev_bias[static_cast<u32>(ac.bias.Value())])
+                   << s_tev_scale_left[static_cast<u32>(ac.scale.Value())]) +
+                  temp;
+      value >>= s_tev_scale_right[static_cast<u32>(ac.scale.Value())];
+      if (ac.clamp)
+        value = std::clamp(value, 0, 255);
+      else
+        value = std::clamp(value, -1024, 1023);
+      reg[static_cast<u32>(ac.dest.Value())] = value;
+    }
+    result = reg[static_cast<u32>(bpmem.combiners[stages - 1].alphaC.dest.Value())];
+    return true;
+  };
+
+  // Sample the chain at the four corners of (texture alpha, rasterized alpha).
+  // Both are free variables: GX's standard modulate is TEXA * RASA, which is
+  // BILINEAR in the pair - treating only texture alpha as free bailed on 146 of
+  // 149 draws, which is to say on essentially everything.
+  int corner[4] = {};
+  if (!evaluate(0, 0, corner[0]) || !evaluate(255, 0, corner[1]) ||
+      !evaluate(0, 255, corner[2]) || !evaluate(255, 255, corner[3]))
+  {
+    return false;
+  }
+
+  // Four corners describe the chain only if it really is bilinear. Check the
+  // midpoint against what bilinear interpolation predicts and give up if the
+  // chain is doing something else (a square, a comparison, a clamp biting
+  // mid-range). Cheap, and it keeps the evaluator honest rather than plausible.
+  int middle = 0;
+  if (!evaluate(128, 128, middle))
+    return false;
+  const float predicted =
+      0.25f * (static_cast<float>(corner[0]) + static_cast<float>(corner[1]) +
+               static_cast<float>(corner[2]) + static_cast<float>(corner[3]));
+  if (std::abs(predicted - static_cast<float>(middle)) > 3.0f)
+  {
+    g_tev_alpha_bail = TevAlphaBail::DependsOnRasterized;
+    return false;
+  }
+
+  for (int i = 0; i < 4; ++i)
+    out_corners[i] = static_cast<float>(corner[i]) / 255.0f;
+  return true;
+}
+
 void ResolveBlend(DrawBlendState& out, FrameStats& stats)
 {
   const BlendMode& mode = bpmem.blendmode;
@@ -895,7 +1063,31 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // proxies - but there is no depth buffer here for them to write to, so
   // submitting them just adds solid geometry the game never meant to be seen.
   // Mirrors the rule in RenderState.cpp: color_update && TestResult() != Fail.
-  if ((!bpmem.blendmode.color_update && !bpmem.blendmode.alpha_update) ||
+  //
+  // The alpha_update half has to be qualified the way BlendingState::Generate
+  // qualifies it (RenderState.cpp:115-119): GX can only write destination alpha
+  // when the EFB format HAS one, and on RGB8_Z24 / Z24 / RGB565_Z16 an
+  // alpha-only write is literally a no-op (SWEfbInterface.cpp:40-48). Testing
+  // the raw bit let the classic "write an EFB alpha mask" draw through, and it
+  // then rendered as opaque geometry.
+  const bool target_has_alpha = bpmem.zcontrol.pixel_format == PixelFormat::RGBA6_Z24;
+  const bool writes_colour = bpmem.blendmode.color_update;
+  const bool writes_alpha = bpmem.blendmode.alpha_update && target_has_alpha;
+
+  // Three configurations that are algebraic no-ops on console - the game is
+  // using them to say "draw nothing" - and that this backend would otherwise
+  // render as solid geometry:
+  //   - a NoOp logic op (SWEfbInterface.cpp:353-355; RenderState.cpp:162-169
+  //     turns it straight into color_update = false)
+  //   - Zero * src + One * dst, which leaves the destination bit-exact
+  //     (SWEfbInterface.cpp:312-332)
+  const bool logic_noop = !bpmem.blendmode.blend_enable && bpmem.blendmode.logic_op_enable &&
+                          bpmem.blendmode.logic_mode == LogicOp::NoOp;
+  const bool blend_noop = bpmem.blendmode.blend_enable && !bpmem.blendmode.subtract &&
+                          bpmem.blendmode.src_factor == SrcBlendFactor::Zero &&
+                          bpmem.blendmode.dst_factor == DstBlendFactor::One;
+
+  if ((!writes_colour && !writes_alpha) || logic_noop || blend_noop ||
       bpmem.alpha_test.TestResult() == AlphaTestResult::Fail)
   {
     ++stats.skipped_invisible;
@@ -1102,6 +1294,25 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     blend.alpha_test_compare = alpha_test_type;
     blend.alpha_test_reference = alpha_reference;
     blend.alpha_test_enabled = alpha_test_type != 7;
+
+    // The raw test and the resolved TEV alpha ride alongside, for consumers that
+    // can run the real thing rather than the single-comparator reduction.
+    blend.raw_alpha_compare0 = static_cast<u8>(bpmem.alpha_test.comp0.Value());
+    blend.raw_alpha_compare1 = static_cast<u8>(bpmem.alpha_test.comp1.Value());
+    blend.raw_alpha_logic = static_cast<u8>(bpmem.alpha_test.logic.Value());
+    blend.raw_alpha_reference0 = static_cast<u8>(bpmem.alpha_test.ref0.Value());
+    blend.raw_alpha_reference1 = static_cast<u8>(bpmem.alpha_test.ref1.Value());
+    blend.tev_alpha_known = ResolveTevAlpha(blend.tev_alpha_corners);
+    if (!blend.tev_alpha_known)
+    {
+      switch (g_tev_alpha_bail)
+      {
+      case TevAlphaBail::TooManyStages: ++stats.tev_bail_stages; break;
+      case TevAlphaBail::Konst: ++stats.tev_bail_konst; break;
+      case TevAlphaBail::CompareMode: ++stats.tev_bail_compare; break;
+      default: ++stats.tev_bail_rasterized; break;
+      }
+    }
     if (blend.alpha_test_enabled)
       ++stats.alpha_tested;
 
@@ -1431,19 +1642,63 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // rasterized to pixels and composited after the frame is traced, which is
     // the only way UI comes out looking like UI.
     //
-    // The viewport, in EFB space, exactly as BPFunctions::SetViewport derives it
-    // for every other backend (the scissor offset is the same one
-    // VertexManagerBase::CalculateZSlope subtracts). A game is free to put its
-    // HUD in a sub-rect, and assuming full-screen would silently misplace it.
-    const float scissor_x = bpmem.scissorOffset.x * 2.0f;
-    const float scissor_y = bpmem.scissorOffset.y * 2.0f;
+    // Viewport AND scissor, derived exactly the way BPFunctions does it for
+    // every other backend - same ComputeScissorRects, same Best() rectangle, so
+    // the offsets can never disagree with what the game intended.
+    //
+    // The scissor is not optional decoration here. GX games clip UI with it
+    // constantly - sliding panels, wipes, text windows, and banks of elements
+    // that are all drawn but scissored down to whichever one is showing. Without
+    // it every one of them appears at once.
+    const BPFunctions::ScissorResult scissor = BPFunctions::ComputeScissorRects(
+        bpmem.scissorTL, bpmem.scissorBR, bpmem.scissorOffset, xfmem.viewport);
+    const BPFunctions::ScissorRect native_rc = scissor.Best();
     const std::array<float, 4> viewport = {
-        (xfmem.viewport.xOrig - scissor_x) - xfmem.viewport.wd,
-        (xfmem.viewport.yOrig - scissor_y) + xfmem.viewport.ht, 2.0f * xfmem.viewport.wd,
-        -2.0f * xfmem.viewport.ht};
+        (xfmem.viewport.xOrig - static_cast<float>(native_rc.x_off)) - xfmem.viewport.wd,
+        (xfmem.viewport.yOrig - static_cast<float>(native_rc.y_off)) + xfmem.viewport.ht,
+        2.0f * xfmem.viewport.wd, -2.0f * xfmem.viewport.ht};
+    const std::array<float, 4> clip = {
+        static_cast<float>(native_rc.rect.left), static_cast<float>(native_rc.rect.top),
+        static_cast<float>(native_rc.rect.right), static_cast<float>(native_rc.rect.bottom)};
+
+    // One frame's worth of the state that decides whether a UI draw is visible
+    // on console. The backend reads final alpha from stage 0's texture only,
+    // while GX resolves it through the whole TEV chain - so a HUD element faded
+    // out by a TEV register or konst alpha is invisible on hardware and fully
+    // opaque here. This log is what says whether that is actually happening,
+    // rather than assuming it.
+    if (g_remix_api->ShouldTraceDraws() && stats.ui_placed < 12)
+    {
+      const u32 stages = bpmem.genMode.numtevstages + 1;
+      std::string alpha_chain;
+      for (u32 stage = 0; stage < stages && stage < 16; ++stage)
+      {
+        alpha_chain += fmt::format(
+            "{}[a{} b{} c{} d{} k{} ->{}]", stage == 0 ? "" : " ",
+            static_cast<u32>(bpmem.combiners[stage].alphaC.a.Value()),
+            static_cast<u32>(bpmem.combiners[stage].alphaC.b.Value()),
+            static_cast<u32>(bpmem.combiners[stage].alphaC.c.Value()),
+            static_cast<u32>(bpmem.combiners[stage].alphaC.d.Value()),
+            static_cast<u32>(bpmem.tevksel.GetKonstAlpha(stage)),
+            static_cast<u32>(bpmem.combiners[stage].alphaC.dest.Value()));
+      }
+      INFO_LOG_FMT(VIDEO,
+                   "Remix UI draw {}: tex {:#018x} | blend en {} src {} dst {} sub {} logic {} op "
+                   "{} | colorupd {} alphaupd {} pixfmt {} | atest {:#010x} | dstalpha {:#x} | "
+                   "verts {} | tev stages {} alpha {}",
+                   stats.ui_placed, albedo != nullptr ? albedo->GetContentHash() : 0,
+                   bpmem.blendmode.blend_enable ? 1 : 0,
+                   static_cast<u32>(bpmem.blendmode.src_factor.Value()),
+                   static_cast<u32>(bpmem.blendmode.dst_factor.Value()),
+                   bpmem.blendmode.subtract ? 1 : 0, bpmem.blendmode.logic_op_enable ? 1 : 0,
+                   static_cast<u32>(bpmem.blendmode.logic_mode.Value()),
+                   bpmem.blendmode.color_update ? 1 : 0, bpmem.blendmode.alpha_update ? 1 : 0,
+                   static_cast<u32>(bpmem.zcontrol.pixel_format.Value()), bpmem.alpha_test.hex,
+                   bpmem.dstalpha.hex, out_vertices->size(), stages, alpha_chain);
+    }
 
     std::array<float, 6> ortho_raw = xfmem.projection.rawProjection;
-    g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview, ortho_raw, viewport,
+    g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview, ortho_raw, viewport, clip,
                               albedo, filter_mode, wrap_mode_u, wrap_mode_v, blend);
     return;
   }

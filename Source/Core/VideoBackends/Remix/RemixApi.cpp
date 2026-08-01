@@ -582,6 +582,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_trace_modelviews = Config::Get(Config::GFX_REMIX_TRACE_MODELVIEWS);
   m_camera_from_modelview = Config::Get(Config::GFX_REMIX_CAMERA_FROM_MODELVIEW);
   m_ui_mode = Config::Get(Config::GFX_REMIX_UI_MODE);
+  m_ui_dump_frame = Config::Get(Config::GFX_REMIX_UI_DUMP_FRAME);
   m_world_ui_distance = Config::Get(Config::GFX_REMIX_WORLD_UI_DISTANCE);
   m_world_ui_flip_y = Config::Get(Config::GFX_REMIX_WORLD_UI_FLIP_Y);
   // The histogram is what the camera is read out of, so the mode cannot run
@@ -1365,9 +1366,9 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
 void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                             const std::vector<u32>& indices, const float* modelview,
                             const std::array<float, 6>& ortho_projection,
-                            const std::array<float, 4>& viewport, const RemixTexture* texture,
-                            u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
-                            const DrawBlendState& blend)
+                            const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
+                            const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
+                            u8 wrap_mode_v, const DrawBlendState& blend)
 {
   if (!m_valid || m_ui_mode != 1 || vertices.empty() || indices.empty())
     return;
@@ -1401,24 +1402,37 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // Blend state arrives already translated into Vulkan's numbering, so the cases
   // are read off that rather than re-derived from GX.
   //   VK_BLEND_FACTOR_ZERO = 0, ONE = 1, SRC_ALPHA = 6, ONE_MINUS_SRC_ALPHA = 7
+  //
+  // Anything unrecognised falls to Over rather than Opaque: on a composited
+  // overlay, guessing "opaque" paints a solid rectangle over the scene, while
+  // guessing "over" at worst gets the compositing weight wrong on pixels the
+  // element actually covers. The failure modes are not remotely symmetric.
   if (!blend.blend_enabled)
-  {
     call.blend = UiRasterizer::BlendMode::Opaque;
-  }
   else if (blend.src_color_factor == 1 && blend.dst_color_factor == 1)
-  {
     call.blend = UiRasterizer::BlendMode::Additive;
-  }
   else if (blend.src_color_factor == 1 && blend.dst_color_factor == 0)
-  {
     call.blend = UiRasterizer::BlendMode::Opaque;
-  }
   else
-  {
     call.blend = UiRasterizer::BlendMode::Over;
-  }
-  call.alpha_compare = blend.alpha_test_enabled ? blend.alpha_test_compare : 7;
-  call.alpha_reference = static_cast<float>(blend.alpha_test_reference) / 255.0f;
+
+  // The write mask is computed by ResolveBlend and was then ignored here. A draw
+  // that writes no colour contributes nothing on console; one that writes no
+  // alpha must not be allowed to reduce the overlay's coverage.
+  if ((blend.write_mask & 0x7) == 0)
+    return;
+  // The raw GX alpha test, both comparators - not the And-only decomposition the
+  // material path uses, which has to surrender to Always on any other logic op.
+  call.alpha_compare = blend.raw_alpha_compare0;
+  call.alpha_compare1 = blend.raw_alpha_compare1;
+  call.alpha_logic = blend.raw_alpha_logic;
+  call.alpha_reference = static_cast<float>(blend.raw_alpha_reference0) / 255.0f;
+  call.alpha_reference1 = static_cast<float>(blend.raw_alpha_reference1) / 255.0f;
+
+  call.tev_alpha_known = blend.tev_alpha_known;
+  call.tev_alpha_corners = blend.tev_alpha_corners;
+  if (call.tev_alpha_known)
+    ++m_stats.ui_tev_alpha;
 
   // EFB space -> overlay pixels. The overlay is the swapchain, the viewport is
   // in EFB units, and the two differ by the internal resolution scale.
@@ -1428,6 +1442,12 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   call.viewport_y = viewport[1] * scale_y;
   call.viewport_width = viewport[2] * scale_x;
   call.viewport_height = viewport[3] * scale_y;
+  call.clip_left = static_cast<int>(std::floor(clip[0] * scale_x));
+  call.clip_top = static_cast<int>(std::floor(clip[1] * scale_y));
+  // The EFB rect's right/bottom are exclusive, so the last included pixel is one
+  // short of them.
+  call.clip_right = static_cast<int>(std::ceil(clip[2] * scale_x)) - 1;
+  call.clip_bottom = static_cast<int>(std::ceil(clip[3] * scale_y)) - 1;
 
   m_ui_vertices.clear();
   m_ui_vertices.reserve(vertices.size());
@@ -1534,9 +1554,13 @@ void RemixApi::SubmitScreenOverlay()
           const u32 texel = buffer[static_cast<size_t>(y) * width + x];
           const float alpha = static_cast<float>((texel >> 24) & 0xFF) / 255.0f;
           const float checker = ((x / 16 + y / 16) & 1) != 0 ? 0.35f : 0.55f;
-          const float channel[3] = {static_cast<float>((texel >> 16) & 0xFF) / 255.0f,
+          // The buffer is 0xAABBGGRR, so byte 0 is RED. BMP rows are B, G, R -
+          // hence the reversed store below. Getting this backwards made a dumped
+          // overlay look like it had its channels swapped when the overlay was
+          // fine, which is worse than not dumping at all.
+          const float channel[3] = {static_cast<float>(texel & 0xFF) / 255.0f,
                                     static_cast<float>((texel >> 8) & 0xFF) / 255.0f,
-                                    static_cast<float>(texel & 0xFF) / 255.0f};
+                                    static_cast<float>((texel >> 16) & 0xFF) / 255.0f};
           // The buffer is straight alpha, so undo nothing - just composite.
           for (int i = 0; i < 3; ++i)
           {
@@ -3047,7 +3071,7 @@ void RemixApi::OnAfterFrame()
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
-                 "unplaceable, raster {} us, upload {} us) | sky auto: candidates {}, "
+                 "unplaceable, {} tev-alpha, bail s{}/k{}/c{}/r{}, raster {} us, upload {} us) | sky auto: candidates {}, "
                  "classified {}, tagged {} ({} ignored) (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
@@ -3061,7 +3085,10 @@ void RemixApi::OnAfterFrame()
                  m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
                  m_stats.ambient_bright ? "bright" : "dim", m_stats.ui_placed,
-                 m_stats.ui_unplaceable, m_stats.ui_raster_us, m_stats.ui_upload_us,
+                 m_stats.ui_unplaceable, m_stats.ui_tev_alpha, m_stats.tev_bail_stages,
+                 m_stats.tev_bail_konst, m_stats.tev_bail_compare, m_stats.tev_bail_rasterized,
+                 m_stats.ui_raster_us,
+                 m_stats.ui_upload_us,
                  m_stats.sky_auto_candidates,
                  m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
                  m_sky_auto_detect);

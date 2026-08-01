@@ -83,16 +83,38 @@ public:
   {
     Texture texture;
     BlendMode blend = BlendMode::Over;
-    // GX alpha test, in the CompareMode numbering the rest of the backend
-    // already uses (Never = 0 .. Always = 7), against a 0-1 reference.
+    // GX alpha test - BOTH comparators and the logic op joining them, in the
+    // CompareMode numbering the rest of the backend already uses
+    // (Never = 0 .. Always = 7), against 0-1 references. Collapsing this to one
+    // comparator surrenders every Or/Xor/Xnor configuration to "always pass".
     u8 alpha_compare = 7;
+    u8 alpha_compare1 = 7;
+    // 0 = And, 1 = Or, 2 = Xor, 3 = Xnor (BPMemory.h AlphaTest::Op).
+    u8 alpha_logic = 0;
     float alpha_reference = 0.0f;
+    float alpha_reference1 = 0.0f;
+
+    // Final alpha as GX's TEV chain resolves it, at the four corners of
+    // (texture alpha, rasterized alpha): (0,0) (1,0) (0,1) (1,1). Bilinearly
+    // interpolated, this REPLACES the texture-alpha-times-vertex-alpha guess -
+    // including the vertex-alpha modulation, which the chain already accounts
+    // for. False means it could not be resolved and the old behaviour stands.
+    bool tev_alpha_known = false;
+    std::array<float, 4> tev_alpha_corners = {1.0f, 1.0f, 1.0f, 1.0f};
     // Where on screen NDC [-1,1] lands, in pixels. Normally the whole surface,
     // but a game is free to draw its UI through a sub-viewport.
     float viewport_x = 0.0f;
     float viewport_y = 0.0f;
     float viewport_width = 0.0f;
     float viewport_height = 0.0f;
+    // The draw's scissor rect in overlay pixels, inclusive on all four sides.
+    // GX games clip UI with the scissor constantly - sliding panels, wipes, text
+    // windows, banks of elements all drawn but scissored down to the one showing
+    // - so ignoring it makes every element appear at once.
+    int clip_left = 0;
+    int clip_top = 0;
+    int clip_right = 0;
+    int clip_bottom = 0;
   };
 
   UiRasterizer();

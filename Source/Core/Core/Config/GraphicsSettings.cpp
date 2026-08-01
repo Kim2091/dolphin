@@ -233,6 +233,11 @@ const Info<int> GFX_REMIX_UI_MODE{{System::GFX, "Settings", "RemixUiMode"}, 1};
 // there is not much real detail to lose below 1.0 on a high-resolution window.
 const Info<float> GFX_REMIX_UI_OVERLAY_SCALE{{System::GFX, "Settings", "RemixUiOverlayScale"},
                                              1.0f};
+// Non-zero writes the composited UI overlay at that frame index to
+// Logs/remix-ui-overlay.bmp, once, over a checkerboard so transparent and black
+// are distinguishable. Diagnostic only - it is the only way to see what this
+// backend actually produced without trusting the screen.
+const Info<int> GFX_REMIX_UI_DUMP_FRAME{{System::GFX, "Settings", "RemixUiDumpFrame"}, 0};
 // Mode 2 only. The mapping from a draw's screen space onto the plane is exactly
 // affine, so it rides the INSTANCE transform rather than being baked into
 // vertices, which keeps one mesh handle per UI element instead of re-hashing it
