@@ -167,6 +167,15 @@ const Info<bool> GFX_REMIX_PROJECTION_FIX{{System::GFX, "Settings", "RemixProjec
 // off-centre term), so this is only needed to watch a projection change live.
 const Info<bool> GFX_REMIX_TRACE_PROJECTIONS{
     {System::GFX, "Settings", "RemixTraceProjections"}, false};
+// GX has no view matrix - posMatrices are combined object-to-view - so by
+// default the backend submits an identity camera and lets instances carry the
+// modelview, making Remix's world space the same thing as camera space. That
+// costs every temporal feature: motion vectors are meaningless and RTXDI /
+// ReSTIR / the denoiser all see the whole world move whenever the camera does.
+// Enabling this recovers a real camera from inter-frame modelview deltas so
+// world space holds still. Off is byte-identical to the identity-view path.
+const Info<bool> GFX_REMIX_CAMERA_RECOVERY{{System::GFX, "Settings", "RemixCameraRecovery"},
+                                           false};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

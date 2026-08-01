@@ -47,6 +47,166 @@ constexpr u64 FALLBACK_LIGHT_HASH = 0x8B1D0F17'52D9A3C3ULL;
 constexpr u64 XF_LIGHT_HASH_BASE = 0x8B1D0F17'52D9A400ULL;
 
 // ---------------------------------------------------------------------------
+// 3x4 affine helpers, used by the camera recovery path.
+// ---------------------------------------------------------------------------
+constexpr Affine IDENTITY_AFFINE = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+                                    0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+
+// How far apart two transforms may be and still count as the same one. Rotation
+// and translation get separate budgets because they live on different scales: a
+// rotation is unit-magnitude by construction and takes an absolute threshold,
+// while a translation is in game world units that vary by orders of magnitude
+// between titles and takes a relative one.
+//
+// Keeping them in one combined norm is what made the stable-W diagnostic read
+// 100% on a frame where a quarter of the objects had visibly moved - an
+// object's distance from the origin inflated the tolerance for its own motion.
+constexpr float VIEW_ROTATION_EPSILON = 2e-3f;
+constexpr float VIEW_TRANSLATION_EPSILON = 5e-3f;
+
+// out = a * b, with the implicit [0 0 0 1] fourth row on both. b's translation
+// column participates through a's 3x3, then a's own translation is added.
+Affine AffineMultiply(const Affine& a, const Affine& b)
+{
+  Affine out = {};
+  for (int i = 0; i < 3; ++i)
+  {
+    for (int j = 0; j < 4; ++j)
+    {
+      out[i * 4 + j] = a[i * 4 + 0] * b[0 * 4 + j] + a[i * 4 + 1] * b[1 * 4 + j] +
+                       a[i * 4 + 2] * b[2 * 4 + j] + (j == 3 ? a[i * 4 + 3] : 0.0f);
+    }
+  }
+  return out;
+}
+
+// [R|t]^-1 = [R^-1 | -R^-1 t]. A real 3x3 inverse rather than a transpose,
+// because a GX modelview legitimately carries scale - only the accumulated view
+// matrix is guaranteed rigid, and only because we re-orthonormalise it.
+bool AffineInvert(const Affine& m, Affine& out)
+{
+  const float a = m[0], b = m[1], c = m[2];
+  const float d = m[4], e = m[5], f = m[6];
+  const float g = m[8], h = m[9], i = m[10];
+
+  const float c00 = e * i - f * h;
+  const float c01 = -(d * i - f * g);
+  const float c02 = d * h - e * g;
+  const float det = a * c00 + b * c01 + c * c02;
+  if (!std::isfinite(det) || std::abs(det) < 1e-20f)
+    return false;
+  const float s = 1.0f / det;
+
+  const float r00 = c00 * s, r01 = -(b * i - c * h) * s, r02 = (b * f - c * e) * s;
+  const float r10 = c01 * s, r11 = (a * i - c * g) * s, r12 = -(a * f - c * d) * s;
+  const float r20 = c02 * s, r21 = -(a * h - b * g) * s, r22 = (a * e - b * d) * s;
+
+  const float tx = m[3], ty = m[7], tz = m[11];
+  out = {r00, r01, r02, -(r00 * tx + r01 * ty + r02 * tz),
+         r10, r11, r12, -(r10 * tx + r11 * ty + r12 * tz),
+         r20, r21, r22, -(r20 * tx + r21 * ty + r22 * tz)};
+  return std::isfinite(out[3]) && std::isfinite(out[7]) && std::isfinite(out[11]);
+}
+
+void Normalize3(float* v)
+{
+  const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (length > 1e-20f)
+  {
+    v[0] /= length;
+    v[1] /= length;
+    v[2] /= length;
+  }
+}
+
+// Gram-Schmidt the rotation part back to orthonormal. Integrating a delta every
+// frame accumulates error, and the camera extraction in SetupCamera assumes
+// R^-1 == R^T - so left alone the basis would slowly shear and the recovered
+// camera would stop matching the geometry it is meant to frame.
+void AffineOrthonormalize(Affine& m)
+{
+  float x[3] = {m[0], m[1], m[2]};
+  float y[3] = {m[4], m[5], m[6]};
+  Normalize3(x);
+  const float xy = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+  for (int k = 0; k < 3; ++k)
+    y[k] -= xy * x[k];
+  Normalize3(y);
+  const float z[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2],
+                      x[0] * y[1] - x[1] * y[0]};
+  m[0] = x[0];  m[1] = x[1];  m[2] = x[2];
+  m[4] = y[0];  m[5] = y[1];  m[6] = y[2];
+  m[8] = z[0];  m[9] = z[1];  m[10] = z[2];
+}
+
+// A camera delta is rigid. A candidate that is not is a moving or scaling
+// object that happened to win the vote, and folding it into the accumulated
+// view would corrupt the basis permanently rather than for one frame.
+bool AffineIsRigid(const Affine& m)
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    const float* row = &m[i * 4];
+    const float length_sq = row[0] * row[0] + row[1] * row[1] + row[2] * row[2];
+    if (!std::isfinite(length_sq) || std::abs(length_sq - 1.0f) > 0.02f)
+      return false;
+  }
+  for (int i = 0; i < 3; ++i)
+  {
+    const float* a = &m[i * 4];
+    const float* b = &m[((i + 1) % 3) * 4];
+    if (std::abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) > 0.02f)
+      return false;
+  }
+  return true;
+}
+
+// Do two transforms agree? Rotation and translation are tested separately - see
+// the epsilon comments above for why one combined norm silently trades one
+// against the other.
+bool AffineSimilar(const Affine& a, const Affine& b)
+{
+  float rotation_diff_sq = 0.0f;
+  for (int i = 0; i < 3; ++i)
+  {
+    for (int j = 0; j < 3; ++j)
+    {
+      const float d = a[i * 4 + j] - b[i * 4 + j];
+      rotation_diff_sq += d * d;
+    }
+  }
+  if (!(std::sqrt(rotation_diff_sq) <= VIEW_ROTATION_EPSILON))
+    return false;
+
+  float translation_diff_sq = 0.0f;
+  float translation_scale_sq = 0.0f;
+  for (int i = 0; i < 3; ++i)
+  {
+    const float d = a[i * 4 + 3] - b[i * 4 + 3];
+    translation_diff_sq += d * d;
+    translation_scale_sq +=
+        std::max(a[i * 4 + 3] * a[i * 4 + 3], b[i * 4 + 3] * b[i * 4 + 3]);
+  }
+  return std::sqrt(translation_diff_sq) <=
+         VIEW_TRANSLATION_EPSILON * (1.0f + std::sqrt(translation_scale_sq));
+}
+
+// remixapi_Transform::matrix and Affine are the same 3x4 row-major floats.
+Affine FromRemixTransform(const remixapi_Transform& transform)
+{
+  Affine out = {};
+  std::memcpy(out.data(), &transform.matrix[0][0], sizeof(float) * 12);
+  return out;
+}
+
+remixapi_Transform ToRemixTransform(const Affine& affine)
+{
+  remixapi_Transform out = {};
+  std::memcpy(&out.matrix[0][0], affine.data(), sizeof(float) * 12);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Guarded remixapi calls.
 //
 // dxvk-remix is built /MD and throws std::out_of_range out of internal resource
@@ -142,6 +302,12 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
   m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
+  m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
+  // World space starts as view space and drifts away from it as the estimator
+  // integrates. Frame 0 is therefore exactly the identity-view behaviour.
+  m_view = IDENTITY_AFFINE;
+  m_view_inverse = IDENTITY_AFFINE;
+  m_view_inverse_previous = IDENTITY_AFFINE;
   m_sky_mode = Config::Get(Config::GFX_REMIX_SKY_MODE);
 
   // "0xabc,0xdef" -> the set of stage-0 texture hashes to treat as skybox.
@@ -416,6 +582,18 @@ void RemixApi::DestroyAllHandles()
     m_fallback_light = nullptr;
   }
 
+  // Queued instances reference mesh handles that were just destroyed, and the
+  // sample tables key off hashes that will not mean the same thing after a
+  // backend restart - a stale pair would hand the estimator one bogus delta on
+  // the first frame back.
+  m_pending_instances.clear();
+  m_view_samples.clear();
+  m_view_samples_previous.clear();
+  m_view = IDENTITY_AFFINE;
+  m_view_inverse = IDENTITY_AFFINE;
+  m_view_inverse_previous = IDENTITY_AFFINE;
+  m_view_miss_streak = 0;
+
   m_bound_textures = {};
 }
 
@@ -682,7 +860,8 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
 void RemixApi::SubmitMesh(const MaterialRef& material,
                           const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices, const remixapi_Transform& transform,
-                          remixapi_InstanceCategoryFlags category_flags)
+                          remixapi_InstanceCategoryFlags category_flags,
+                          const float* raw_modelview)
 {
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
@@ -746,35 +925,208 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
     ++m_stats.meshes_created;
   }
 
-  // Object picking: the runtime only records a pick for a non-zero value, and
-  // only resolves a click to a texture when the draw carries one. Without this
-  // the dev menu highlights API geometry on hover (that path reads the picking
-  // buffer directly) but clicking selects nothing.
-  remixapi_InstanceInfoObjectPickingEXT picking = {};
-  picking.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
-  picking.pNext = nullptr;
-  picking.objectPickingValue = m_next_picking_value++;
-  if (m_next_picking_value == 0)
-    m_next_picking_value = 1;
-
-  remixapi_InstanceInfo instance = {};
-  instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-  instance.pNext = &picking;
-  instance.categoryFlags = category_flags;
-  instance.mesh = mesh_handle;
-  instance.transform = transform;
-  // v1 pins double-sided: GC winding under our right-handed identity view is
-  // not verified, and a wrong guess would silently cull whole scenes.
-  instance.doubleSided = 1;
-
-  const int guard =
-      CallGuarded("DrawInstance", [&] { m_interface.DrawInstance(&instance); });
-  if (guard != 0)
+  // Sample this draw for the camera estimator before queueing it. The mesh hash
+  // is the correspondence key across frames, and it works precisely because the
+  // non-palette path hashes OBJECT-space vertices: a static object keeps the
+  // same hash however the camera moves. Palette draws have no single modelview
+  // and their baked view-space vertices re-hash every frame, so they cannot
+  // take part either way.
+  if (raw_modelview != nullptr && m_view_samples.size() < MAX_VIEW_SAMPLES &&
+      vertices.size() >= MIN_VIEW_SAMPLE_VERTICES)
   {
-    m_poisoned_meshes.insert(mesh_hash);
-    return;
+    Affine modelview = {};
+    std::memcpy(modelview.data(), raw_modelview, sizeof(float) * 12);
+    m_view_samples.emplace(mesh_hash, modelview);
   }
-  ++m_stats.instances_drawn;
+
+  m_pending_instances.push_back(PendingInstance{mesh_handle, transform, category_flags, mesh_hash});
+}
+
+void RemixApi::FlushPendingInstances()
+{
+  for (const PendingInstance& pending : m_pending_instances)
+  {
+    // Object picking: the runtime only records a pick for a non-zero value, and
+    // only resolves a click to a texture when the draw carries one. Without this
+    // the dev menu highlights API geometry on hover (that path reads the picking
+    // buffer directly) but clicking selects nothing.
+    remixapi_InstanceInfoObjectPickingEXT picking = {};
+    picking.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
+    picking.pNext = nullptr;
+    picking.objectPickingValue = m_next_picking_value++;
+    if (m_next_picking_value == 0)
+      m_next_picking_value = 1;
+
+    remixapi_InstanceInfo instance = {};
+    instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+    instance.pNext = &picking;
+    instance.categoryFlags = pending.category_flags;
+    instance.mesh = pending.mesh;
+    // The submitted transform is V^-1 * (C * MV), and the camera is V, so Remix
+    // computes P * V * V^-1 * C * MV = P * C * MV. The rendered image is
+    // therefore INVARIANT to whatever V the estimator produces - a wrong camera
+    // costs temporal quality, never correctness. The one thing that can break
+    // the picture is SetupCamera's basis extraction disagreeing with this V,
+    // which is why that is the part to suspect if geometry ever moves wrongly.
+    instance.transform =
+        m_camera_recovery ?
+            ToRemixTransform(AffineMultiply(m_view_inverse, FromRemixTransform(pending.transform))) :
+            pending.transform;
+    // v1 pins double-sided: GC winding under our right-handed identity view is
+    // not verified, and a wrong guess would silently cull whole scenes.
+    instance.doubleSided = 1;
+
+    const u64 mesh_hash = pending.mesh_hash;
+    const int guard = CallGuarded("DrawInstance", [&] { m_interface.DrawInstance(&instance); });
+    if (guard != 0)
+    {
+      m_poisoned_meshes.insert(mesh_hash);
+      continue;
+    }
+    ++m_stats.instances_drawn;
+  }
+  m_pending_instances.clear();
+}
+
+void RemixApi::EstimateView()
+{
+  m_stats.view_samples = static_cast<u32>(m_view_samples.size());
+  if (!m_camera_recovery)
+    return;
+
+  // GX gives us no view matrix, only combined modelviews. But for STATIC
+  // geometry the world transform is constant, so it cancels across a frame
+  // boundary:
+  //   MV(t) * MV(t-1)^-1  ==  V(t)*W * (V(t-1)*W)^-1  ==  V(t) * V(t-1)^-1
+  // Every static draw therefore votes for the same delta, and anything that
+  // moved is an outlier. Nothing here knows which draws are static - the
+  // consensus below is what decides, which is why it must be a vote and not an
+  // average.
+  // EVERY persisting draw contributes a delta and gets to vote. The cap is on
+  // how many are tried as hypotheses, which is what makes the pass O(48*n)
+  // rather than O(n^2) - it is not a cap on the electorate.
+  //
+  // Capping the voters too was the original mistake, and it did not fail
+  // gracefully: the samples live in an unordered_map, so taking the first 48 of
+  // a few hundred is an arbitrary slice, and a slice that happened to hold
+  // mostly moving objects lost the vote even with a static scene all around it.
+  // That pinned the camera to identity and re-anchored every fourth frame.
+  std::vector<Affine> deltas;
+  deltas.reserve(m_view_samples.size());
+  for (const auto& [mesh_hash, current] : m_view_samples)
+  {
+    const auto previous = m_view_samples_previous.find(mesh_hash);
+    if (previous == m_view_samples_previous.end())
+      continue;
+    Affine previous_inverse = {};
+    if (!AffineInvert(previous->second, previous_inverse))
+      continue;
+    deltas.push_back(AffineMultiply(current, previous_inverse));
+  }
+  m_stats.view_candidates = static_cast<u32>(deltas.size());
+
+  const size_t hypotheses = std::min(deltas.size(), MAX_VIEW_CANDIDATES);
+  size_t best = 0;
+  u32 best_inliers = 0;
+  for (size_t i = 0; i < hypotheses; ++i)
+  {
+    u32 inliers = 0;
+    for (size_t j = 0; j < deltas.size(); ++j)
+    {
+      if (AffineSimilar(deltas[i], deltas[j]))
+        ++inliers;
+    }
+    if (inliers > best_inliers)
+    {
+      best_inliers = inliers;
+      best = i;
+    }
+  }
+  m_stats.view_inliers = best_inliers;
+
+  const u32 required = std::max<u32>(3, static_cast<u32>(deltas.size()) / 4);
+  if (!deltas.empty() && best_inliers >= required && AffineIsRigid(deltas[best]))
+  {
+    m_view_miss_streak = 0;
+    m_view = AffineMultiply(deltas[best], m_view);
+    AffineOrthonormalize(m_view);
+  }
+  else if (deltas.size() >= 2)
+  {
+    // No consensus: a cut, a teleport, or a frame where the estimator simply
+    // could not tell. Re-anchoring resets world space onto the current camera,
+    // which costs one frame of temporal history - strictly better than
+    // integrating a delta we do not believe. The streak keeps a single odd
+    // frame, or a cutscene in which genuinely everything moves, from tripping
+    // it; a frame with almost nothing persisting is not evidence of a cut.
+    if (++m_view_miss_streak >= VIEW_MISS_STREAK_BEFORE_REANCHOR)
+    {
+      m_view_miss_streak = 0;
+      m_view = IDENTITY_AFFINE;
+      ++m_stats.view_reanchors;
+      INFO_LOG_FMT(VIDEO, "Remix: camera re-anchored at frame {} ({} deltas, {} inliers, {} needed)",
+                   m_frame_index, deltas.size(), best_inliers, required);
+    }
+  }
+
+  m_view_inverse_previous = m_view_inverse;
+  if (!AffineInvert(m_view, m_view_inverse))
+  {
+    // Unreachable while m_view stays orthonormal, but an un-invertible view
+    // would put every instance at the origin, so fail back to camera-relative.
+    m_view = IDENTITY_AFFINE;
+    m_view_inverse = IDENTITY_AFFINE;
+  }
+
+  // The real verdict on the decomposition: an object that did not move should
+  // have a world transform that does not change. W = V^-1 * MV, so comparing
+  // this frame's against last frame's - each built with its own V - measures
+  // exactly what recovery is for. A high stable fraction means motion vectors
+  // and reservoir reuse now have something to hold on to.
+  //
+  // Compare W(t) * W(t-1)^-1 against identity rather than W(t) against W(t-1)
+  // directly. The ratio is near-identity for a genuinely static object whatever
+  // its position, so its translation term is the distance the object actually
+  // moved rather than where it happens to sit - which puts this on the same
+  // footing as the inlier test instead of scaling with distance from origin.
+  for (const auto& [mesh_hash, current] : m_view_samples)
+  {
+    const auto previous = m_view_samples_previous.find(mesh_hash);
+    if (previous == m_view_samples_previous.end())
+      continue;
+    Affine previous_world_inverse = {};
+    if (!AffineInvert(AffineMultiply(m_view_inverse_previous, previous->second),
+                      previous_world_inverse))
+    {
+      continue;
+    }
+    ++m_stats.w_compared;
+    const Affine ratio =
+        AffineMultiply(AffineMultiply(m_view_inverse, current), previous_world_inverse);
+    if (AffineSimilar(ratio, IDENTITY_AFFINE))
+      ++m_stats.w_stable;
+  }
+}
+
+void RemixApi::LogCameraRecovery()
+{
+  if (!m_log_stats || !m_camera_recovery || (m_frame_index % 60) != 0)
+    return;
+
+  const Affine& v = m_view;
+  const float tx = v[3], ty = v[7], tz = v[11];
+  const float position[3] = {-(v[0] * tx + v[4] * ty + v[8] * tz),
+                             -(v[1] * tx + v[5] * ty + v[9] * tz),
+                             -(v[2] * tx + v[6] * ty + v[10] * tz)};
+  const u32 stable_pct =
+      m_stats.w_compared != 0 ? (m_stats.w_stable * 100) / m_stats.w_compared : 0;
+
+  INFO_LOG_FMT(VIDEO,
+               "Remix frame {} camera: samples {} | inliers {}/{} | stable W {}/{} ({}%) | "
+               "pos ({:.1f} {:.1f} {:.1f}) fwd ({:.3f} {:.3f} {:.3f})",
+               m_frame_index, m_stats.view_samples, m_stats.view_inliers, m_stats.view_candidates,
+               m_stats.w_stable, m_stats.w_compared, stable_pct, position[0], position[1],
+               position[2], -v[8], -v[9], -v[10]);
 }
 
 void RemixApi::SetupCamera()
@@ -792,6 +1144,34 @@ void RemixApi::SetupCamera()
   params.forward = {0.0f, 0.0f, -1.0f};
   params.up = {0.0f, 1.0f, 0.0f};
   params.right = {1.0f, 0.0f, 0.0f};
+  if (m_camera_recovery)
+  {
+    // Handedness, because it is not symmetric and the defaults above hide it:
+    // the runtime builds viewToWorld with rows (right, up, forward, position)
+    // and projects with PROJ_LEFT_HANDED, so REMIX view space is left-handed
+    // looking down +Z (rtx_remix_api.cpp, toRtCamera). GC view space is
+    // right-handed looking down -Z. The identity-view defaults above bridge
+    // that by passing forward = -Z, which makes viewToWorld diag(1,1,-1) - a
+    // reflection, not a rotation. That is deliberate and load-bearing.
+    //
+    // Generalising it: we need worldToView_remix = F * m_view with
+    // F = diag(1,1,-1), so viewToWorld_remix = m_view^-1 * F. Writing m_view as
+    // [R|t] and reading off the columns of R^T * F gives the basis below - the
+    // world direction of each view axis is the corresponding ROW of R, with the
+    // third negated by F. The camera position is the point mapping to the view
+    // origin, -R^T t.
+    //
+    // With m_view identity this reproduces the constants above term for term,
+    // which is the cheapest standing check that the convention has not drifted.
+    const Affine& v = m_view;
+    const float tx = v[3], ty = v[7], tz = v[11];
+    params.position = {-(v[0] * tx + v[4] * ty + v[8] * tz),
+                       -(v[1] * tx + v[5] * ty + v[9] * tz),
+                       -(v[2] * tx + v[6] * ty + v[10] * tz)};
+    params.right = {v[0], v[1], v[2]};
+    params.up = {v[4], v[5], v[6]};
+    params.forward = {-v[8], -v[9], -v[10]};
+  }
   params.fovYInDegrees = 60.0f;
   params.aspect = 16.0f / 9.0f;
   params.nearPlane = 1.0f;
@@ -867,9 +1247,11 @@ void RemixApi::SetupCamera()
 
 void RemixApi::SubmitLights()
 {
-  // GX lights are specified in view space, which is exactly our identity-view
-  // world, so they need no basis change at all. The enable mask lives in the
-  // per-channel lighting configs rather than on the lights themselves.
+  // GX lights are specified in view space. With recovery off that IS our world
+  // space and they need no basis change; with it on they have to be carried
+  // into world space by V^-1 exactly as the geometry is, or the lighting stays
+  // welded to the camera while the world holds still. The enable mask lives in
+  // the per-channel lighting configs rather than on the lights themselves.
   u32 light_mask = 0;
   for (u32 i = 0; i < xfmem.numChan.numColorChans && i < 2; ++i)
   {
@@ -891,10 +1273,20 @@ void RemixApi::SubmitLights()
     if (r <= 0.0f && g <= 0.0f && b <= 0.0f)
       continue;
 
+    float position[3] = {src.dpos[0], src.dpos[1], src.dpos[2]};
+    if (m_camera_recovery)
+    {
+      const Affine& iv = m_view_inverse;
+      const float x = position[0], y = position[1], z = position[2];
+      position[0] = iv[0] * x + iv[1] * y + iv[2] * z + iv[3];
+      position[1] = iv[4] * x + iv[5] * y + iv[6] * z + iv[7];
+      position[2] = iv[8] * x + iv[9] * y + iv[10] * z + iv[11];
+    }
+
     remixapi_LightInfoSphereEXT sphere = {};
     sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
     sphere.pNext = nullptr;
-    sphere.position = {src.dpos[0], src.dpos[1], src.dpos[2]};
+    sphere.position = {position[0], position[1], position[2]};
     // GX point lights are analytically infinitesimal; give them a small but
     // non-zero radius so the tracer produces soft rather than hard shadows.
     sphere.radius = 5.0f;
@@ -1040,10 +1432,11 @@ void RemixApi::SubmitFallbackTriangle()
   if (!EnsureFallbackMesh())
     return;
 
-  remixapi_Transform transform = {};
-  transform.matrix[0][0] = 1.0f;
-  transform.matrix[1][1] = 1.0f;
-  transform.matrix[2][2] = 1.0f;
+  // The triangle's vertices are placed in front of the identity-view camera, so
+  // under camera recovery it needs the same V^-1 the geometry gets to stay
+  // there rather than being left behind at the world origin.
+  const remixapi_Transform transform =
+      m_camera_recovery ? ToRemixTransform(m_view_inverse) : ToRemixTransform(IDENTITY_AFFINE);
 
   remixapi_InstanceInfo instance = {};
   instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -1078,7 +1471,13 @@ void RemixApi::OnAfterFrame()
   if (!m_valid)
     return;
 
+  // Order matters: the camera has to be known before any instance can be placed
+  // relative to it, and the estimate needs the whole frame's draws. So the
+  // frame runs estimate -> camera -> instances rather than emitting instances
+  // as they arrive.
+  EstimateView();
   SetupCamera();
+  FlushPendingInstances();
   SubmitLights();
 
   // Keep the tracer fed when no game geometry made it through the classifier -
@@ -1107,12 +1506,17 @@ void RemixApi::OnAfterFrame()
   }
 
   LogProjectionVariants();
+  LogCameraRecovery();
 
   m_stats = {};
   m_projection_latched = false;
   m_reference_usable = false;
   m_projection_variants = {};
   m_projection_variant_count = 0;
+  // This frame's samples become next frame's history; reuse the old map's
+  // storage rather than reallocating a few hundred entries every frame.
+  m_view_samples.swap(m_view_samples_previous);
+  m_view_samples.clear();
   ++m_frame_index;
 }
 

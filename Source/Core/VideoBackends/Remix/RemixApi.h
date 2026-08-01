@@ -24,6 +24,11 @@ namespace Remix
 {
 class RemixTexture;
 
+// A 3x4 row-major affine transform - the layout GX's xfmem.posMatrices and
+// remixapi_Transform::matrix both already use, so conversion is a copy. The
+// implicit fourth row is [0 0 0 1].
+using Affine = std::array<float, 12>;
+
 // Per-frame draw-classification counters. Logged once per frame when
 // Config::GFX_REMIX_LOG_STATS is enabled, so classification is observable
 // without a debugger.
@@ -50,6 +55,19 @@ struct FrameStats
   // Draws arriving after the per-frame variant table filled up. Non-zero means
   // the projection log below is incomplete, not that anything rendered wrong.
   u32 projection_overflow = 0;
+
+  // Camera recovery. `view_candidates` is how many draws persisted from last
+  // frame and so could vote on the camera delta; `view_inliers` is how many
+  // agreed with the winner. A healthy frame has inliers close to candidates -
+  // most of the world is static. `w_stable / w_compared` is the real verdict:
+  // it counts objects whose recovered world transform did NOT change between
+  // frames, which is exactly what the decomposition is supposed to achieve.
+  u32 view_samples = 0;
+  u32 view_candidates = 0;
+  u32 view_inliers = 0;
+  u32 view_reanchors = 0;
+  u32 w_stable = 0;
+  u32 w_compared = 0;
 };
 
 // Result of resolving a draw's stage-0 texture to a Remix material. The hash is
@@ -119,14 +137,24 @@ public:
   MaterialRef EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
                              u8 wrap_mode_v);
 
-  // Creates the mesh on a cache miss and always draws one instance of it.
+  // Creates the mesh on a cache miss and queues one instance of it. The draw is
+  // NOT emitted here: the recovered camera is not known until the frame's draws
+  // have all been seen, so instances are held and flushed after it is. See
+  // FlushPendingInstances.
+  //
   // category_flags is per-instance (REMIXAPI_INSTANCE_CATEGORY_BIT_*) and so is
   // deliberately NOT folded into the mesh hash - the same geometry tagged two
   // ways still shares one mesh handle, which is what we want.
+  //
+  // raw_modelview is the draw's untouched GX modelview, or nullptr on the
+  // matrix-palette path where there is no single one. It is what the camera
+  // estimator votes on, and it must be the RAW matrix: a projection correction
+  // present in both frames conjugates the inter-frame delta instead of
+  // cancelling out of it, which yields the right rotation in the wrong basis.
   void SubmitMesh(const MaterialRef& material,
                   const std::vector<remixapi_HardcodedVertex>& vertices,
                   const std::vector<u32>& indices, const remixapi_Transform& transform,
-                  remixapi_InstanceCategoryFlags category_flags);
+                  remixapi_InstanceCategoryFlags category_flags, const float* raw_modelview);
 
   FrameStats& Stats() { return m_stats; }
 
@@ -172,8 +200,28 @@ private:
   };
   static constexpr size_t MAX_PROJECTION_VARIANTS = 8;
 
+  // A draw held back until the frame's camera is known.
+  struct PendingInstance
+  {
+    remixapi_MeshHandle mesh = nullptr;
+    remixapi_Transform transform = {};
+    remixapi_InstanceCategoryFlags category_flags = 0;
+    u64 mesh_hash = 0;
+  };
+  // How many draws may vote on the camera delta, and how many of those the
+  // O(n^2) consensus pass will consider as candidates.
+  static constexpr size_t MAX_VIEW_SAMPLES = 256;
+  static constexpr size_t MAX_VIEW_CANDIDATES = 48;
+  // Draws below this vertex count are more likely to be effects or overlays
+  // than world geometry, and a bad vote costs more than a missing one.
+  static constexpr u32 MIN_VIEW_SAMPLE_VERTICES = 16;
+  static constexpr u32 VIEW_MISS_STREAK_BEFORE_REANCHOR = 4;
+
   void OnAfterFrame();
   void LogProjectionVariants();
+  void EstimateView();
+  void FlushPendingInstances();
+  void LogCameraRecovery();
   void SetupCamera();
   void SubmitLights();
   void SubmitFallbackTriangle();
@@ -207,6 +255,20 @@ private:
   u32 m_projection_variant_count = 0;
   bool m_projection_fix = true;
   bool m_trace_projections = false;
+
+  // Camera recovery state. m_view maps world -> view and is built by
+  // integrating per-frame deltas from an arbitrary origin; m_view_inverse is
+  // what turns each draw's modelview back into a world transform. Both are
+  // identity while recovery is off, which is exactly the v1 behaviour of
+  // treating view space as world space.
+  std::vector<PendingInstance> m_pending_instances;
+  std::unordered_map<u64, Affine> m_view_samples;
+  std::unordered_map<u64, Affine> m_view_samples_previous;
+  Affine m_view = {};
+  Affine m_view_inverse = {};
+  Affine m_view_inverse_previous = {};
+  u32 m_view_miss_streak = 0;
+  bool m_camera_recovery = false;
 
   std::array<LightEntry, 8> m_lights = {};
   remixapi_LightHandle m_fallback_light = nullptr;

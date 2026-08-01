@@ -435,6 +435,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // ---- Instance transform -------------------------------------------------
 
   remixapi_Transform transform = {};
+  // Kept separate from `transform` because the camera estimator has to vote on
+  // the RAW modelview: the projection correction folded in below is a view-space
+  // shear, and one present in both frames conjugates the inter-frame delta
+  // rather than cancelling out of it. Null on the matrix-palette path, which has
+  // no single modelview to offer.
+  const float* raw_modelview = nullptr;
   if (per_vertex_matrix)
   {
     transform.matrix[0][0] = 1.0f;
@@ -444,13 +450,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   else
   {
     // GX modelview matrices are 3 rows of 4 floats, row-major - byte-identical
-    // to remixapi_Transform::matrix[3][4]. Because there is no separate view
-    // matrix in the GX pipeline, this object-to-VIEW transform is submitted as
-    // if it were object-to-world; the camera then sits at the origin (see
-    // RemixApi::SetupCamera).
-    const float* const matrix =
-        &xfmem.posMatrices[g_main_cp_state.matrix_index_a.PosNormalMtxIdx * 4];
-    std::memcpy(&transform.matrix[0][0], matrix, sizeof(float) * 12);
+    // to remixapi_Transform::matrix[3][4]. There is no separate view matrix in
+    // the GX pipeline, so this is an object-to-VIEW transform; either the camera
+    // sits at the origin and it doubles as object-to-world, or camera recovery
+    // is on and RemixApi turns it into one (see RemixApi::SetupCamera).
+    raw_modelview = &xfmem.posMatrices[g_main_cp_state.matrix_index_a.PosNormalMtxIdx * 4];
+    std::memcpy(&transform.matrix[0][0], raw_modelview, sizeof(float) * 12);
   }
 
   // Fold this draw's projection onto the frame's reference, so the one camera
@@ -521,7 +526,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   }
 
   g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
-  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags);
+  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags,
+                          raw_modelview);
 }
 
 }  // namespace Remix
