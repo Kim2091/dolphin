@@ -579,7 +579,7 @@ private:
   bool m_camera_recovery = false;
   bool m_view_electorate_fix = true;
   bool m_view_hold_on_miss = true;
-  bool m_view_tie_break = false;
+  bool m_view_tie_break = true;
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;

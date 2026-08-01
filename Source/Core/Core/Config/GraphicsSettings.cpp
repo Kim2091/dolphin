@@ -232,14 +232,22 @@ const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS{{System::GFX, "Settings", "RemixVie
 // animated object arguing with the static world, and the camera is not the part
 // of a title screen swinging around. Off is pure max-inliers.
 //
-// Defaulted OFF on measurement, which is the outcome the prior did not survive.
-// On Wind Waker's 3D window it fires on exactly the frames where it makes things
-// worse: stable W over frames 720-900 goes 41/37/38% with pure max-inliers and
-// 2/18/19% with the tie-break, so the "calmer" cluster it prefers there is not
-// the camera. The code and its counters stay because the runner-up size is worth
-// logging either way, and a title whose title screen really is one big rigid
-// mover can turn it on.
-const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, false};
+// Measured on Wind Waker's 3D window, where it is what stops the camera
+// inventing motion. Frames 780-960, pure max-inliers: the estimator claims
+// 1.20-1.30 deg of rotation and 330-434 units of translation EVERY frame,
+// forever, so the recovered basis rotates without end - which is precisely the
+// "sky swings while the geometry holds still" symptom. With the tie-break: 0.06
+// to 0.13 deg and 57-62 units, and the absolute drift plateaus instead of
+// climbing. The classifier agrees independently: the sky signature only resolves
+// under this estimate, and when it does it names exactly the frame's first draws
+// including both hand-tagged sky textures.
+//
+// Do NOT read stable W alone here. It is HIGHER with the tie-break off
+// (37-41% vs 18-19%) because it measures agreement with whichever cluster won,
+// not whether that cluster was the camera - so an estimator riding a large
+// coherent moving object scores well on it. That is the trap this default was
+// briefly flipped into and back out of.
+const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, true};
 // Identify skyboxes by the one property that defines them: they translate with
 // the camera. Under camera recovery a skybox's recovered world transform slides
 // with the camera position while its rotation holds still, so the frame-to-frame
