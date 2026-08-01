@@ -167,6 +167,93 @@ const Info<bool> GFX_REMIX_PROJECTION_FIX{{System::GFX, "Settings", "RemixProjec
 // off-centre term), so this is only needed to watch a projection change live.
 const Info<bool> GFX_REMIX_TRACE_PROJECTIONS{
     {System::GFX, "Settings", "RemixTraceProjections"}, false};
+// Histogram every draw's modelview by VALUE and report the one shared by the
+// most distinct meshes. Pure instrument: nothing reads the result.
+//
+// It exists to answer one question. GX has no view matrix, so the backend
+// ESTIMATES one from inter-frame deltas - but a modelview is V*M, and for any
+// object whose model transform is the identity that product IS V. World-authored
+// geometry (terrain, rooms, the sea) is very often drawn exactly that way, so V
+// is probably sitting in xfmem.posMatrices as a literal value and the only real
+// question is which slot. A histogram answers it from every draw in the frame,
+// where the estimator votes with the few dozen meshes that happen to persist.
+//
+// The dominant value alone is not proof - a room full of props drawn in one
+// room-local space would also dominate - so the log line carries the two checks
+// that separate the cases: whether the value is RIGID (a view matrix carries no
+// model scale), and what fraction of objects hold still when it is used as the
+// camera, measured against the estimator's own number on the same objects.
+const Info<bool> GFX_REMIX_TRACE_MODELVIEWS{
+    {System::GFX, "Settings", "RemixTraceModelviews"}, true};
+// Take the camera from the histogram's dominant modelview instead of estimating
+// it from inter-frame deltas. Needs RemixCameraRecovery on; off restores the
+// estimator exactly, so the two are a clean A/B.
+//
+// The estimator's problem was never its consensus rule, it was its evidence: it
+// votes with the few dozen meshes that persist across a frame boundary AND clear
+// a vertex floor, and when that electorate goes bad it invents camera motion out
+// of nothing - measured on Wind Waker at 0.66-1.25 deg/frame and hundreds of
+// units of translation across 90 frames during which the game's own view matrix
+// did not change to four decimal places. Every instance carries V^-1, so that
+// error swings the entire world around the viewer.
+//
+// This reads the answer instead. For an object drawn with an identity model
+// transform the combined modelview IS the view matrix, and Wind Waker puts it in
+// posMatrices slot 0 on every frame measured, rigid, shared by 160-293 meshes
+// against a runner-up of 14. A gate (mesh count, 2x dominance, rigidity) decides
+// per frame whether to believe it; a miss holds the previous pose.
+const Info<bool> GFX_REMIX_CAMERA_FROM_MODELVIEW{
+    {System::GFX, "Settings", "RemixCameraFromModelview"}, true};
+// How orthographic draws - HUD, menus, every 2D screen - are handled.
+//   0 = dropped. What v1 did, and why the path-traced output had no 2D in it.
+//   1 = software-rasterized into a screen overlay, composited at present. (default)
+//   2 = submitted as world-space geometry on a plane in front of the camera.
+//
+// Mode 1 is what looks like a normal UI, because it IS one: the pixels are drawn
+// by a small software rasterizer (RemixUiRaster) and handed to
+// remixapi_DrawScreenOverlay, which the runtime composites after the frame is
+// traced and denoised. Nothing about the UI touches the path tracer.
+//
+// Mode 2 was the first attempt and is kept only because it does something mode 1
+// cannot - it puts the UI inside the traced world, where it can light the scene
+// and be viewed at an angle. It is NOT passthrough: the runtime treats it as
+// geometry, so it is denoised, and being welded to the camera it swims whenever
+// the view moves. REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI patches the material
+// to emissive-from-albedo (rtx_instance_manager.cpp:1116-1123) so at least it is
+// unlit, but that does not make it a HUD.
+const Info<int> GFX_REMIX_UI_MODE{{System::GFX, "Settings", "RemixUiMode"}, 1};
+// Resolution of the mode-1 overlay, as a fraction of the render window. The
+// rasterizer is fill-rate bound and this is the only lever with a linear effect
+// on its cost: halving it quarters the pixels.
+//
+// 1.0 costs 3-9 ms a frame on Wind Waker's busiest 2D screens even threaded,
+// which is most of a 60 Hz budget, so this is the knob to reach for on a slow
+// machine. The runtime scales the overlay to the output when compositing, so the
+// only cost is sharpness - and GC UI is authored for a 640x528 framebuffer, so
+// there is not much real detail to lose below 1.0 on a high-resolution window.
+const Info<float> GFX_REMIX_UI_OVERLAY_SCALE{{System::GFX, "Settings", "RemixUiOverlayScale"},
+                                             1.0f};
+// Mode 2 only. The mapping from a draw's screen space onto the plane is exactly
+// affine, so it rides the INSTANCE transform rather than being baked into
+// vertices, which keeps one mesh handle per UI element instead of re-hashing it
+// every time the camera moves:
+//   ndc = (raw0*x + raw1, raw2*y + raw3, raw4*z + raw5)   [w = 1]
+// and a point at that ndc, distance d along the camera's forward, is
+//   C + F*d + R*(ndc.x * d*tan(fovY/2)*aspect) + U*(ndc.y * d*tan(fovY/2))
+// which composes with the draw's own modelview into a single 3x4.
+//
+// How far in front of the camera that plane sits, in game units. Just past the
+// near plane by default: the game guarantees nothing it draws is nearer than
+// that, so world geometry cannot poke through the HUD. Raise it only if the UI
+// is being occluded; the plane scales with distance so its apparent size does
+// not change.
+const Info<float> GFX_REMIX_WORLD_UI_DISTANCE{{System::GFX, "Settings", "RemixWorldUiDistance"},
+                                              2.0f};
+// Mirror the UI vertically. GX ndc y points up (Dolphin's vertex shader negates
+// it on the way out, for APIs whose y points down - VertexShaderGen.cpp:876), so
+// the default should be right. This exists because an upside-down HUD is a
+// one-bit mistake that otherwise costs a rebuild to test.
+const Info<bool> GFX_REMIX_WORLD_UI_FLIP_Y{{System::GFX, "Settings", "RemixWorldUiFlipY"}, false};
 // GX has no view matrix - posMatrices are combined object-to-view - so by
 // default the backend submits an identity camera and lets instances carry the
 // modelview, making Remix's world space the same thing as camera space. That

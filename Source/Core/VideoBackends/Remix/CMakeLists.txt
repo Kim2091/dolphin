@@ -8,6 +8,8 @@ add_library(videoremix
   RemixTexture.cpp
   RemixTexture.h
   RemixTextureCache.h
+  RemixUiRaster.cpp
+  RemixUiRaster.h
   RemixVertexManager.cpp
   RemixVertexManager.h
   PerfQuery.h

@@ -849,10 +849,20 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   // ---- Classify -----------------------------------------------------------
 
-  // Orthographic projection is HUD/UI/menus. It is never submitted; v1 has no
-  // 2D compositing path at all, so those draws are simply absent from the
-  // path-traced output.
-  if (xfmem.projection.type != ProjectionType::Perspective)
+  // Orthographic projection is HUD/UI/menus. RemixUiMode decides what happens to
+  // it: dropped (0, what v1 did), software-rasterized into the screen overlay
+  // (1, the default and the only one that looks like a HUD), or carried through
+  // this function like any other draw and placed on a plane in front of the
+  // camera at flush time (2).
+  //
+  // Everything below that reads the PERSPECTIVE projection is skipped for these:
+  // an ortho draw must not latch the reference camera, must not be folded onto
+  // it, must not be tested for sky, and above all must not reach the modelview
+  // histogram - its modelview is not a view matrix, and one in the histogram
+  // would corrupt the very camera the frame is rendered from.
+  const bool is_ortho = xfmem.projection.type != ProjectionType::Perspective;
+  const int ui_mode = g_remix_api->UiMode();
+  if (is_ortho && ui_mode == 0)
   {
     ++stats.skipped_ortho;
     return;
@@ -861,7 +871,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // First perspective draw of the frame defines the camera; every distinct
   // projection after it is tracked so the frame log can say whether the
   // reference is the one actually carrying the scene.
-  const int projection_slot = g_remix_api->ObserveProjection(xfmem.projection.rawProjection);
+  const int projection_slot =
+      is_ortho ? -1 : g_remix_api->ObserveProjection(xfmem.projection.rawProjection);
 
   // bSupportsPrimitiveRestart is false for this backend, so every quad/strip/fan
   // has already been expanded into a plain triangle list by the index generator
@@ -1256,6 +1267,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // rather than cancelling out of it. Null on the matrix-palette path, which has
   // no single modelview to offer.
   const float* raw_modelview = nullptr;
+  // Which slot that matrix came out of, for the modelview histogram. Hoisted out
+  // of the branch below because the diagnostics are filled in further down.
+  u32 position_matrix_slot = DrawDiagnostics::NO_POSITION_MATRIX;
   if (bake_vertices)
   {
     transform.matrix[0][0] = 1.0f;
@@ -1275,6 +1289,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     const u32 matrix_index =
         uniform_matrix ? uniform_matrix_index :
                          static_cast<u32>(g_main_cp_state.matrix_index_a.PosNormalMtxIdx);
+    position_matrix_slot = matrix_index;
     raw_modelview = &xfmem.posMatrices[matrix_index * 4];
     std::memcpy(&transform.matrix[0][0], raw_modelview, sizeof(float) * 12);
   }
@@ -1286,10 +1301,13 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // and a dropped off-centre term reads almost exactly like a small camera
   // rotation - so that geometry swings against the rest of the scene as the
   // view turns, which is the whole symptom this exists to kill.
-  if (xfmem.projection.rawProjection[1] != 0.0f || xfmem.projection.rawProjection[3] != 0.0f)
+  if (!is_ortho &&
+      (xfmem.projection.rawProjection[1] != 0.0f || xfmem.projection.rawProjection[3] != 0.0f))
+  {
     ++stats.projection_oblique;
+  }
 
-  if (g_remix_api->ProjectionFixEnabled() && g_remix_api->HasReferenceProjection())
+  if (!is_ortho && g_remix_api->ProjectionFixEnabled() && g_remix_api->HasReferenceProjection())
   {
     ProjectionCorrection correction;
     switch (BuildProjectionCorrection(xfmem.projection.rawProjection,
@@ -1343,8 +1361,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // lets it reach Wind Waker's untextured dome, something no texture-hash list
   // can ever match.
   const int sky_mode = g_remix_api->SkyMode();
-  const bool is_sky = (albedo != nullptr && g_remix_api->IsSkyTexture(albedo->GetContentHash())) ||
-                      (sky_mode != 0 && IsSkyDraw(bpmem.zmode));
+  const bool is_sky = !is_ortho &&
+                      ((albedo != nullptr && g_remix_api->IsSkyTexture(albedo->GetContentHash())) ||
+                       (sky_mode != 0 && IsSkyDraw(bpmem.zmode)));
   if (is_sky)
     ++stats.sky_draws;
 
@@ -1401,10 +1420,47 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   diagnostics.depth_func = static_cast<u8>(bpmem.zmode.func.Value());
   diagnostics.depth_write = bpmem.zmode.update_enable;
   diagnostics.draw_index = stats.draws_seen;
+  diagnostics.position_matrix = position_matrix_slot;
 
-  g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
+  if (!is_ortho)
+    g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
+
+  if (is_ortho && ui_mode == 1)
+  {
+    // Screen overlay. This draw never becomes a mesh or an instance - it is
+    // rasterized to pixels and composited after the frame is traced, which is
+    // the only way UI comes out looking like UI.
+    //
+    // The viewport, in EFB space, exactly as BPFunctions::SetViewport derives it
+    // for every other backend (the scissor offset is the same one
+    // VertexManagerBase::CalculateZSlope subtracts). A game is free to put its
+    // HUD in a sub-rect, and assuming full-screen would silently misplace it.
+    const float scissor_x = bpmem.scissorOffset.x * 2.0f;
+    const float scissor_y = bpmem.scissorOffset.y * 2.0f;
+    const std::array<float, 4> viewport = {
+        (xfmem.viewport.xOrig - scissor_x) - xfmem.viewport.wd,
+        (xfmem.viewport.yOrig - scissor_y) + xfmem.viewport.ht, 2.0f * xfmem.viewport.wd,
+        -2.0f * xfmem.viewport.ht};
+
+    std::array<float, 6> ortho_raw = xfmem.projection.rawProjection;
+    g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview, ortho_raw, viewport,
+                              albedo, filter_mode, wrap_mode_u, wrap_mode_v, blend);
+    return;
+  }
+
+  // Mode 2. An ortho draw hands over its raw projection and a NULL modelview:
+  // the first is what maps its screen-space vertices onto the UI plane, the
+  // second keeps it out of the camera histogram and the estimator both.
+  const std::array<float, 6>* world_ui_projection = nullptr;
+  std::array<float, 6> ortho_raw = {};
+  if (is_ortho)
+  {
+    ortho_raw = xfmem.projection.rawProjection;
+    world_ui_projection = &ortho_raw;
+    raw_modelview = nullptr;
+  }
   g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags, blend,
-                          raw_modelview, diagnostics);
+                          raw_modelview, diagnostics, world_ui_projection);
 }
 
 }  // namespace Remix

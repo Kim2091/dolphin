@@ -10,6 +10,8 @@
 #include <cwchar>
 #include <exception>
 #include <iterator>
+#include <chrono>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -25,6 +27,11 @@
 
 #include "VideoBackends/Remix/RemixTexture.h"
 
+#include "Common/FileUtil.h"
+
+// For EFB_WIDTH / EFB_HEIGHT: the UI viewport arrives in EFB space and the
+// screen overlay is rasterized at the swapchain's, so the two need relating.
+#include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoEvents.h"
 #include "VideoCommon/XFMemory.h"
 
@@ -236,6 +243,32 @@ bool AffineIsRigid(const Affine& m)
   }
   return true;
 }
+
+// Determinant of an affine's 3x3. A view matrix is rigid, so a candidate whose
+// determinant is anything but +/-1 carries a model scale and cannot be one.
+float AffineDeterminant(const Affine& m)
+{
+  return m[0] * (m[5] * m[10] - m[6] * m[9]) - m[1] * (m[4] * m[10] - m[6] * m[8]) +
+         m[2] * (m[4] * m[9] - m[5] * m[8]);
+}
+
+// Which of two histogram buckets is the better claim to "the frame's shared
+// space". Distinct meshes decide it: a matrix used four hundred times by one
+// mesh is an instanced prop, while one used by four hundred DIFFERENT meshes is
+// a space they were all authored in.
+bool BucketOutranks(const ModelviewBucket& a, const ModelviewBucket& b)
+{
+  if (a.meshes.size() != b.meshes.size())
+    return a.meshes.size() > b.meshes.size();
+  if (a.draws != b.draws)
+    return a.draws > b.draws;
+  return a.vertices > b.vertices;
+}
+
+// How often the histogram prints. Tighter than the 60-frame stats cadence
+// because the window in which a game is actually rendering 3D can be short -
+// Wind Waker's title screen is over in a few hundred frames.
+constexpr u64 MODELVIEW_LOG_INTERVAL = 30;
 
 // Do two transforms agree? Rotation and translation are tested separately - see
 // the epsilon comments above for why one combined norm silently trades one
@@ -546,6 +579,15 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
   m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
+  m_trace_modelviews = Config::Get(Config::GFX_REMIX_TRACE_MODELVIEWS);
+  m_camera_from_modelview = Config::Get(Config::GFX_REMIX_CAMERA_FROM_MODELVIEW);
+  m_ui_mode = Config::Get(Config::GFX_REMIX_UI_MODE);
+  m_world_ui_distance = Config::Get(Config::GFX_REMIX_WORLD_UI_DISTANCE);
+  m_world_ui_flip_y = Config::Get(Config::GFX_REMIX_WORLD_UI_FLIP_Y);
+  // The histogram is what the camera is read out of, so the mode cannot run
+  // without it. Forcing it on beats silently falling back to the estimator.
+  if (m_camera_from_modelview)
+    m_trace_modelviews = true;
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
   m_view_electorate_fix = Config::Get(Config::GFX_REMIX_VIEW_ELECTORATE_FIX);
   m_view_hold_on_miss = Config::Get(Config::GFX_REMIX_VIEW_HOLD_ON_MISS);
@@ -633,6 +675,14 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
     width = static_cast<u32>(client_rect.right - client_rect.left);
     height = static_cast<u32>(client_rect.bottom - client_rect.top);
   }
+
+  // The screen overlay is rasterized at this resolution, so it has to be known
+  // whether or not the explicit-device path below is taken. Scaled down on
+  // request: the rasterizer is fill-rate bound and the runtime rescales the
+  // overlay when it composites, so this trades sharpness for frame time.
+  const float ui_scale = std::clamp(Config::Get(Config::GFX_REMIX_UI_OVERLAY_SCALE), 0.1f, 1.0f);
+  m_surface_width = std::max(1u, static_cast<u32>(static_cast<float>(width) * ui_scale));
+  m_surface_height = std::max(1u, static_cast<u32>(static_cast<float>(height) * ui_scale));
 
   // Preferred path: create and register the D3D9 device explicitly through the
   // dxvk extension. Startup()'s default-init flow spawns the dev-menu overlay
@@ -1153,7 +1203,8 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
                           const std::vector<u32>& indices, const remixapi_Transform& transform,
                           remixapi_InstanceCategoryFlags category_flags,
                           const DrawBlendState& blend, const float* raw_modelview,
-                          const DrawDiagnostics& diagnostics)
+                          const DrawDiagnostics& diagnostics,
+                          const std::array<float, 6>* world_ui_projection)
 {
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
@@ -1256,8 +1307,320 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
       m_view_duplicate_hashes.insert(mesh_hash);
   }
 
-  m_pending_instances.push_back(
-      PendingInstance{mesh_handle, transform, category_flags, blend, mesh_hash});
+  // Modelview histogram, deliberately outside every cap the electorate above
+  // applies. That is the entire point of it: the estimator votes with the few
+  // dozen meshes that both persist across the frame boundary and clear the vertex
+  // floor, while this sees every draw in the frame. If the view matrix is sitting
+  // in xfmem.posMatrices as a literal value - which it is whenever a game draws
+  // world-authored geometry with an identity model transform - then one bucket
+  // here holds most of the scene and no estimate is needed at all.
+  if (m_trace_modelviews)
+  {
+    if (raw_modelview == nullptr)
+    {
+      ++m_stats.modelview_palette;
+    }
+    else
+    {
+      ++m_stats.modelview_samples;
+      // Fold -0.0 onto +0.0 before hashing. The two compare equal and mean the
+      // same transform, so a game that writes either into the same slot must not
+      // end up with its scene split across two buckets over a sign bit.
+      Affine matrix = {};
+      for (size_t i = 0; i < matrix.size(); ++i)
+        matrix[i] = raw_modelview[i] == 0.0f ? 0.0f : raw_modelview[i];
+
+      const u64 key = XXH64(matrix.data(), matrix.size() * sizeof(float), 0);
+      auto bucket = m_modelviews.find(key);
+      if (bucket == m_modelviews.end() && m_modelviews.size() < MAX_MODELVIEW_BUCKETS)
+      {
+        ModelviewBucket fresh;
+        fresh.matrix = matrix;
+        bucket = m_modelviews.emplace(key, std::move(fresh)).first;
+      }
+      if (bucket == m_modelviews.end())
+      {
+        ++m_modelview_overflow;
+      }
+      else
+      {
+        bucket->second.meshes.insert(mesh_hash);
+        ++bucket->second.draws;
+        bucket->second.vertices += static_cast<u32>(vertices.size());
+        if (diagnostics.position_matrix < 64)
+          bucket->second.slots |= 1ull << diagnostics.position_matrix;
+      }
+    }
+  }
+
+  PendingInstance pending{mesh_handle, transform, category_flags, blend, mesh_hash};
+  if (world_ui_projection != nullptr)
+  {
+    pending.world_ui = true;
+    pending.ortho_projection = *world_ui_projection;
+  }
+  m_pending_instances.push_back(pending);
+}
+
+void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
+                            const std::vector<u32>& indices, const float* modelview,
+                            const std::array<float, 6>& ortho_projection,
+                            const std::array<float, 4>& viewport, const RemixTexture* texture,
+                            u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
+                            const DrawBlendState& blend)
+{
+  if (!m_valid || m_ui_mode != 1 || vertices.empty() || indices.empty())
+    return;
+  if (m_interface.DrawScreenOverlay == nullptr)
+    return;
+
+  // The overlay is sized to the swapchain. Cleared here, at the frame's first UI
+  // draw, rather than in OnAfterFrame: a frame that draws no UI must leave the
+  // buffer untouched so SubmitScreenOverlay can tell the runtime to drop its
+  // pending overlay instead of compositing a transparent full-screen quad.
+  if (!m_ui_frame_begun)
+  {
+    m_ui_raster.Begin(m_surface_width, m_surface_height);
+    m_ui_frame_begun = true;
+  }
+
+  UiRasterizer::DrawCall call;
+  if (texture != nullptr && !texture->GetPixels().empty())
+  {
+    call.texture.pixels = texture->GetPixels().data();
+    call.texture.width = texture->GetWidth();
+    call.texture.height = texture->GetHeight();
+    // GX TexMode0 filter: 0 = near, anything else is some flavour of linear.
+    call.texture.bilinear = filter_mode != 0;
+    // GX wrap mode 0 = clamp, 1 = repeat, 2 = mirror. Mirror falls back to
+    // repeat in the sampler; see the note there.
+    call.texture.clamp_u = wrap_mode_u == 0;
+    call.texture.clamp_v = wrap_mode_v == 0;
+  }
+
+  // Blend state arrives already translated into Vulkan's numbering, so the cases
+  // are read off that rather than re-derived from GX.
+  //   VK_BLEND_FACTOR_ZERO = 0, ONE = 1, SRC_ALPHA = 6, ONE_MINUS_SRC_ALPHA = 7
+  if (!blend.blend_enabled)
+  {
+    call.blend = UiRasterizer::BlendMode::Opaque;
+  }
+  else if (blend.src_color_factor == 1 && blend.dst_color_factor == 1)
+  {
+    call.blend = UiRasterizer::BlendMode::Additive;
+  }
+  else if (blend.src_color_factor == 1 && blend.dst_color_factor == 0)
+  {
+    call.blend = UiRasterizer::BlendMode::Opaque;
+  }
+  else
+  {
+    call.blend = UiRasterizer::BlendMode::Over;
+  }
+  call.alpha_compare = blend.alpha_test_enabled ? blend.alpha_test_compare : 7;
+  call.alpha_reference = static_cast<float>(blend.alpha_test_reference) / 255.0f;
+
+  // EFB space -> overlay pixels. The overlay is the swapchain, the viewport is
+  // in EFB units, and the two differ by the internal resolution scale.
+  const float scale_x = static_cast<float>(m_surface_width) / static_cast<float>(EFB_WIDTH);
+  const float scale_y = static_cast<float>(m_surface_height) / static_cast<float>(EFB_HEIGHT);
+  call.viewport_x = viewport[0] * scale_x;
+  call.viewport_y = viewport[1] * scale_y;
+  call.viewport_width = viewport[2] * scale_x;
+  call.viewport_height = viewport[3] * scale_y;
+
+  m_ui_vertices.clear();
+  m_ui_vertices.reserve(vertices.size());
+  for (const remixapi_HardcodedVertex& source : vertices)
+  {
+    // Object -> view. A baked draw (matrix palette) is already in view space and
+    // passes a null modelview.
+    float view[3] = {source.position[0], source.position[1], source.position[2]};
+    if (modelview != nullptr)
+    {
+      for (int i = 0; i < 3; ++i)
+      {
+        view[i] = modelview[i * 4 + 0] * source.position[0] +
+                  modelview[i * 4 + 1] * source.position[1] +
+                  modelview[i * 4 + 2] * source.position[2] + modelview[i * 4 + 3];
+      }
+    }
+
+    UiRasterizer::Vertex vertex;
+    // View -> NDC. w is 1 for an orthographic projection, which is what lets the
+    // rasterizer interpolate affinely and still be exact.
+    vertex.x = ortho_projection[0] * view[0] + ortho_projection[1];
+    vertex.y = ortho_projection[2] * view[1] + ortho_projection[3];
+    vertex.u = source.texcoord[0];
+    vertex.v = source.texcoord[1];
+    // remixapi_HardcodedVertex::color is packed B,G,R,A in memory - see
+    // ToRemixVertexColor, which does that swap on the way in.
+    vertex.color = {static_cast<float>((source.color >> 16) & 0xFF) / 255.0f,
+                    static_cast<float>((source.color >> 8) & 0xFF) / 255.0f,
+                    static_cast<float>(source.color & 0xFF) / 255.0f,
+                    static_cast<float>((source.color >> 24) & 0xFF) / 255.0f};
+    m_ui_vertices.push_back(vertex);
+  }
+
+  m_ui_raster.Draw(call, m_ui_vertices, indices);
+  ++m_stats.ui_placed;
+}
+
+void RemixApi::SubmitScreenOverlay()
+{
+  if (m_ui_mode != 1 || m_interface.DrawScreenOverlay == nullptr)
+    return;
+
+  // Replay the frame's recorded draws across the worker bands. This is where the
+  // rasterization actually happens, so it is what the raster timing measures.
+  const auto raster_start = std::chrono::steady_clock::now();
+  if (m_ui_frame_begun)
+    m_ui_raster.Flush();
+  m_stats.ui_raster_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                              std::chrono::steady_clock::now() - raster_start)
+                                              .count());
+
+  // Nothing drawn this frame: clear the runtime's pending overlay rather than
+  // leaving the last one up. A null pointer is the documented way to do that
+  // (rtx_fork_api_entry.cpp drawScreenOverlay), and it costs no upload.
+  if (!m_ui_frame_begun || !m_ui_raster.HasContent())
+  {
+    CallGuarded("DrawScreenOverlay(clear)", [&] {
+      m_interface.DrawScreenOverlay(nullptr, 0, 0, REMIXAPI_FORMAT_R8G8B8A8_UNORM, 1.0f);
+    });
+    return;
+  }
+
+  const std::vector<u32>& buffer = m_ui_raster.Buffer();
+
+  // One-shot dump of the composited overlay, for checking that this path
+  // produces an IMAGE rather than merely calling the API successfully - the two
+  // are not the same thing and only one of them is the feature. Written over a
+  // checkerboard so transparent and black are distinguishable.
+  if (m_ui_dump_frame != 0 && m_frame_index == static_cast<u64>(m_ui_dump_frame))
+  {
+    const std::string path = File::GetUserPath(D_LOGS_IDX) + "remix-ui-overlay.bmp";
+    std::ofstream out(path, std::ios::binary);
+    if (out)
+    {
+      const u32 width = m_ui_raster.Width();
+      const u32 height = m_ui_raster.Height();
+      const u32 row_bytes = (width * 3 + 3) & ~3u;
+      const u32 image_bytes = row_bytes * height;
+      const u32 file_bytes = 54 + image_bytes;
+      const auto put16 = [&](u16 v) { out.write(reinterpret_cast<const char*>(&v), 2); };
+      const auto put32 = [&](u32 v) { out.write(reinterpret_cast<const char*>(&v), 4); };
+      out.write("BM", 2);
+      put32(file_bytes);
+      put32(0);
+      put32(54);
+      put32(40);
+      put32(width);
+      put32(height);
+      put16(1);
+      put16(24);
+      put32(0);
+      put32(image_bytes);
+      put32(2835);
+      put32(2835);
+      put32(0);
+      put32(0);
+      std::vector<u8> row(row_bytes, 0);
+      // BMP rows run bottom-up.
+      for (u32 y = height; y-- > 0;)
+      {
+        for (u32 x = 0; x < width; ++x)
+        {
+          const u32 texel = buffer[static_cast<size_t>(y) * width + x];
+          const float alpha = static_cast<float>((texel >> 24) & 0xFF) / 255.0f;
+          const float checker = ((x / 16 + y / 16) & 1) != 0 ? 0.35f : 0.55f;
+          const float channel[3] = {static_cast<float>((texel >> 16) & 0xFF) / 255.0f,
+                                    static_cast<float>((texel >> 8) & 0xFF) / 255.0f,
+                                    static_cast<float>(texel & 0xFF) / 255.0f};
+          // The buffer is straight alpha, so undo nothing - just composite.
+          for (int i = 0; i < 3; ++i)
+          {
+            const float v = channel[i] * alpha + checker * (1.0f - alpha);
+            row[x * 3 + static_cast<size_t>(2 - i)] =
+                static_cast<u8>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
+          }
+        }
+        out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
+      }
+      INFO_LOG_FMT(VIDEO, "Remix: dumped UI overlay ({}x{}) to {}", width, height, path);
+    }
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  CallGuarded("DrawScreenOverlay", [&] {
+    m_interface.DrawScreenOverlay(buffer.data(), m_ui_raster.Width(), m_ui_raster.Height(),
+                                  REMIXAPI_FORMAT_R8G8B8A8_UNORM, 1.0f);
+  });
+  m_stats.ui_upload_us = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
+          .count());
+}
+
+bool RemixApi::BuildWorldUiTransform(const std::array<float, 6>& raw, Affine& out) const
+{
+  // Maps an orthographic draw's VIEW space onto a plane in front of the camera.
+  //
+  //   ndc = (raw0*x + raw1, raw2*y + raw3, raw4*z + raw5)         [w = 1]
+  //   world = C + F*(d + ndc.z*depth) + R*(ndc.x*half_w) + U*(ndc.y*half_h)
+  //
+  // Every term is affine in (x, y, z), so this is a 3x4 and composes with the
+  // draw's own modelview into one instance transform. That is the whole reason
+  // to do it this way rather than transforming vertices: baked vertices would
+  // re-hash on every camera move and churn a mesh handle per UI element per
+  // frame, which is the same trap the matrix-palette path already falls into.
+  // Read back the frustum SetupCamera actually SUBMITTED rather than recovering
+  // it again here. The two must agree exactly or the UI plane does not line up
+  // with the frame, and re-deriving it would also fail on a screen that has no
+  // perspective draw at all - which is precisely the case this exists for. A
+  // game sitting on a 2D menu still gets a camera (SetupCamera falls back to a
+  // fabricated one), so there is always a frustum to fill.
+  const float distance = std::max(m_world_ui_distance, 0.001f);
+  const float half_h = distance * std::tan(0.5f * m_camera_fov_y_deg * DEG_TO_RAD);
+  const float half_w = half_h * m_camera_aspect;
+  // Enough separation for a UI element's own depth values to order its layers
+  // without the plane visibly tilting away from the camera.
+  const float depth = distance * 0.02f;
+
+  // Camera basis, exactly as SetupCamera hands it to the runtime - the two must
+  // agree or the UI lands somewhere the camera is not looking.
+  const Affine& v = m_view;
+  const float tx = v[3], ty = v[7], tz = v[11];
+  const float centre[3] = {-(v[0] * tx + v[4] * ty + v[8] * tz),
+                           -(v[1] * tx + v[5] * ty + v[9] * tz),
+                           -(v[2] * tx + v[6] * ty + v[10] * tz)};
+  const float right[3] = {v[0], v[1], v[2]};
+  const float up[3] = {v[4], v[5], v[6]};
+  const float forward[3] = {-v[8], -v[9], -v[10]};
+
+  const float y_sign = m_world_ui_flip_y ? -1.0f : 1.0f;
+  const float scale_x = half_w * raw[0];
+  const float scale_y = half_h * raw[2] * y_sign;
+  // A UI projection with no depth range at all would make this column zero and
+  // the transform singular, which leaves the runtime inverse-transposing a
+  // degenerate matrix for its normals. Floor it; the value is arbitrary because
+  // nothing depends on the scale of a dimension the game is not using.
+  float scale_z = depth * raw[4];
+  if (std::abs(scale_z) < depth * 1e-3f)
+    scale_z = depth * 1e-3f;
+
+  const float offset = distance + depth * raw[5];
+  const float bias_x = half_w * raw[1];
+  const float bias_y = half_h * raw[3] * y_sign;
+
+  for (int i = 0; i < 3; ++i)
+  {
+    out[i * 4 + 0] = right[i] * scale_x;
+    out[i * 4 + 1] = up[i] * scale_y;
+    out[i * 4 + 2] = forward[i] * scale_z;
+    out[i * 4 + 3] =
+        centre[i] + forward[i] * offset + right[i] * bias_x + up[i] * bias_y;
+  }
+  return std::isfinite(out[3]) && std::isfinite(out[7]) && std::isfinite(out[11]);
 }
 
 void RemixApi::FlushPendingInstances()
@@ -1341,16 +1704,38 @@ void RemixApi::FlushPendingInstances()
     instance.pNext = need_blend_ext ? static_cast<void*>(&blend) : static_cast<void*>(&picking);
     instance.categoryFlags = category_flags;
     instance.mesh = pending.mesh;
-    // The submitted transform is V^-1 * (C * MV), and the camera is V, so Remix
-    // computes P * V * V^-1 * C * MV = P * C * MV. The rendered image is
-    // therefore INVARIANT to whatever V the estimator produces - a wrong camera
-    // costs temporal quality, never correctness. The one thing that can break
-    // the picture is SetupCamera's basis extraction disagreeing with this V,
-    // which is why that is the part to suspect if geometry ever moves wrongly.
-    instance.transform =
-        m_camera_recovery ?
-            ToRemixTransform(AffineMultiply(m_view_inverse, FromRemixTransform(pending.transform))) :
-            pending.transform;
+    if (pending.world_ui)
+    {
+      // Already world space: BuildWorldUiTransform maps view -> WORLD, camera
+      // basis included, so applying V^-1 on top would undo the placement. Built
+      // per draw rather than once per frame because a game is free to use more
+      // than one orthographic projection - a full-screen fade and a corner HUD
+      // element need not share a frustum.
+      Affine placement = {};
+      if (!BuildWorldUiTransform(pending.ortho_projection, placement))
+      {
+        ++m_stats.ui_unplaceable;
+        continue;
+      }
+      instance.transform =
+          ToRemixTransform(AffineMultiply(placement, FromRemixTransform(pending.transform)));
+      instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI;
+      ++m_stats.ui_placed;
+    }
+    else
+    {
+      // The submitted transform is V^-1 * (C * MV), and the camera is V, so Remix
+      // computes P * V * V^-1 * C * MV = P * C * MV. The rendered image is
+      // therefore INVARIANT to whatever V the estimator produces - a wrong camera
+      // costs temporal quality, never correctness. The one thing that can break
+      // the picture is SetupCamera's basis extraction disagreeing with this V,
+      // which is why that is the part to suspect if geometry ever moves wrongly.
+      instance.transform =
+          m_camera_recovery ?
+              ToRemixTransform(
+                  AffineMultiply(m_view_inverse, FromRemixTransform(pending.transform))) :
+              pending.transform;
+    }
     // v1 pins double-sided: GC winding under our right-handed identity view is
     // not verified, and a wrong guess would silently cull whole scenes.
     instance.doubleSided = 1;
@@ -1375,6 +1760,10 @@ void RemixApi::EstimateView()
   m_view_delta_translation = 0.0f;
   if (!m_camera_recovery)
     return;
+
+  // Snapshot before the estimator integrates anything, so that a histogram gate
+  // miss can hold the pose the frame started with.
+  const Affine view_at_entry = m_view;
 
   // A mesh hash submitted more than once this frame corresponds to nothing in
   // particular: emplace kept whichever instance arrived first, so pairing it
@@ -1548,6 +1937,36 @@ void RemixApi::EstimateView()
       INFO_LOG_FMT(VIDEO, "Remix: camera estimate {} at frame {} ({} deltas, {} inliers, {} needed)",
                    m_view_hold_on_miss ? "held" : "re-anchored", m_frame_index, deltas.size(),
                    best_inliers, required);
+    }
+  }
+
+  // --- Stop estimating the view matrix and use the one the game wrote -------
+  //
+  // For any object whose model transform is the identity, the combined modelview
+  // IS the view matrix - and world-authored geometry (terrain, rooms, the sea)
+  // is typically drawn exactly that way. So V is not something to infer: it is
+  // sitting in xfmem.posMatrices as a literal value, and the histogram says
+  // which slot from EVERY draw in the frame rather than from the few dozen
+  // meshes that happen to persist across the boundary. Measured on Wind Waker
+  // it is slot 0 on 340 of 340 frames, rigid, shared by 160-293 meshes against a
+  // runner-up pinned at 14.
+  //
+  // The estimator above still runs and its numbers still reach the log, so the
+  // two can be read against each other on the same frame. It just no longer
+  // decides. On a gate miss the pose is HELD at what it was when the frame
+  // started, rather than inheriting whatever the estimator did with it - the
+  // mode has to be independent of the estimator or the A/B means nothing.
+  if (m_camera_from_modelview)
+  {
+    if (m_modelview_camera_valid)
+    {
+      m_view = m_modelview_camera;
+      ++m_modelview_camera_accepted;
+    }
+    else
+    {
+      m_view = view_at_entry;
+      ++m_modelview_camera_held;
     }
   }
 
@@ -1766,6 +2185,280 @@ void RemixApi::LogCameraRecovery()
   m_view_max_translation = 0.0f;
 }
 
+void RemixApi::ResolveDominantModelview()
+{
+  m_modelview_top_valid = false;
+  m_modelview_camera_valid = false;
+  m_modelview_mesh_uses = 0;
+  m_modelview_top_meshes = 0;
+  m_modelview_top_draws = 0;
+  m_modelview_top_vertices = 0;
+  m_modelview_top_slots = 0;
+  m_modelview_second_meshes = 0;
+  m_modelview_second_draws = 0;
+  m_modelview_third_meshes = 0;
+  m_modelview_third_draws = 0;
+  if (!m_trace_modelviews)
+    return;
+
+  const ModelviewBucket* ranked[3] = {nullptr, nullptr, nullptr};
+  for (const auto& entry : m_modelviews)
+  {
+    const ModelviewBucket& bucket = entry.second;
+    // Not the number of distinct meshes in the frame: one mesh drawn under two
+    // matrices counts in both buckets. It is the right denominator anyway - the
+    // question is what share of the frame's mesh-to-matrix pairings the winner
+    // accounts for.
+    m_modelview_mesh_uses += static_cast<u32>(bucket.meshes.size());
+    for (int place = 0; place < 3; ++place)
+    {
+      if (ranked[place] != nullptr && !BucketOutranks(bucket, *ranked[place]))
+        continue;
+      for (int shift = 2; shift > place; --shift)
+        ranked[shift] = ranked[shift - 1];
+      ranked[place] = &bucket;
+      break;
+    }
+  }
+  if (ranked[0] == nullptr)
+  {
+    m_modelview_camera_streak = 0;
+    return;
+  }
+
+  // Copied out as values rather than kept as pointers into the map: the log
+  // pass runs at the far end of the frame, and a member pointing into a
+  // container that gets cleared in between is a trap waiting to be sprung.
+  m_modelview_top = ranked[0]->matrix;
+  m_modelview_top_meshes = static_cast<u32>(ranked[0]->meshes.size());
+  m_modelview_top_draws = ranked[0]->draws;
+  m_modelview_top_vertices = ranked[0]->vertices;
+  m_modelview_top_slots = ranked[0]->slots;
+  m_modelview_top_mesh_set.clear();
+  m_modelview_top_mesh_set.insert(ranked[0]->meshes.begin(), ranked[0]->meshes.end());
+  if (ranked[1] != nullptr)
+  {
+    m_modelview_second_meshes = static_cast<u32>(ranked[1]->meshes.size());
+    m_modelview_second_draws = ranked[1]->draws;
+  }
+  if (ranked[2] != nullptr)
+  {
+    m_modelview_third_meshes = static_cast<u32>(ranked[2]->meshes.size());
+    m_modelview_third_draws = ranked[2]->draws;
+  }
+  m_modelview_top_valid = true;
+
+  // --- Is the winner trustworthy enough to BE the camera? -------------------
+  // Not a close call to arbitrate - a scene either has a shared authoring space
+  // or it does not. Wind Waker measures 160-293 meshes against a runner-up
+  // pinned at 14, an 11-20x margin, so these floors sit far under any real
+  // positive and exist to catch the frame where the space is simply absent.
+  //
+  // The third test is that a view matrix carries no model scale, which is what
+  // stops a large scaled object's space from being adopted as the camera. A
+  // genuine V passes it by construction.
+  const bool gate_passed =
+      m_modelview_top_meshes >= MIN_MODELVIEW_CAMERA_MESHES &&
+      m_modelview_second_meshes * MODELVIEW_CAMERA_DOMINANCE <= m_modelview_top_meshes &&
+      AffineIsRigid(m_modelview_top);
+  if (!gate_passed)
+  {
+    m_modelview_camera_streak = 0;
+    return;
+  }
+
+  // A warm-up streak before anything is believed. The gate is a per-frame test
+  // and a startup logo or a single transition frame can satisfy it by accident
+  // with a handful of meshes around the origin - which is not hypothetical: the
+  // first attempt latched the world offset below on exactly such a frame, at
+  // t ~ 0, so the offset came out as the identity and did nothing at all. A
+  // scene that really has a shared space holds it for many frames in a row.
+  if (++m_modelview_camera_streak < MODELVIEW_CAMERA_WARMUP)
+    return;
+
+  // --- Move the world origin to where the camera started --------------------
+  // The game's own view matrices carry translations of order 1e5 - Wind Waker's
+  // Great Sea sits near (-207000, 0, 272000) - and using one directly puts every
+  // instance out there too. That is not just a tracer precision tax: W = V^-1*MV
+  // then differences two ~1e5 quantities down to a small one, which in float32
+  // costs about 0.03 units of absolute error and puts the 5e-3 stability check
+  // below its own noise floor, so the one metric available to judge this by
+  // stops working. Post-multiplying by a CONSTANT translation fixes it exactly:
+  //   V = A * O,  O = [I | p0]   =>   W = V^-1 * MV = O^-1 * M
+  // so every world transform is just shifted by -p0 and nothing else changes.
+  // Latched once, so the world frame never moves again; p0 is the camera's own
+  // world position at the lock, which makes the camera start at the origin.
+  if (!m_modelview_world_offset_latched)
+  {
+    const Affine& a = m_modelview_top;
+    const float tx = a[3], ty = a[7], tz = a[11];
+    m_modelview_world_offset = {1.0f, 0.0f, 0.0f, -(a[0] * tx + a[4] * ty + a[8] * tz),
+                                0.0f, 1.0f, 0.0f, -(a[1] * tx + a[5] * ty + a[9] * tz),
+                                0.0f, 0.0f, 1.0f, -(a[2] * tx + a[6] * ty + a[10] * tz)};
+    m_modelview_world_offset_latched = true;
+  }
+  m_modelview_camera = AffineMultiply(m_modelview_top, m_modelview_world_offset);
+  // Belt and braces: SetupCamera extracts the basis assuming R^-1 == R^T, and
+  // AffineIsRigid above only holds the rows to 0.02.
+  AffineOrthonormalize(m_modelview_camera);
+  m_modelview_camera_valid = true;
+}
+
+void RemixApi::LogModelviewHistogram()
+{
+  if (!m_trace_modelviews)
+    return;
+
+  // --- Follow the dominant bucket across the frame boundary -----------------
+  // If the candidate really is the view matrix then its own inter-frame delta IS
+  // the camera delta, and it should agree with what the estimator claims. Mesh
+  // overlap is what says the two frames' winners are the same thing rather than
+  // two unrelated matrices that each happened to win.
+  u32 kept = 0;
+  float candidate_rotation = 0.0f;
+  float candidate_translation = 0.0f;
+  bool candidate_delta_rigid = false;
+  Affine candidate_previous_inverse = {};
+  bool have_previous_inverse = false;
+  if (m_modelview_top_valid && m_modelview_top_previous_valid)
+  {
+    for (const u64 mesh_hash : m_modelview_top_meshes_previous)
+      kept += static_cast<u32>(m_modelview_top_mesh_set.count(mesh_hash));
+
+    have_previous_inverse = AffineInvert(m_modelview_top_previous, candidate_previous_inverse);
+    if (have_previous_inverse)
+    {
+      const Affine delta = AffineMultiply(m_modelview_top, candidate_previous_inverse);
+      candidate_rotation = AffineRotationDegrees(delta);
+      candidate_translation = AffineTranslationLength(delta);
+      candidate_delta_rigid = AffineIsRigid(delta);
+    }
+  }
+
+  const bool report =
+      m_log_stats && m_modelview_top_valid && (m_frame_index % MODELVIEW_LOG_INTERVAL) == 0;
+
+  // --- Score the candidate as a camera --------------------------------------
+  // Exactly the metric EstimateView reports, with the recovered V replaced by
+  // this candidate: W = A^-1 * MV, and a static object's W must not change
+  // between frames. Run over the same electorate so the two percentages are
+  // directly comparable - a candidate that scores far higher than the estimator
+  // is the answer to this whole workstream.
+  //
+  // Worth stating what it cannot distinguish: any A = V*K for a CONSTANT K
+  // scores identically, because K falls out of the ratio. A perfect score
+  // identifies the view matrix only up to a fixed change of world basis, which
+  // costs the geometry nothing and merely rotates the sky.
+  //
+  // Rotation and translation are counted SEPARATELY, and the residual
+  // translation is reported as a magnitude rather than a pass/fail. At a
+  // candidate translation of order 1e5 the ratio's translation is the difference
+  // of two nearly equal large numbers in float32, so its absolute error is
+  // roughly |t| * 1e-7 ~ 0.04 - an order of magnitude over the 5e-3 epsilon,
+  // which would fail every static object on arithmetic alone. The residual is
+  // what separates the two readings: ~0.1 is that precision floor, ~50 is the
+  // objects genuinely moving relative to the candidate.
+  u32 candidate_stable = 0;
+  u32 candidate_stable_rotation = 0;
+  u32 candidate_compared = 0;
+  float candidate_residual = 0.0f;
+  Affine candidate_inverse = {};
+  if (report && have_previous_inverse && AffineInvert(m_modelview_top, candidate_inverse))
+  {
+    for (const auto& [mesh_hash, current] : m_view_samples)
+    {
+      // A hash submitted twice pairs two arbitrary members of a set of identical
+      // props, so its "motion" is meaningless. EstimateView already drops these
+      // when the electorate fix is on; check anyway, since this instrument has to
+      // read the same with camera recovery off.
+      if (m_view_duplicate_hashes.count(mesh_hash) != 0)
+        continue;
+      const auto previous = m_view_samples_previous.find(mesh_hash);
+      if (previous == m_view_samples_previous.end())
+        continue;
+      Affine previous_world_inverse = {};
+      if (!AffineInvert(AffineMultiply(candidate_previous_inverse, previous->second),
+                        previous_world_inverse))
+      {
+        continue;
+      }
+      ++candidate_compared;
+      const Affine ratio =
+          AffineMultiply(AffineMultiply(candidate_inverse, current), previous_world_inverse);
+      if (AffineSimilar(ratio, IDENTITY_AFFINE))
+        ++candidate_stable;
+      if (AffineRotationDegrees(ratio) < 0.2f)
+      {
+        // Only meaningful for objects the candidate already holds still
+        // rotationally - averaging in a genuinely moving object's translation
+        // would drown the precision floor we are trying to read.
+        ++candidate_stable_rotation;
+        candidate_residual += AffineTranslationLength(ratio);
+      }
+    }
+    if (candidate_stable_rotation != 0)
+      candidate_residual /= static_cast<float>(candidate_stable_rotation);
+  }
+
+  if (report)
+  {
+    const u32 share = m_modelview_mesh_uses != 0 ?
+                          (m_modelview_top_meshes * 100) / m_modelview_mesh_uses : 0;
+    INFO_LOG_FMT(VIDEO,
+                 "Remix frame {} modelviews: draws {} (palette {}, overflow {}) | {} distinct "
+                 "matrices over {} mesh-uses | TOP {} meshes ({}%), {} draws, {} verts, slots "
+                 "{:#x} | #2 {} meshes {} draws | #3 {} meshes {} draws | camera {} (accepted "
+                 "{}, held {} since last report)",
+                 m_frame_index, m_stats.modelview_samples, m_stats.modelview_palette,
+                 m_modelview_overflow, m_modelviews.size(), m_modelview_mesh_uses,
+                 m_modelview_top_meshes, share, m_modelview_top_draws, m_modelview_top_vertices,
+                 m_modelview_top_slots, m_modelview_second_meshes, m_modelview_second_draws,
+                 m_modelview_third_meshes, m_modelview_third_draws,
+                 !m_camera_from_modelview ? "estimator (mode off)" :
+                     (m_modelview_camera_valid ? "HISTOGRAM" : "held (gate missed)"),
+                 m_modelview_camera_accepted, m_modelview_camera_held);
+    m_modelview_camera_accepted = 0;
+    m_modelview_camera_held = 0;
+
+    const u32 candidate_pct =
+        candidate_compared != 0 ? (candidate_stable * 100) / candidate_compared : 0;
+    const u32 estimator_pct =
+        m_stats.w_compared != 0 ? (m_stats.w_stable * 100) / m_stats.w_compared : 0;
+    INFO_LOG_FMT(VIDEO,
+                 "Remix frame {} modelview TOP: [{:.4f} {:.4f} {:.4f} {:.2f} / {:.4f} {:.4f} "
+                 "{:.4f} {:.2f} / {:.4f} {:.4f} {:.4f} {:.2f}] | rigid {} det {:.4f} | kept {}/{} "
+                 "meshes | its delta rot {:.3f} deg trans {:.2f} (rigid {}) vs estimator rot "
+                 "{:.3f} trans {:.2f} | stable W {}/{} ({}%) [rot-only {}, mean residual "
+                 "{:.4f}] vs estimator {}/{} ({}%)",
+                 m_frame_index, m_modelview_top[0], m_modelview_top[1], m_modelview_top[2],
+                 m_modelview_top[3], m_modelview_top[4], m_modelview_top[5], m_modelview_top[6],
+                 m_modelview_top[7], m_modelview_top[8], m_modelview_top[9], m_modelview_top[10],
+                 m_modelview_top[11],
+                 AffineIsRigid(m_modelview_top) ? "yes" : "NO", AffineDeterminant(m_modelview_top),
+                 kept,
+                 m_modelview_top_meshes_previous.size(), candidate_rotation, candidate_translation,
+                 candidate_delta_rigid ? "yes" : "NO", m_view_delta_rotation_deg,
+                 m_view_delta_translation, candidate_stable, candidate_compared, candidate_pct,
+                 candidate_stable_rotation, candidate_residual, m_stats.w_stable,
+                 m_stats.w_compared, estimator_pct);
+  }
+
+  // Roll the state EVERY frame, printing or not: a candidate delta measured
+  // across a 30-frame gap would not be a camera delta.
+  if (m_modelview_top_valid)
+  {
+    m_modelview_top_previous = m_modelview_top;
+    m_modelview_top_meshes_previous.swap(m_modelview_top_mesh_set);
+    m_modelview_top_previous_valid = true;
+  }
+  else
+  {
+    m_modelview_top_previous_valid = false;
+  }
+  m_modelviews.clear();
+  m_modelview_overflow = 0;
+}
+
 // Union of every projection variant's depth range this frame. Taking the union
 // is what stops a draw with a longer far plane from being clipped by whichever
 // projection happened to be latched first; variant #0 is the reference, so it is
@@ -1879,6 +2572,12 @@ void RemixApi::SetupCamera()
     }
     m_camera_valid = true;
   }
+  // Whatever frustum ended up being submitted - recovered or fallback - is what
+  // the world-space UI plane has to fill, so publish it rather than letting
+  // BuildWorldUiTransform derive its own and drift.
+  m_camera_fov_y_deg = params.fovYInDegrees;
+  m_camera_aspect = params.aspect;
+
   // If no perspective draw has ever been seen the hardcoded default above
   // stands, which is what keeps the Milestone 0 triangle visible.
 
@@ -2312,7 +3011,9 @@ void RemixApi::OnAfterFrame()
   // Order matters: the camera has to be known before any instance can be placed
   // relative to it, and the estimate needs the whole frame's draws. So the
   // frame runs estimate -> camera -> instances rather than emitting instances
-  // as they arrive.
+  // as they arrive. The histogram is resolved first because when it is driving,
+  // its winner is what EstimateView installs as the view matrix.
+  ResolveDominantModelview();
   EstimateView();
   SetupCamera();
   FlushPendingInstances();
@@ -2325,6 +3026,11 @@ void RemixApi::OnAfterFrame()
     SubmitFallbackTriangle();
 
   ReapIdleMeshes();
+
+  // Before Present, not after: the runtime stages the overlay and drains it at
+  // the next present boundary, so a submission after Present would land a frame
+  // late.
+  SubmitScreenOverlay();
 
   remixapi_PresentInfo present_info = {};
   present_info.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
@@ -2340,7 +3046,8 @@ void RemixApi::OnAfterFrame()
                  "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
-                 "diffuse none {} sign {} | spec {} | GX ambient {} | sky auto: candidates {}, "
+                 "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
+                 "unplaceable, raster {} us, upload {} us) | sky auto: candidates {}, "
                  "classified {}, tagged {} ({} ignored) (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
@@ -2353,13 +3060,18 @@ void RemixApi::OnAfterFrame()
                  m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
                  m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
-                 m_stats.ambient_bright ? "bright" : "dim", m_stats.sky_auto_candidates,
+                 m_stats.ambient_bright ? "bright" : "dim", m_stats.ui_placed,
+                 m_stats.ui_unplaceable, m_stats.ui_raster_us, m_stats.ui_upload_us,
+                 m_stats.sky_auto_candidates,
                  m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
                  m_sky_auto_detect);
   }
 
   LogProjectionVariants();
   LogCameraRecovery();
+  // Reads m_stats and both sample maps, so it has to run before the reset below
+  // and before this frame's samples become last frame's.
+  LogModelviewHistogram();
 
   m_stats = {};
   m_frame_light_mask = 0;
@@ -2376,6 +3088,7 @@ void RemixApi::OnAfterFrame()
   m_view_samples.swap(m_view_samples_previous);
   m_view_samples.clear();
   m_view_duplicate_hashes.clear();
+  m_ui_frame_begun = false;
   ++m_frame_index;
 }
 

@@ -12,6 +12,8 @@
 #include "Common/CommonTypes.h"
 #include "Common/HookableEvent.h"
 
+#include "VideoBackends/Remix/RemixUiRaster.h"
+
 // For the XF Light register layout. The backend snapshots those registers on
 // the draw path rather than reading them at frame end, so the struct has to be
 // storable here.
@@ -172,6 +174,23 @@ struct FrameStats
   // the camera's rotation delta with the translation missing, which is an
   // actively wrong hypothesis rather than merely a useless one.
   u32 view_sky_excluded = 0;
+  // Modelview histogram. `modelview_samples` counts draws that offered a single
+  // modelview to bucket; `modelview_palette` counts the ones that had none, so a
+  // dominant matrix's share can be read against the right denominator.
+  u32 modelview_samples = 0;
+  u32 modelview_palette = 0;
+  // Orthographic draws placed on the world-space UI plane, and those that could
+  // not be (no camera yet, or a degenerate ortho projection). A game whose menus
+  // are missing while `ui_placed` is non-zero has a placement bug, not a
+  // classification one.
+  u32 ui_placed = 0;
+  u32 ui_unplaceable = 0;
+  // Microseconds spent rasterizing the overlay, and handing it to the runtime.
+  // Split because they have different fixes: the first is this backend's inner
+  // loop, the second is a per-frame staging-buffer create plus a multi-megabyte
+  // memcpy inside the runtime.
+  u64 ui_raster_us = 0;
+  u64 ui_upload_us = 0;
   // A lit draw whose channel ambient register was bright enough to matter. GX
   // ambient has no Remix analogue at all - the path tracer's GI has to stand in
   // for it - so this quantifies how much of the frame's light was ambient before
@@ -193,6 +212,30 @@ struct DrawDiagnostics
   u8 depth_func = 0;
   bool depth_write = false;
   u32 draw_index = 0;
+  // Which xfmem.posMatrices slot supplied this draw's modelview, or
+  // NO_POSITION_MATRIX on the matrix-palette path where the vertices name their
+  // own and there is no single one. Carried for the modelview histogram: "which
+  // slot holds the view matrix" is the question that instrument exists to answer,
+  // and the slot is known here and nowhere downstream.
+  static constexpr u32 NO_POSITION_MATRIX = 0xFFFFFFFFu;
+  u32 position_matrix = NO_POSITION_MATRIX;
+};
+
+// One distinct modelview VALUE seen during a frame, and everything that used it.
+// Keyed on the exact 12 floats: a game that computes V*M for an identity M gets
+// V back bit for bit (multiplying by one and adding zero is exact), so every
+// draw sharing a view matrix lands in one bucket with no tolerance needed.
+struct ModelviewBucket
+{
+  Affine matrix = {};
+  // Distinct mesh hashes, not draws. A hundred instances of one prop is one mesh
+  // sharing one matrix; a hundred DIFFERENT meshes sharing one matrix is the
+  // signature that says they were authored in a common space.
+  std::unordered_set<u64> meshes;
+  u32 draws = 0;
+  u32 vertices = 0;
+  // Bit per xfmem.posMatrices slot that held this value during the frame.
+  u64 slots = 0;
 };
 
 // What one draw said about the XF lights it switched on. Every field here is
@@ -374,11 +417,38 @@ public:
   // estimator votes on, and it must be the RAW matrix: a projection correction
   // present in both frames conjugates the inter-frame delta instead of
   // cancelling out of it, which yields the right rotation in the wrong basis.
+  // world_ui_projection non-null marks an orthographic draw: `transform` is then
+  // the draw's plain modelview and the mapping onto the UI plane is applied at
+  // flush time, when the camera exists. Such a draw must pass raw_modelview as
+  // null - an ortho modelview is not a view matrix, and letting one into the
+  // histogram would corrupt the very camera the UI is placed against.
   void SubmitMesh(const MaterialRef& material,
                   const std::vector<remixapi_HardcodedVertex>& vertices,
                   const std::vector<u32>& indices, const remixapi_Transform& transform,
                   remixapi_InstanceCategoryFlags category_flags, const DrawBlendState& blend,
-                  const float* raw_modelview, const DrawDiagnostics& diagnostics);
+                  const float* raw_modelview, const DrawDiagnostics& diagnostics,
+                  const std::array<float, 6>* world_ui_projection = nullptr);
+
+  // How orthographic draws - HUD, menus, 2D screens - are handled.
+  //   0 = dropped, the pre-feature behaviour
+  //   1 = software-rasterized into a screen overlay composited at present
+  //   2 = submitted as world-space geometry on a plane in front of the camera
+  // Mode 2 is kept because it is the only one that puts UI inside the traced
+  // world (it can light the scene, reflect, and be looked at from an angle), but
+  // it is NOT passthrough: the runtime treats it as geometry, so it is denoised
+  // and moves with the camera. Mode 1 is what looks like a normal UI.
+  int UiMode() const { return m_ui_mode; }
+
+  // Rasterizes one orthographic draw into the screen overlay. Vertices are the
+  // decoded remixapi ones; `modelview` is the draw's GX modelview, or null when
+  // the vertices have already been baked into view space. `viewport` is the
+  // draw's viewport as an EFB-space rect (x, y, width, height) - a game is free
+  // to put its HUD in a sub-rect and a full-screen assumption would misplace it.
+  void SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
+                    const std::vector<u32>& indices, const float* modelview,
+                    const std::array<float, 6>& ortho_projection,
+                    const std::array<float, 4>& viewport, const RemixTexture* texture,
+                    u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v, const DrawBlendState& blend);
 
   // Records which XF lights a draw switched on, and what each one MEANS to that
   // draw - GX puts the attenuation function on the referencing channel, not on
@@ -475,6 +545,23 @@ private:
     u32 vertices = 0;
   };
   static constexpr size_t MAX_PROJECTION_VARIANTS = 8;
+  // Ceiling on distinct modelviews tracked per frame, so a game that gives every
+  // draw its own matrix cannot grow the map without bound. Overflowing draws are
+  // counted and dropped - the histogram is then incomplete, which is itself the
+  // answer to "does one matrix dominate".
+  static constexpr size_t MAX_MODELVIEW_BUCKETS = 4096;
+  // What the histogram's winner has to show before it is trusted AS the camera.
+  // Not a close call to arbitrate - a scene either has a shared authoring space
+  // or it does not - so these are floors far under any real positive rather than
+  // tuned values. Wind Waker measures 160-293 meshes against a runner-up pinned
+  // at 14, an 11-20x margin.
+  static constexpr u32 MIN_MODELVIEW_CAMERA_MESHES = 8;
+  static constexpr u32 MODELVIEW_CAMERA_DOMINANCE = 2;
+  // Consecutive gate passes before the winner is believed. Guards the world
+  // offset latch specifically: the gate is a per-frame test and a startup logo
+  // can satisfy it by accident at t ~ 0, which is exactly how the first attempt
+  // latched an identity offset and left the world out at 1e5.
+  static constexpr u32 MODELVIEW_CAMERA_WARMUP = 8;
 
   // A draw held back until the frame's camera is known.
   struct PendingInstance
@@ -484,6 +571,12 @@ private:
     remixapi_InstanceCategoryFlags category_flags = 0;
     DrawBlendState blend;
     u64 mesh_hash = 0;
+    // An orthographic draw, to be placed on the world-space UI plane at flush
+    // time. `transform` then holds only the draw's own modelview - the mapping
+    // onto the plane is built from the camera, which is not known while draws
+    // are arriving, and is composed onto it in FlushPendingInstances.
+    bool world_ui = false;
+    std::array<float, 6> ortho_projection = {};
   };
   // How many draws may vote on the camera delta, and how many of those the
   // O(n^2) consensus pass will consider as candidates.
@@ -520,6 +613,16 @@ private:
                    const float camera_delta[3], float far_plane);
   void FlushPendingInstances();
   void LogCameraRecovery();
+  // Picks the frame's dominant modelview and, if it clears the confidence gate,
+  // turns it into the camera. Runs at the TOP of OnAfterFrame - before
+  // EstimateView - because with RemixCameraFromModelview on this IS the camera
+  // and everything downstream is placed relative to it.
+  void ResolveDominantModelview();
+  // Runs EVERY frame, not just on the frames it prints: it carries the dominant
+  // bucket across the frame boundary, which is what makes the candidate's own
+  // inter-frame delta - the thing that would BE the camera delta if the candidate
+  // is the view matrix - measurable at all. Clears the histogram on the way out.
+  void LogModelviewHistogram();
   void SetupCamera();
   void SubmitLights();
   void SubmitFallbackTriangle();
@@ -585,6 +688,68 @@ private:
   bool m_view_electorate_fix = true;
   bool m_view_hold_on_miss = true;
   bool m_view_tie_break = true;
+
+  // Modelview histogram - a pure instrument, read by nothing but its own log
+  // line. Rebuilt from scratch every frame; only the dominant bucket survives the
+  // frame boundary, so that the candidate can be differenced against itself.
+  std::unordered_map<u64, ModelviewBucket> m_modelviews;
+  u32 m_modelview_overflow = 0;
+  // The frame's winner, held as VALUES rather than a pointer into the map above:
+  // it is resolved at the top of OnAfterFrame and read again at the bottom, and
+  // a member pointing into a container that is cleared in between is a trap.
+  Affine m_modelview_top = {};
+  std::unordered_set<u64> m_modelview_top_mesh_set;
+  u32 m_modelview_top_meshes = 0;
+  u32 m_modelview_top_draws = 0;
+  u32 m_modelview_top_vertices = 0;
+  u64 m_modelview_top_slots = 0;
+  u32 m_modelview_second_meshes = 0;
+  u32 m_modelview_second_draws = 0;
+  u32 m_modelview_third_meshes = 0;
+  u32 m_modelview_third_draws = 0;
+  u32 m_modelview_mesh_uses = 0;
+  bool m_modelview_top_valid = false;
+  // The winner turned into a camera, once it has cleared the confidence gate.
+  Affine m_modelview_camera = {};
+  bool m_modelview_camera_valid = false;
+  // Constant world offset latched at the first accepted camera, so world space
+  // starts at the origin instead of at the game's own 1e5-scale coordinates.
+  // See ResolveDominantModelview for why post-multiplying is exact.
+  Affine m_modelview_world_offset = {};
+  bool m_modelview_world_offset_latched = false;
+  u32 m_modelview_camera_streak = 0;
+  u32 m_modelview_camera_accepted = 0;
+  u32 m_modelview_camera_held = 0;
+  Affine m_modelview_top_previous = {};
+  std::unordered_set<u64> m_modelview_top_meshes_previous;
+  bool m_modelview_top_previous_valid = false;
+  bool m_trace_modelviews = true;
+  bool m_camera_from_modelview = true;
+
+  // World-space UI. BuildWorldUiTransform maps a draw's orthographic view space
+  // onto a plane in front of the camera; it needs the camera, so it is called
+  // from FlushPendingInstances rather than from the draw path.
+  bool BuildWorldUiTransform(const std::array<float, 6>& raw, Affine& out) const;
+  int m_ui_mode = 1;
+  float m_world_ui_distance = 2.0f;
+  bool m_world_ui_flip_y = false;
+  // Screen overlay. Sized to the swapchain, cleared at the first UI draw of each
+  // frame and handed to the runtime just before Present.
+  UiRasterizer m_ui_raster;
+  // Scratch, reused across draws so a per-frame HUD does not allocate ~140 times.
+  std::vector<UiRasterizer::Vertex> m_ui_vertices;
+  bool m_ui_frame_begun = false;
+  u32 m_surface_width = 0;
+  u32 m_surface_height = 0;
+  // Non-zero dumps the composited overlay at that frame index to
+  // Logs/remix-ui-overlay.bmp, once. Diagnostic only; nothing reads it back.
+  int m_ui_dump_frame = 0;
+  void SubmitScreenOverlay();
+  // The frustum SetupCamera actually submitted, published so the UI plane fills
+  // the same one. Defaults match SetupCamera's own fallback, which is what a
+  // screen with no perspective draw at all gets.
+  float m_camera_fov_y_deg = 60.0f;
+  float m_camera_aspect = 16.0f / 9.0f;
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;
