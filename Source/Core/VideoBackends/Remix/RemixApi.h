@@ -163,6 +163,11 @@ struct FrameStats
   u32 sky_auto_candidates = 0;
   u32 sky_auto_classified = 0;
   u32 sky_auto_tagged = 0;
+  // Of the tagged instances, how many took IGNORE instead of SKY because the draw
+  // had no texture. Splitting the counter is what makes the experiment readable:
+  // tagged 7 / ignored 4 says the four untextured Wind Waker domes were dropped
+  // outright rather than handed to the sky path.
+  u32 sky_auto_ignored = 0;
   // Classified sky meshes removed from the camera electorate. A skybox votes for
   // the camera's rotation delta with the translation missing, which is an
   // actively wrong hypothesis rather than merely a useless one.
@@ -604,6 +609,9 @@ private:
   int m_sky_auto_detect = 1;
   u32 m_sky_auto_frames = 30;
   float m_sky_auto_min_extent = 0.05f;
+  // Untextured classified draws take IGNORE rather than SKY, so a dome that the
+  // sky path would have left in the scene cannot occlude the Numos sun.
+  bool m_sky_auto_untextured_ignore = true;
   std::unordered_map<u64, SkyCandidate> m_sky_candidates;
   // Sticky for the session. A classified mesh is never un-classified: sky that
   // flickers in and out is worse than sky that is occasionally wrong, and a

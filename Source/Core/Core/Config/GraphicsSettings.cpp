@@ -282,6 +282,21 @@ const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT{
 // precedence: veto beats the manual list, which beats auto-detection.
 const Info<std::string> GFX_REMIX_SKY_VETO_HASHES{
     {System::GFX, "Settings", "RemixSkyVetoHashes"}, ""};
+// Auto-classified draws that carry NO texture are tagged IGNORE rather than SKY.
+//
+// The SKY tag routes a draw to CameraType::Sky, which under rtx.skyMode = 1 is
+// meant to drop it. IGNORE removes it from the scene outright. The difference
+// matters for the untextured draws specifically: four of Wind Waker's seven
+// classified sky meshes have no texture at all, and if such a dome survives as a
+// closed shell around the viewpoint it occludes the Numos distant sun no matter
+// what the sky path does with it - which reads as a dark scene rather than as a
+// sky problem. Untextured is the right discriminator because those draws carry
+// no albedo worth keeping, whereas a textured sky dome is exactly what the sky
+// path is designed to consume.
+//
+// False = tag every auto-classified draw SKY, the pre-flag behaviour.
+const Info<bool> GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE{
+    {System::GFX, "Settings", "RemixSkyAutoUntexturedIgnore"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

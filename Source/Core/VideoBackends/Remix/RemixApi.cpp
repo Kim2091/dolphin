@@ -565,6 +565,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_sky_auto_frames =
       static_cast<u32>(std::max(1, Config::Get(Config::GFX_REMIX_SKY_AUTO_FRAMES)));
   m_sky_auto_min_extent = std::max(0.0f, Config::Get(Config::GFX_REMIX_SKY_AUTO_MIN_EXTENT));
+  m_sky_auto_untextured_ignore = Config::Get(Config::GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE);
   m_sky_candidates.clear();
   m_sky_classified.clear();
 
@@ -1311,7 +1312,26 @@ void RemixApi::FlushPendingInstances()
     remixapi_InstanceCategoryFlags category_flags = pending.category_flags;
     if (m_sky_auto_detect >= 2 && m_sky_classified.count(pending.mesh_hash) != 0)
     {
-      category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+      // An untextured classified draw takes IGNORE instead. SKY only promises
+      // that the sky PATH stops drawing the geometry; it does not promise the
+      // geometry leaves the scene, and a dome that survives as a closed shell
+      // around the viewpoint occludes the Numos distant sun from every
+      // direction - a lighting failure that presents as a dark scene rather
+      // than as a sky artefact. Four of Wind Waker's seven classified meshes
+      // are untextured, so this is most of the set. A textured dome keeps SKY:
+      // it has albedo the sky path is designed to consume.
+      const auto mesh = m_meshes.find(pending.mesh_hash);
+      const bool untextured =
+          mesh != m_meshes.end() && mesh->second.diagnostics.texture_hash == 0;
+      if (m_sky_auto_untextured_ignore && untextured)
+      {
+        category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE;
+        ++m_stats.sky_auto_ignored;
+      }
+      else
+      {
+        category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+      }
       ++m_stats.sky_auto_tagged;
     }
 
@@ -2321,7 +2341,7 @@ void RemixApi::OnAfterFrame()
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | sky auto: candidates {}, "
-                 "classified {}, tagged {} (mode {})",
+                 "classified {}, tagged {} ({} ignored) (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
@@ -2334,7 +2354,8 @@ void RemixApi::OnAfterFrame()
                  m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
                  m_stats.ambient_bright ? "bright" : "dim", m_stats.sky_auto_candidates,
-                 m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_sky_auto_detect);
+                 m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
+                 m_sky_auto_detect);
   }
 
   LogProjectionVariants();
