@@ -131,6 +131,7 @@ extern const Info<bool> GFX_REMIX_GX_BLEND;
 extern const Info<bool> GFX_REMIX_GX_LIGHT_FIX;
 extern const Info<float> GFX_REMIX_LIGHT_RANGE;
 extern const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX;
+extern const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS;
 
 // Graphics.Enhancements
 

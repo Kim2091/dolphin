@@ -509,6 +509,7 @@ private:
   u32 m_view_miss_streak = 0;
   bool m_camera_recovery = false;
   bool m_view_electorate_fix = true;
+  bool m_view_hold_on_miss = true;
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;

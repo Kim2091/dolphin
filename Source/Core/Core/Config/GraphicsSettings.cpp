@@ -216,6 +216,15 @@ const Info<float> GFX_REMIX_LIGHT_RANGE{{System::GFX, "Settings", "RemixLightRan
 // Off is the 256-entry cap plus keep-first, exactly the pre-fix behaviour.
 const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX{
     {System::GFX, "Settings", "RemixViewElectorateFix"}, true};
+// On a run of frames the estimator could not read, keep the view it already has
+// instead of resetting it to the identity. Both are equally correct for
+// geometry - the image is invariant to the view and the world origin is
+// arbitrary - but a reset re-welds world space onto the CURRENT camera pose,
+// which rotates the entire replacement sky in a single frame and, after a
+// pitched or rolled cut, leaves its horizon permanently tilted to that pose.
+// Off is the reset, which is what the backend did before.
+const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS{{System::GFX, "Settings", "RemixViewHoldOnMiss"},
+                                             true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

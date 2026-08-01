@@ -468,6 +468,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
   m_view_electorate_fix = Config::Get(Config::GFX_REMIX_VIEW_ELECTORATE_FIX);
+  m_view_hold_on_miss = Config::Get(Config::GFX_REMIX_VIEW_HOLD_ON_MISS);
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
@@ -1352,18 +1353,28 @@ void RemixApi::EstimateView()
   else if (deltas.size() >= 2)
   {
     // No consensus: a cut, a teleport, or a frame where the estimator simply
-    // could not tell. Re-anchoring resets world space onto the current camera,
-    // which costs one frame of temporal history - strictly better than
-    // integrating a delta we do not believe. The streak keeps a single odd
-    // frame, or a cutscene in which genuinely everything moves, from tripping
-    // it; a frame with almost nothing persisting is not evidence of a cut.
+    // could not tell. Either way we do not integrate a delta we do not believe.
+    // The streak keeps a single odd frame, or a cutscene in which genuinely
+    // everything moves, from tripping it; a frame with almost nothing persisting
+    // is not evidence of a cut.
+    //
+    // What happens then used to be a reset to the identity, and both choices are
+    // equally correct for the geometry - the image is invariant to V and the
+    // world origin is arbitrary. They are not equally correct for the SKY: the
+    // replacement atmosphere is generated from the submitted camera's world
+    // basis, so re-welding world space onto whatever pose the camera holds this
+    // frame swings the whole sky in one frame, and after a pitched or rolled cut
+    // it leaves the horizon tilted to that pose for good. Holding costs nothing
+    // - the estimator resumes integrating valid deltas either way - so hold.
     if (++m_view_miss_streak >= VIEW_MISS_STREAK_BEFORE_REANCHOR)
     {
       m_view_miss_streak = 0;
-      m_view = IDENTITY_AFFINE;
+      if (!m_view_hold_on_miss)
+        m_view = IDENTITY_AFFINE;
       ++m_stats.view_reanchors;
-      INFO_LOG_FMT(VIDEO, "Remix: camera re-anchored at frame {} ({} deltas, {} inliers, {} needed)",
-                   m_frame_index, deltas.size(), best_inliers, required);
+      INFO_LOG_FMT(VIDEO, "Remix: camera estimate {} at frame {} ({} deltas, {} inliers, {} needed)",
+                   m_view_hold_on_miss ? "held" : "re-anchored", m_frame_index, deltas.size(),
+                   best_inliers, required);
     }
   }
 
