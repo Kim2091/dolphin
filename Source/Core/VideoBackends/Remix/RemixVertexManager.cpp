@@ -24,6 +24,12 @@ namespace Remix
 {
 namespace
 {
+// Channel ambient bright enough to be worth reporting: 0.25 of full scale. GX
+// ambient is a flat per-channel add that Remix cannot express, so a frame with a
+// lot of it will look darker after translation no matter how well the lights
+// themselves are converted, and the log should be able to say that.
+constexpr u8 AMBIENT_BRIGHT_THRESHOLD = 63;
+
 // Dolphin's vertex loader writes vertex colors as a u32 whose memory order is
 // R, G, B, A. Remix reads remixapi_HardcodedVertex::color as
 // VK_FORMAT_B8G8R8A8_UNORM, i.e. memory order B, G, R, A. Swap the two ends.
@@ -1006,19 +1012,31 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // per-draw state and have to be accumulated here: read once at frame end they
   // reflect only the last draw, which is how Wind Waker managed to enable light
   // 0 all frame and still have every light dropped.
-  u32 draw_light_mask = 0;
-  u32 draw_color_light_mask = 0;
-  std::array<u8, 8> draw_attenuation = {};
-  const auto claim_lights = [&](const LitChannel& lit_channel, bool color_channel) {
+  DrawLightState light_state;
+  const auto claim_lights = [&](const LitChannel& lit_channel, u32 channel, bool color_channel) {
     const u32 channel_mask = lit_channel.GetFullLightMask();
-    for (u32 i = 0; i < draw_attenuation.size(); ++i)
+    for (u32 i = 0; i < light_state.attenuation.size(); ++i)
     {
-      if ((channel_mask & (1u << i)) != 0 && (draw_light_mask & (1u << i)) == 0)
-        draw_attenuation[i] = static_cast<u8>(lit_channel.attnfunc.Value());
+      if ((channel_mask & (1u << i)) != 0 && (light_state.mask & (1u << i)) == 0)
+      {
+        light_state.attenuation[i] = static_cast<u8>(lit_channel.attnfunc.Value());
+        light_state.diffuse[i] = static_cast<u8>(lit_channel.diffusefunc.Value());
+      }
     }
-    draw_light_mask |= channel_mask;
+    light_state.mask |= channel_mask;
     if (color_channel)
-      draw_color_light_mask |= channel_mask;
+      light_state.color_mask |= channel_mask;
+
+    // GX ambient has no Remix analogue - the path tracer's GI is what has to
+    // stand in for it - so record whether the frame had a meaningful amount of
+    // it before anyone concludes the translated lights are too dim. Register
+    // bytes are abgr, same packing as a light's colour (TransformUnit.cpp:342).
+    if (channel_mask != 0 && lit_channel.ambsource == AmbSource::AmbColorRegister)
+    {
+      const u8* ambient = reinterpret_cast<const u8*>(&xfmem.ambColor[channel]);
+      if (std::max({ambient[1], ambient[2], ambient[3]}) > AMBIENT_BRIGHT_THRESHOLD)
+        light_state.ambient_bright = true;
+    }
   };
   // BOTH colour channels before either alpha channel. First claim decides the
   // light's kind, and an alpha channel only ever reads the light's color[0]
@@ -1026,11 +1044,11 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // function, the colour channel's reading is the one describing what the light
   // does to the picture.
   for (u32 channel = 0; channel < xfmem.numChan.numColorChans && channel < 2; ++channel)
-    claim_lights(xfmem.color[channel], true);
+    claim_lights(xfmem.color[channel], channel, true);
   for (u32 channel = 0; channel < xfmem.numChan.numColorChans && channel < 2; ++channel)
-    claim_lights(xfmem.alpha[channel], false);
-  stats.draw_light_mask |= draw_light_mask;
-  g_remix_api->NoteDrawLights(draw_light_mask, draw_color_light_mask, draw_attenuation);
+    claim_lights(xfmem.alpha[channel], channel, false);
+  stats.draw_light_mask |= light_state.mask;
+  g_remix_api->NoteDrawLights(light_state);
 
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const bool gx_blend = g_remix_api->GxBlendEnabled();

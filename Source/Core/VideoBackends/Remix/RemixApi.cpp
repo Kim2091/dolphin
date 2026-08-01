@@ -356,6 +356,11 @@ remixapi_Transform ToRemixTransform(const Affine& affine)
 constexpr int GUARD_LOG_CAP = 32;
 int s_guard_log_count = 0;
 
+// Same idea for the light trace: one line whenever a submitted light's
+// translation materially changes, and never more than this many in a session.
+constexpr int LIGHT_TRACE_LOG_CAP = 48;
+int s_light_trace_count = 0;
+
 void LogGuardHit(const char* site, const char* kind, unsigned long code)
 {
   if (s_guard_log_count >= GUARD_LOG_CAP)
@@ -1007,12 +1012,12 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   return result;
 }
 
-void RemixApi::NoteDrawLights(u32 mask, u32 color_mask, const std::array<u8, 8>& attenuation)
+void RemixApi::NoteDrawLights(const DrawLightState& state)
 {
   for (u32 i = 0; i < m_frame_light_attenuation.size(); ++i)
   {
     const u32 bit = 1u << i;
-    if ((mask & bit) == 0)
+    if ((state.mask & bit) == 0)
       continue;
 
     // The registers are per-DRAW state, exactly like the enable mask and the
@@ -1023,7 +1028,8 @@ void RemixApi::NoteDrawLights(u32 mask, u32 color_mask, const std::array<u8, 8>&
     const Light& src = xfmem.lights[i];
     if ((m_frame_light_mask & bit) == 0)
     {
-      m_frame_light_attenuation[i] = attenuation[i];
+      m_frame_light_attenuation[i] = state.attenuation[i];
+      m_frame_light_diffuse[i] = state.diffuse[i];
       m_frame_lights[i] = src;
       continue;
     }
@@ -1033,11 +1039,12 @@ void RemixApi::NoteDrawLights(u32 mask, u32 color_mask, const std::array<u8, 8>&
     // non-zero - but the disagreement stops being silent.
     if (std::memcmp(&m_frame_lights[i], &src, sizeof(Light)) != 0)
       ++m_stats.lights_rewritten;
-    if (m_frame_light_attenuation[i] != attenuation[i])
+    if (m_frame_light_attenuation[i] != state.attenuation[i])
       ++m_stats.lights_conflicted;
   }
-  m_frame_light_mask |= mask;
-  m_frame_light_color_mask |= color_mask;
+  m_frame_light_mask |= state.mask;
+  m_frame_light_color_mask |= state.color_mask;
+  m_stats.ambient_bright = m_stats.ambient_bright || state.ambient_bright;
 }
 
 void RemixApi::SubmitMesh(const MaterialRef& material,
@@ -1522,8 +1529,22 @@ void RemixApi::SubmitLights()
     // So only Spot is really a point light. The rest are directional.
     const AttenuationFunc attnfunc = static_cast<AttenuationFunc>(attenuation[i]);
     const bool is_positional = attnfunc == AttenuationFunc::Spot;
+    if (attnfunc == AttenuationFunc::Spec)
+      ++m_stats.lights_spec;
+
+    // Remix always renders a clamped N.L. GX's other two diffuse functions have
+    // no translation at all - None makes the light behave as pure ambient, Sign
+    // lets it darken a surface - so a scene lit mainly by them reads dark and
+    // these counters are how the log says so.
+    const DiffuseFunc diffusefunc = static_cast<DiffuseFunc>(m_frame_light_diffuse[i]);
+    if (diffusefunc == DiffuseFunc::None)
+      ++m_stats.lights_diffuse_none;
+    else if (diffusefunc == DiffuseFunc::Sign)
+      ++m_stats.lights_diffuse_sign;
 
     float vector[3] = {src.dpos[0], src.dpos[1], src.dpos[2]};
+    const float source_distance =
+        std::sqrt(src.dpos[0] * src.dpos[0] + src.dpos[1] * src.dpos[1] + src.dpos[2] * src.dpos[2]);
     if (m_camera_recovery)
     {
       // Positions take the translation, directions do not.
@@ -1651,6 +1672,44 @@ void RemixApi::SubmitLights()
     info.ignoreViewModel = 0;
 
     LightEntry& entry = m_lights[i];
+
+    // One line per light whose translation materially changed - a create, a kind
+    // change, a recoloured or re-shaped light. Self-silencing and capped: the
+    // fingerprint deliberately leaves the POSITION out, so a light that merely
+    // moves stays quiet, and the cap stops a light that flickers every frame
+    // from owning the log. This is the evidence for the cone axis and the
+    // radiance calibration, and the first thing to read on any future "the
+    // lights look wrong" report.
+    if (m_log_stats)
+    {
+      u64 trace_key = static_cast<u64>(attenuation[i]) | (static_cast<u64>(diffusefunc) << 8) |
+                      (static_cast<u64>(is_positional ? 1 : 0) << 16);
+      trace_key = FoldHash(trace_key, static_cast<u64>(src.color[0]) |
+                                          (static_cast<u64>(src.color[1]) << 8) |
+                                          (static_cast<u64>(src.color[2]) << 16) |
+                                          (static_cast<u64>(src.color[3]) << 24));
+      const float quantized[4] = {sphere.shaping_value.coneAngleDegrees,
+                                  sphere.shaping_value.coneSoftness, radiance[0], end_distance};
+      trace_key = XXH64(quantized, sizeof(quantized), trace_key);
+      if (trace_key != entry.trace_key && s_light_trace_count < LIGHT_TRACE_LOG_CAP)
+      {
+        ++s_light_trace_count;
+        INFO_LOG_FMT(VIDEO,
+                     "Remix light {} @frame {}: attn {} diffuse {} | {} | colour ({:.3f} {:.3f} "
+                     "{:.3f}) | |dpos| {:.1f} | cosatt ({:.4f} {:.4f} {:.4f}) distatt ({:.6f} "
+                     "{:.6f} {:.6f}) | cone {:.1f} deg softness {:.4f} axis ({:.3f} {:.3f} {:.3f}) "
+                     "| end {:.1f} -> radiance ({:.3f} {:.3f} {:.3f})",
+                     i, m_frame_index, attnfunc, diffusefunc,
+                     is_positional ? "sphere" : "distant", r, g, b, source_distance, src.cosatt[0],
+                     src.cosatt[1], src.cosatt[2], src.distatt[0], src.distatt[1], src.distatt[2],
+                     sphere.shaping_value.coneAngleDegrees, sphere.shaping_value.coneSoftness,
+                     is_positional ? sphere.shaping_value.direction.x : distant.direction.x,
+                     is_positional ? sphere.shaping_value.direction.y : distant.direction.y,
+                     is_positional ? sphere.shaping_value.direction.z : distant.direction.z,
+                     end_distance, radiance[0], radiance[1], radiance[2]);
+      }
+      entry.trace_key = trace_key;
+    }
     // A light can change kind between frames when the channel referencing it
     // changes attenuation function. Remix bakes the light type in at create
     // time, so an update cannot carry a sphere handle over to a distant one -
@@ -1863,7 +1922,8 @@ void RemixApi::OnAfterFrame()
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
                  "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
-                 "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {}",
+                 "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
+                 "diffuse none {} sign {} | spec {} | GX ambient {}",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
@@ -1873,7 +1933,9 @@ void RemixApi::OnAfterFrame()
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,
                  m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
-                 m_stats.lights_alpha_only);
+                 m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
+                 m_stats.lights_diffuse_sign, m_stats.lights_spec,
+                 m_stats.ambient_bright ? "bright" : "dim");
   }
 
   LogProjectionVariants();
@@ -1883,6 +1945,7 @@ void RemixApi::OnAfterFrame()
   m_frame_light_mask = 0;
   m_frame_light_color_mask = 0;
   m_frame_light_attenuation = {};
+  m_frame_light_diffuse = {};
   m_frame_lights = {};
   m_projection_latched = false;
   m_reference_usable = false;

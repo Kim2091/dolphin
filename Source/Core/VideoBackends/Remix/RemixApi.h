@@ -130,6 +130,37 @@ struct FrameStats
   u32 lights_rewritten = 0;
   u32 lights_conflicted = 0;
   u32 lights_alpha_only = 0;
+
+  // Channel semantics Remix has no way to reproduce, counted so a "the scene is
+  // too dark" report can be answered from the log. Remix always renders a
+  // clamped N.L; a diffusefunc of None makes a GX light behave as pure ambient
+  // and Sign lets it go negative, neither of which survives translation. A Spec
+  // light is a specular-only contribution GX adds through a second channel, so
+  // rendering it as an ordinary diffuse light double-counts it - kept, but no
+  // longer invisible.
+  u32 lights_diffuse_none = 0;
+  u32 lights_diffuse_sign = 0;
+  u32 lights_spec = 0;
+  // A lit draw whose channel ambient register was bright enough to matter. GX
+  // ambient has no Remix analogue at all - the path tracer's GI has to stand in
+  // for it - so this quantifies how much of the frame's light was ambient before
+  // anyone reaches for RemixLightScale.
+  bool ambient_bright = false;
+};
+
+// What one draw said about the XF lights it switched on. Every field here is
+// per-DRAW state: the enable mask, the attenuation function and the diffuse
+// function all live on the referencing channel rather than on the light, and
+// reading any of them once at frame end sees only the frame's last draw.
+struct DrawLightState
+{
+  u32 mask = 0;
+  // Subset of `mask` claimed by a COLOUR channel rather than an alpha one.
+  u32 color_mask = 0;
+  std::array<u8, 8> attenuation = {};
+  std::array<u8, 8> diffuse = {};
+  // Any lit channel of this draw whose ambient register was bright.
+  bool ambient_bright = false;
 };
 
 // Result of resolving a draw's stage-0 texture to a Remix material. The hash is
@@ -319,9 +350,7 @@ public:
   // time are well defined, while the frame-end values are whatever the last
   // draw happened to leave behind.
   //
-  // color_mask is the subset of `mask` claimed by a COLOUR channel rather than
-  // an alpha one. It is only counted, not acted on.
-  void NoteDrawLights(u32 mask, u32 color_mask, const std::array<u8, 8>& attenuation);
+  void NoteDrawLights(const DrawLightState& state);
 
   FrameStats& Stats() { return m_stats; }
 
@@ -358,6 +387,10 @@ private:
     // Which Remix light kind the handle was created as. Baked in at create
     // time, so a GX light that switches attenuation function needs a new one.
     bool positional = false;
+    // Fingerprint of everything the trace line reports except the position, so
+    // the trace fires on a create or a genuine parameter change and stays quiet
+    // while a light merely moves.
+    u64 trace_key = 0;
   };
 
   // One distinct projection seen during a frame, with how much geometry rode on
@@ -456,6 +489,7 @@ private:
   // Subset of m_frame_light_mask claimed by a colour channel. Diagnostic only.
   u32 m_frame_light_color_mask = 0;
   std::array<u8, 8> m_frame_light_attenuation = {};
+  std::array<u8, 8> m_frame_light_diffuse = {};
   // The XF light registers as they stood at the draw that first claimed each
   // slot this frame. SubmitLights consumes these, never xfmem directly.
   std::array<Light, 8> m_frame_lights = {};
