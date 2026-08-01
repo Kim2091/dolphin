@@ -64,6 +64,31 @@ constexpr Affine IDENTITY_AFFINE = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f,
 constexpr float VIEW_ROTATION_EPSILON = 2e-3f;
 constexpr float VIEW_TRANSLATION_EPSILON = 5e-3f;
 
+// The world frame is defined by frame 0's camera: m_view starts as the identity,
+// so world space IS that first camera's space and these are its basis vectors by
+// construction. Reporting the recovered camera against them turns slow
+// integrated drift - many individually plausible per-frame deltas, each too
+// small to trip the spike log, accumulating into a large ABSOLUTE rotation -
+// into a number that can be read straight off the log. That failure produces
+// the same "sky swings while geometry holds still" symptom as a per-frame spike
+// and is otherwise invisible.
+constexpr float VIEW_REFERENCE_FORWARD[3] = {0.0f, 0.0f, -1.0f};
+constexpr float VIEW_REFERENCE_UP[3] = {0.0f, 1.0f, 0.0f};
+
+// A single frame's accepted camera rotation above this gets its own log line.
+// A real camera turns a fraction of a degree per frame; half a degree at 60 Hz
+// is a 30 deg/s slew, which the title screen of a game has no business doing.
+constexpr float VIEW_SPIKE_ROTATION_DEGREES = 0.5f;
+constexpr int VIEW_SPIKE_LOG_CAP = 96;
+int s_view_spike_log_count = 0;
+
+// Angle between two unit-ish vectors, in degrees.
+float AngleBetweenDegrees(const float a[3], const float b[3])
+{
+  const float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  return std::acos(std::clamp(dot, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+}
+
 // out = a * b, with the implicit [0 0 0 1] fourth row on both. b's translation
 // column participates through a's 3x3, then a's own translation is added.
 Affine AffineMultiply(const Affine& a, const Affine& b)
@@ -733,6 +758,7 @@ void RemixApi::DestroyAllHandles()
   m_pending_instances.clear();
   m_view_samples.clear();
   m_view_samples_previous.clear();
+  m_view_duplicate_hashes.clear();
   m_view = IDENTITY_AFFINE;
   m_view_inverse = IDENTITY_AFFINE;
   m_view_inverse_previous = IDENTITY_AFFINE;
@@ -1126,7 +1152,11 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
   {
     Affine modelview = {};
     std::memcpy(modelview.data(), raw_modelview, sizeof(float) * 12);
-    m_view_samples.emplace(mesh_hash, modelview);
+    // emplace keeps the FIRST instance of a repeated mesh, so a hash submitted
+    // twice pairs an arbitrary instance across frames. Record which hashes those
+    // are; what to do about it is a separate question.
+    if (!m_view_samples.emplace(mesh_hash, modelview).second)
+      m_view_duplicate_hashes.insert(mesh_hash);
   }
 
   m_pending_instances.push_back(
@@ -1212,6 +1242,9 @@ void RemixApi::FlushPendingInstances()
 void RemixApi::EstimateView()
 {
   m_stats.view_samples = static_cast<u32>(m_view_samples.size());
+  m_stats.view_duplicates = static_cast<u32>(m_view_duplicate_hashes.size());
+  m_view_delta_rotation_deg = 0.0f;
+  m_view_delta_translation = 0.0f;
   if (!m_camera_recovery)
     return;
 
@@ -1274,8 +1307,32 @@ void RemixApi::EstimateView()
       std::clamp<u32>(static_cast<u32>(deltas.size()) / 4, 3, MAX_VIEW_CONSENSUS_REQUIRED);
   if (!deltas.empty() && best_inliers >= required && AffineIsRigid(deltas[best]))
   {
+    // How much camera motion this frame is claiming. The rotation comes from the
+    // trace of the 3x3 (trace = 1 + 2cos(theta) for a rotation), the translation
+    // from the delta's own translation column - which, the delta being a
+    // frame-to-frame ratio, is the distance moved rather than a position.
+    const Affine& delta = deltas[best];
+    const float trace = delta[0] + delta[5] + delta[10];
+    m_view_delta_rotation_deg =
+        std::acos(std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f)) * RAD_TO_DEG;
+    m_view_delta_translation = std::sqrt(delta[3] * delta[3] + delta[7] * delta[7] +
+                                         delta[11] * delta[11]);
+    m_view_max_rotation_deg = std::max(m_view_max_rotation_deg, m_view_delta_rotation_deg);
+    m_view_max_translation = std::max(m_view_max_translation, m_view_delta_translation);
+
+    if (m_log_stats && m_view_delta_rotation_deg > VIEW_SPIKE_ROTATION_DEGREES &&
+        s_view_spike_log_count < VIEW_SPIKE_LOG_CAP)
+    {
+      ++s_view_spike_log_count;
+      INFO_LOG_FMT(VIDEO,
+                   "Remix frame {} camera SPIKE: accepted rotation {:.3f} deg, translation {:.2f} "
+                   "| inliers {}/{} (needed {}) | samples {} duplicates {}",
+                   m_frame_index, m_view_delta_rotation_deg, m_view_delta_translation, best_inliers,
+                   deltas.size(), required, m_view_samples.size(), m_view_duplicate_hashes.size());
+    }
+
     m_view_miss_streak = 0;
-    m_view = AffineMultiply(deltas[best], m_view);
+    m_view = AffineMultiply(delta, m_view);
     AffineOrthonormalize(m_view);
   }
   else if (deltas.size() >= 2)
@@ -1348,12 +1405,29 @@ void RemixApi::LogCameraRecovery()
   const u32 stable_pct =
       m_stats.w_compared != 0 ? (m_stats.w_stable * 100) / m_stats.w_compared : 0;
 
+  // The ABSOLUTE recovered basis, not just the per-frame delta. The maxima below
+  // catch a camera that oscillates; these catch one that creeps - a run of small,
+  // individually plausible deltas integrating into a large standing rotation.
+  // Both produce a sky that swings while the geometry holds still, and only one
+  // of them is visible frame by frame.
+  const float forward[3] = {-v[8], -v[9], -v[10]};
+  const float up[3] = {v[4], v[5], v[6]};
+
   INFO_LOG_FMT(VIDEO,
-               "Remix frame {} camera: samples {} | inliers {}/{} | stable W {}/{} ({}%) | "
-               "pos ({:.1f} {:.1f} {:.1f}) fwd ({:.3f} {:.3f} {:.3f})",
-               m_frame_index, m_stats.view_samples, m_stats.view_inliers, m_stats.view_candidates,
-               m_stats.w_stable, m_stats.w_compared, stable_pct, position[0], position[1],
-               position[2], -v[8], -v[9], -v[10]);
+               "Remix frame {} camera: samples {} (dup {}) | inliers {}/{} | stable W {}/{} ({}%) "
+               "| pos ({:.1f} {:.1f} {:.1f}) fwd ({:.3f} {:.3f} {:.3f}) up ({:.3f} {:.3f} {:.3f}) "
+               "| drift fwd {:.2f} deg up {:.2f} deg | max delta rot {:.3f} deg trans {:.2f}",
+               m_frame_index, m_stats.view_samples, m_stats.view_duplicates, m_stats.view_inliers,
+               m_stats.view_candidates, m_stats.w_stable, m_stats.w_compared, stable_pct,
+               position[0], position[1], position[2], forward[0], forward[1], forward[2], up[0],
+               up[1], up[2], AngleBetweenDegrees(forward, VIEW_REFERENCE_FORWARD),
+               AngleBetweenDegrees(up, VIEW_REFERENCE_UP), m_view_max_rotation_deg,
+               m_view_max_translation);
+
+  // The maxima are per reporting window, so they mean "the worst frame in the
+  // last 60" rather than "the worst frame ever".
+  m_view_max_rotation_deg = 0.0f;
+  m_view_max_translation = 0.0f;
 }
 
 void RemixApi::SetupCamera()
@@ -1955,6 +2029,7 @@ void RemixApi::OnAfterFrame()
   // storage rather than reallocating a few hundred entries every frame.
   m_view_samples.swap(m_view_samples_previous);
   m_view_samples.clear();
+  m_view_duplicate_hashes.clear();
   ++m_frame_index;
 }
 

@@ -76,6 +76,10 @@ struct FrameStats
   u32 view_reanchors = 0;
   u32 w_stable = 0;
   u32 w_compared = 0;
+  // Mesh hashes submitted more than once in the frame. Such a hash has no unique
+  // cross-frame correspondence, so the delta built from it pairs two arbitrary
+  // instances - Wind Waker's ocean tiles and repeated props are exactly this.
+  u32 view_duplicates = 0;
 
   // Where TEV stage 0's rasterized colour came from, by GX's own rules.
   // `color_register` is the case that was being dropped outright - a game
@@ -478,6 +482,17 @@ private:
   std::vector<PendingInstance> m_pending_instances;
   std::unordered_map<u64, Affine> m_view_samples;
   std::unordered_map<u64, Affine> m_view_samples_previous;
+  // Mesh hashes seen more than once this frame. Diagnostic here; the electorate
+  // fix is what acts on them.
+  std::unordered_set<u64> m_view_duplicate_hashes;
+  // How much camera motion the estimator claimed this frame, and the running
+  // maxima since the last camera log line. A rotation that spikes every frame
+  // while the world visibly holds still is the estimator absorbing an object's
+  // motion, which is the one thing that can make the sky rock on its own.
+  float m_view_delta_rotation_deg = 0.0f;
+  float m_view_delta_translation = 0.0f;
+  float m_view_max_rotation_deg = 0.0f;
+  float m_view_max_translation = 0.0f;
   Affine m_view = {};
   Affine m_view_inverse = {};
   Affine m_view_inverse_previous = {};
