@@ -1307,10 +1307,41 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     }
   }
 
-  // Two routes to sky. The explicit texture list is the reliable one - it names
-  // the exact skybox texture, so it cannot mistake clouds or overlays for the
-  // horizon dome the way the depth heuristic did. The heuristic remains behind
-  // RemixSkyMode for games where the hash is not known yet, defaulted off.
+  // ---- The sky coexistence contract ---------------------------------------
+  //
+  // How a game's sky and Remix's replacement atmosphere share one frame, end to
+  // end. All of this is already implemented; it is written down here because it
+  // spans the client, the API and the runtime, and none of the three states it.
+  //
+  //   1. A draw reaches the runtime carrying REMIXAPI_INSTANCE_CATEGORY_BIT_SKY.
+  //      There are three ways to earn that bit, in precedence order:
+  //        veto   - RemixSkyVetoHashes names a texture or mesh hash: never sky.
+  //        manual - RemixSkyTextures names the stage-0 texture hash.
+  //        auto   - RemixSkyAutoDetect = 2 and the transform-signature
+  //                 classifier has classified this draw's MESH hash.
+  //   2. The runtime turns that bit into CameraType::Sky
+  //      (rtx_remix_api.cpp:730-738). Its own texture-grid sky heuristics never
+  //      run on API draws - cameraType is frozen from the instance's category
+  //      flags before the grid lookup - so passing the bit ourselves is the only
+  //      route that works.
+  //   3. Under rtx.skyMode = 1 (Numos) a sky-categorized draw is then SKIPPED
+  //      ENTIRELY (rtx_sky.h:149-154). So the correct configuration is "tag the
+  //      game's sky and let Numos have the volume". No rtx.ignoreTextures entry
+  //      is needed for it, and adding one is redundant at best.
+  //   4. Numos requires RemixCameraRecovery = True. The replacement sky is
+  //      generated from the submitted camera's world basis, so with recovery off
+  //      the camera is the identity and the sky welds itself to the view. Auto
+  //      detection needs recovery on too, by construction: it classifies on the
+  //      recovered world transform.
+  //
+  // Two routes to sky at this point in the draw path. The explicit texture list
+  // is the reliable one - it names the exact skybox texture, so it cannot
+  // mistake clouds or overlays for the horizon dome the way the depth heuristic
+  // did. That heuristic remains behind RemixSkyMode for games where no hash is
+  // known yet, defaulted off. The third route, auto-detection, keys on the MESH
+  // hash and so is applied at flush time instead of here - which is also what
+  // lets it reach Wind Waker's untextured dome, something no texture-hash list
+  // can ever match.
   const int sky_mode = g_remix_api->SkyMode();
   const bool is_sky = (albedo != nullptr && g_remix_api->IsSkyTexture(albedo->GetContentHash())) ||
                       (sky_mode != 0 && IsSkyDraw(bpmem.zmode));
