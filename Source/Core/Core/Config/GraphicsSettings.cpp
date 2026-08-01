@@ -231,7 +231,15 @@ const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS{{System::GFX, "Settings", "RemixVie
 // together and never gets here; two comparable clusters mean a large rigid
 // animated object arguing with the static world, and the camera is not the part
 // of a title screen swinging around. Off is pure max-inliers.
-const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, true};
+//
+// Defaulted OFF on measurement, which is the outcome the prior did not survive.
+// On Wind Waker's 3D window it fires on exactly the frames where it makes things
+// worse: stable W over frames 720-900 goes 41/37/38% with pure max-inliers and
+// 2/18/19% with the tie-break, so the "calmer" cluster it prefers there is not
+// the camera. The code and its counters stay because the runner-up size is worth
+// logging either way, and a title whose title screen really is one big rigid
+// mover can turn it on.
+const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, false};
 // Identify skyboxes by the one property that defines them: they translate with
 // the camera. Under camera recovery a skybox's recovered world transform slides
 // with the camera position while its rotation holds still, so the frame-to-frame
@@ -250,11 +258,17 @@ const Info<int> GFX_REMIX_SKY_AUTO_DETECT{{System::GFX, "Settings", "RemixSkyAut
 // and a restart clears the set.
 const Info<int> GFX_REMIX_SKY_AUTO_FRAMES{{System::GFX, "Settings", "RemixSkyAutoFrames"}, 30};
 // Minimum size, as a fraction of the frame's far plane, for a draw to be
-// considered a skybox. A dome spans a large part of the frustum; a camera-welded
-// view model does not, and during a translation-only window that size check is
-// the only thing separating them.
+// considered a skybox. A camera-welded view model is small, and during a
+// translation-only window this is the only thing separating it from a dome.
+//
+// The value is empirical and NOT a quarter of the far plane, which was the first
+// guess: Wind Waker's seven real sky draws measure 0.09x to 0.16x of a 160000
+// far plane, because a GC skybox is a modest dome drawn near the camera rather
+// than something scaled out to the clip distance. At 0.25 the gate rejected
+// every genuine skybox in the game and the feature classified nothing at all.
+// 0.05 keeps a real gate with room to spare under the smallest true positive.
 const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT{
-    {System::GFX, "Settings", "RemixSkyAutoMinExtent"}, 0.25f};
+    {System::GFX, "Settings", "RemixSkyAutoMinExtent"}, 0.05f};
 // Hashes - texture or mesh, same format as RemixSkyTextures - that are never
 // treated as sky, for the day the classifier is wrong about something. Highest
 // precedence: veto beats the manual list, which beats auto-detection.

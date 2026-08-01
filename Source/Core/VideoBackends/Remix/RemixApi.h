@@ -579,7 +579,7 @@ private:
   bool m_camera_recovery = false;
   bool m_view_electorate_fix = true;
   bool m_view_hold_on_miss = true;
-  bool m_view_tie_break = true;
+  bool m_view_tie_break = false;
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;
@@ -603,7 +603,7 @@ private:
   // Sky auto-detection: 0 off, 1 detect and log only, 2 detect and tag.
   int m_sky_auto_detect = 1;
   u32 m_sky_auto_frames = 30;
-  float m_sky_auto_min_extent = 0.25f;
+  float m_sky_auto_min_extent = 0.05f;
   std::unordered_map<u64, SkyCandidate> m_sky_candidates;
   // Sticky for the session. A classified mesh is never un-classified: sky that
   // flickers in and out is worse than sky that is occasionally wrong, and a
