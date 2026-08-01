@@ -82,6 +82,39 @@ constexpr float VIEW_SPIKE_ROTATION_DEGREES = 0.5f;
 constexpr int VIEW_SPIKE_LOG_CAP = 96;
 int s_view_spike_log_count = 0;
 
+// How close the runner-up cluster has to be, as a percentage of the winner's
+// inlier count, before the vote is treated as too close to call on size alone.
+constexpr u32 VIEW_TIE_BREAK_PERCENT = 75;
+
+// Rotation angle of an affine's 3x3, in degrees: trace = 1 + 2cos(theta).
+float AffineRotationDegrees(const Affine& m)
+{
+  const float trace = m[0] + m[5] + m[10];
+  return std::acos(std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+}
+
+// Length of an affine's translation column. On a frame-to-frame delta this is a
+// distance moved rather than a position, which is what makes it comparable
+// between candidates.
+float AffineTranslationLength(const Affine& m)
+{
+  return std::sqrt(m[3] * m[3] + m[7] * m[7] + m[11] * m[11]);
+}
+
+// Which of two candidate deltas is closer to "the camera did not move". The two
+// terms live on different scales - a rotation is unit-magnitude by construction,
+// a translation is in game world units - so they are compared in order rather
+// than summed: rotation first, because rotation is what visibly swings the sky,
+// and translation only to separate rotations that are effectively equal.
+bool DeltaIsCalmer(const Affine& a, const Affine& b)
+{
+  const float rotation_a = AffineRotationDegrees(a);
+  const float rotation_b = AffineRotationDegrees(b);
+  if (std::abs(rotation_a - rotation_b) > 0.01f)
+    return rotation_a < rotation_b;
+  return AffineTranslationLength(a) < AffineTranslationLength(b);
+}
+
 // Angle between two unit-ish vectors, in degrees.
 float AngleBetweenDegrees(const float a[3], const float b[3])
 {
@@ -469,6 +502,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
   m_view_electorate_fix = Config::Get(Config::GFX_REMIX_VIEW_ELECTORATE_FIX);
   m_view_hold_on_miss = Config::Get(Config::GFX_REMIX_VIEW_HOLD_ON_MISS);
+  m_view_tie_break = Config::Get(Config::GFX_REMIX_VIEW_TIE_BREAK);
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
@@ -1295,6 +1329,7 @@ void RemixApi::EstimateView()
   m_stats.view_candidates = static_cast<u32>(deltas.size());
 
   const size_t hypotheses = std::min(deltas.size(), MAX_VIEW_CANDIDATES);
+  std::vector<u32> hypothesis_inliers(hypotheses, 0);
   size_t best = 0;
   u32 best_inliers = 0;
   for (size_t i = 0; i < hypotheses; ++i)
@@ -1305,11 +1340,49 @@ void RemixApi::EstimateView()
       if (AffineSimilar(deltas[i], deltas[j]))
         ++inliers;
     }
+    hypothesis_inliers[i] = inliers;
     if (inliers > best_inliers)
     {
       best_inliers = inliers;
       best = i;
     }
+  }
+
+  // The biggest cluster that is NOT the winner's. Two hypotheses drawn from one
+  // cluster agree with each other, so the runner-up has to be tested against the
+  // winner rather than just being the second-highest count. Reported either way:
+  // a runner-up nearly as large as the winner is the signature of a big rigid
+  // animated object competing with the static world, which is precisely the case
+  // where max-inliers has no business deciding on its own.
+  size_t runner_up = hypotheses;
+  u32 runner_up_inliers = 0;
+  if (best_inliers != 0)
+  {
+    for (size_t i = 0; i < hypotheses; ++i)
+    {
+      if (AffineSimilar(deltas[i], deltas[best]))
+        continue;
+      if (hypothesis_inliers[i] > runner_up_inliers)
+      {
+        runner_up_inliers = hypothesis_inliers[i];
+        runner_up = i;
+      }
+    }
+  }
+  m_stats.view_runnerup_inliers = runner_up_inliers;
+
+  // A genuinely turning camera makes EVERYTHING static vote together, so it wins
+  // by a mile and never reaches this. Two comparable clusters mean a large rigid
+  // moving thing versus the world, and "the camera is whichever moved least" is
+  // the right prior there - a title screen's camera is not the part of the scene
+  // swinging around.
+  if (m_view_tie_break && runner_up < hypotheses &&
+      runner_up_inliers * 100 >= best_inliers * VIEW_TIE_BREAK_PERCENT &&
+      DeltaIsCalmer(deltas[runner_up], deltas[best]))
+  {
+    best = runner_up;
+    best_inliers = runner_up_inliers;
+    ++m_stats.view_tie_breaks;
   }
   m_stats.view_inliers = best_inliers;
 
@@ -1327,11 +1400,8 @@ void RemixApi::EstimateView()
     // from the delta's own translation column - which, the delta being a
     // frame-to-frame ratio, is the distance moved rather than a position.
     const Affine& delta = deltas[best];
-    const float trace = delta[0] + delta[5] + delta[10];
-    m_view_delta_rotation_deg =
-        std::acos(std::clamp((trace - 1.0f) * 0.5f, -1.0f, 1.0f)) * RAD_TO_DEG;
-    m_view_delta_translation = std::sqrt(delta[3] * delta[3] + delta[7] * delta[7] +
-                                         delta[11] * delta[11]);
+    m_view_delta_rotation_deg = AffineRotationDegrees(delta);
+    m_view_delta_translation = AffineTranslationLength(delta);
     m_view_max_rotation_deg = std::max(m_view_max_rotation_deg, m_view_delta_rotation_deg);
     m_view_max_translation = std::max(m_view_max_translation, m_view_delta_translation);
 
@@ -1341,9 +1411,10 @@ void RemixApi::EstimateView()
       ++s_view_spike_log_count;
       INFO_LOG_FMT(VIDEO,
                    "Remix frame {} camera SPIKE: accepted rotation {:.3f} deg, translation {:.2f} "
-                   "| inliers {}/{} (needed {}) | samples {} duplicates {}",
+                   "| inliers {}/{} (needed {}, runner-up {}) | samples {} duplicates {}",
                    m_frame_index, m_view_delta_rotation_deg, m_view_delta_translation, best_inliers,
-                   deltas.size(), required, m_view_samples.size(), m_view_duplicate_hashes.size());
+                   deltas.size(), required, runner_up_inliers, m_view_samples.size(),
+                   m_view_duplicate_hashes.size());
     }
 
     m_view_miss_streak = 0;
@@ -1439,13 +1510,14 @@ void RemixApi::LogCameraRecovery()
   const float up[3] = {v[4], v[5], v[6]};
 
   INFO_LOG_FMT(VIDEO,
-               "Remix frame {} camera: samples {} (dup {}, excluded {}) | inliers {}/{} | "
-               "stable W {}/{} ({}%) "
+               "Remix frame {} camera: samples {} (dup {}, excluded {}) | inliers {}/{} "
+               "(runner-up {}, tie-breaks {}) | stable W {}/{} ({}%) "
                "| pos ({:.1f} {:.1f} {:.1f}) fwd ({:.3f} {:.3f} {:.3f}) up ({:.3f} {:.3f} {:.3f}) "
                "| drift fwd {:.2f} deg up {:.2f} deg | max delta rot {:.3f} deg trans {:.2f}",
                m_frame_index, m_stats.view_samples, m_stats.view_duplicates,
                m_stats.view_dup_excluded, m_stats.view_inliers, m_stats.view_candidates,
-               m_stats.w_stable, m_stats.w_compared, stable_pct,
+               m_stats.view_runnerup_inliers, m_stats.view_tie_breaks, m_stats.w_stable,
+               m_stats.w_compared, stable_pct,
                position[0], position[1], position[2], forward[0], forward[1], forward[2], up[0],
                up[1], up[2], AngleBetweenDegrees(forward, VIEW_REFERENCE_FORWARD),
                AngleBetweenDegrees(up, VIEW_REFERENCE_UP), m_view_max_rotation_deg,

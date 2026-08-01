@@ -83,6 +83,13 @@ struct FrameStats
   // How many of those were actually dropped from the electorate. Zero with the
   // electorate fix off, which is what makes the two counters worth separating.
   u32 view_dup_excluded = 0;
+  // The largest cluster that disagreed with the winner, and how often that was
+  // close enough for the calm-camera prior to decide instead of raw size. A
+  // runner-up near the winner's size means a big rigid moving thing is competing
+  // with the static world; a genuinely turning camera has no runner-up at all,
+  // because everything static votes together.
+  u32 view_runnerup_inliers = 0;
+  u32 view_tie_breaks = 0;
 
   // Where TEV stage 0's rasterized colour came from, by GX's own rules.
   // `color_register` is the case that was being dropped outright - a game
@@ -510,6 +517,7 @@ private:
   bool m_camera_recovery = false;
   bool m_view_electorate_fix = true;
   bool m_view_hold_on_miss = true;
+  bool m_view_tie_break = true;
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;

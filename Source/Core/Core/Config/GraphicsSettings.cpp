@@ -225,6 +225,13 @@ const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX{
 // Off is the reset, which is what the backend did before.
 const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS{{System::GFX, "Settings", "RemixViewHoldOnMiss"},
                                              true};
+// When the two largest hypothesis clusters are within a quarter of each other's
+// inlier count, take the one closer to "the camera did not move" instead of the
+// merely-bigger one. A genuinely turning camera makes every static draw vote
+// together and never gets here; two comparable clusters mean a large rigid
+// animated object arguing with the static world, and the camera is not the part
+// of a title screen swinging around. Off is pure max-inliers.
+const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
