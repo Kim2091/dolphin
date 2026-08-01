@@ -1001,6 +1001,30 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       ++stats.texgen_nontrivial;
   }
 
+  // Which XF lights this draw switches on, and what each one means to it. Both
+  // live on the referencing CHANNEL rather than on the light, so both are
+  // per-draw state and have to be accumulated here: read once at frame end they
+  // reflect only the last draw, which is how Wind Waker managed to enable light
+  // 0 all frame and still have every light dropped.
+  u32 draw_light_mask = 0;
+  std::array<u8, 8> draw_attenuation = {};
+  const auto claim_lights = [&](const LitChannel& lit_channel) {
+    const u32 channel_mask = lit_channel.GetFullLightMask();
+    for (u32 i = 0; i < draw_attenuation.size(); ++i)
+    {
+      if ((channel_mask & (1u << i)) != 0 && (draw_light_mask & (1u << i)) == 0)
+        draw_attenuation[i] = static_cast<u8>(lit_channel.attnfunc.Value());
+    }
+    draw_light_mask |= channel_mask;
+  };
+  for (u32 channel = 0; channel < xfmem.numChan.numColorChans && channel < 2; ++channel)
+  {
+    claim_lights(xfmem.color[channel]);
+    claim_lights(xfmem.alpha[channel]);
+  }
+  stats.draw_light_mask |= draw_light_mask;
+  g_remix_api->NoteDrawLights(draw_light_mask, draw_attenuation);
+
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const bool gx_blend = g_remix_api->GxBlendEnabled();
   const RasterColor raster_color =

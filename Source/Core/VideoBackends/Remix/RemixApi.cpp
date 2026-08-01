@@ -899,6 +899,16 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   return result;
 }
 
+void RemixApi::NoteDrawLights(u32 mask, const std::array<u8, 8>& attenuation)
+{
+  for (u32 i = 0; i < m_frame_light_attenuation.size(); ++i)
+  {
+    if ((mask & (1u << i)) != 0 && (m_frame_light_mask & (1u << i)) == 0)
+      m_frame_light_attenuation[i] = attenuation[i];
+  }
+  m_frame_light_mask |= mask;
+}
+
 void RemixApi::SubmitMesh(const MaterialRef& material,
                           const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices, const remixapi_Transform& transform,
@@ -1329,28 +1339,21 @@ void RemixApi::SubmitLights()
   // GX lights are specified in view space. With recovery off that IS our world
   // space and they need no basis change; with it on they have to be carried
   // into world space by V^-1 exactly as the geometry is, or the lighting stays
-  // welded to the camera while the world holds still. The enable mask lives in
-  // the per-channel lighting configs rather than on the lights themselves.
-  // A light's meaning depends on the ATTENUATION FUNCTION of the channel that
-  // references it, not on the light itself - so collect both together. First
-  // channel to claim a light wins; a light referenced twice with conflicting
-  // functions is not something GX geometry can express anyway.
-  u32 light_mask = 0;
-  std::array<AttenuationFunc, 8> attenuation = {};
-  const auto claim = [&](const LitChannel& channel) {
-    const u32 channel_mask = channel.GetFullLightMask();
-    for (u32 i = 0; i < attenuation.size(); ++i)
-    {
-      if ((channel_mask & (1u << i)) != 0 && (light_mask & (1u << i)) == 0)
-        attenuation[i] = channel.attnfunc;
-    }
-    light_mask |= channel_mask;
-  };
-  for (u32 i = 0; i < xfmem.numChan.numColorChans && i < 2; ++i)
-  {
-    claim(xfmem.color[i]);
-    claim(xfmem.alpha[i]);
-  }
+  // welded to the camera while the world holds still.
+  //
+  // The enable mask and the attenuation function both live in the per-channel
+  // lighting configs rather than on the lights themselves, which makes them
+  // per-DRAW state. Reading them here, at frame end, saw only whatever the last
+  // draw of the frame happened to leave in xfmem - and in Wind Waker that is a
+  // channel with lighting switched off, so every light in the scene was dropped
+  // while the geometry that needed them rendered on the fallback. The draw path
+  // accumulates them instead; see NoteDrawLights.
+  //
+  // The light REGISTERS below (xfmem.lights) are still a frame-end read. They
+  // are genuinely global rather than per-draw, so that is only wrong for a game
+  // that moves a light mid-frame.
+  const u32 light_mask = m_frame_light_mask;
+  const std::array<u8, 8>& attenuation = m_frame_light_attenuation;
 
   u32 drawn = 0;
   for (u32 i = 0; i < m_lights.size(); ++i)
@@ -1382,7 +1385,7 @@ void RemixApi::SubmitLights()
     //   Spot       : a genuine positional light with a cone, cosatt/distatt.
     //
     // So only Spot is really a point light. The rest are directional.
-    const AttenuationFunc attnfunc = attenuation[i];
+    const AttenuationFunc attnfunc = static_cast<AttenuationFunc>(attenuation[i]);
     const bool is_positional = attnfunc == AttenuationFunc::Spot;
 
     float vector[3] = {src.dpos[0], src.dpos[1], src.dpos[2]};
@@ -1675,7 +1678,8 @@ void RemixApi::OnAfterFrame()
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
                  "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
-                 "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot)",
+                 "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
+                 "enabled mask {:#04x}",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
@@ -1683,13 +1687,16 @@ void RemixApi::OnAfterFrame()
                  m_stats.color_register, m_stats.color_none, m_stats.texgen_generated,
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
-                 m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot);
+                 m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,
+                 m_stats.draw_light_mask);
   }
 
   LogProjectionVariants();
   LogCameraRecovery();
 
   m_stats = {};
+  m_frame_light_mask = 0;
+  m_frame_light_attenuation = {};
   m_projection_latched = false;
   m_reference_usable = false;
   m_projection_variants = {};

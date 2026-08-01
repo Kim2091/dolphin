@@ -100,6 +100,12 @@ struct FrameStats
   u32 normals_generated = 0;
   u32 normals_flipped = 0;
 
+  // Union of every draw's XF light enable mask over the frame. SubmitLights
+  // samples that mask once, at frame end, from whatever channel state the last
+  // draw happened to leave behind - so this differing from what SubmitLights
+  // saw means lights are being dropped by a per-frame read of per-draw state.
+  u32 draw_light_mask = 0;
+
   // XF lights by the kind they resolved to. Distant vs sphere is the whole
   // point of reading the attenuation function - a game whose suns show up as
   // spheres is a game rendering nearly black.
@@ -278,6 +284,18 @@ public:
                   remixapi_InstanceCategoryFlags category_flags, const DrawBlendState& blend,
                   const float* raw_modelview);
 
+  // Records which XF lights a draw switched on, and what each one MEANS to that
+  // draw - GX puts the attenuation function on the referencing channel, not on
+  // the light, so the same eight light registers are directional or positional
+  // depending on who is looking. Accumulated across the frame because both are
+  // per-draw state: reading them once at frame end sees only whatever the last
+  // draw left behind, which in Wind Waker is a channel with lighting off, so
+  // every light in the scene was being dropped.
+  //
+  // First draw to claim a light decides its kind; a light referenced twice with
+  // conflicting functions is not something GX geometry can express anyway.
+  void NoteDrawLights(u32 mask, const std::array<u8, 8>& attenuation);
+
   FrameStats& Stats() { return m_stats; }
 
   // Cached at Initialize rather than read per draw - the classifier runs on
@@ -404,6 +422,10 @@ private:
   Affine m_view_inverse_previous = {};
   u32 m_view_miss_streak = 0;
   bool m_camera_recovery = false;
+
+  // Per-frame accumulation of the above, cleared with the stats.
+  u32 m_frame_light_mask = 0;
+  std::array<u8, 8> m_frame_light_attenuation = {};
 
   std::array<LightEntry, 8> m_lights = {};
   remixapi_LightHandle m_fallback_light = nullptr;
