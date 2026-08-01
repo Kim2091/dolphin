@@ -81,6 +81,12 @@ struct FrameStats
   u32 color_register = 0;
   u32 color_none = 0;
 
+  // Draws whose stage-0 texture coordinate went through GX texgen, and how many
+  // of those produced something a raw read of attribute 0 would not have. A game
+  // reporting zero non-trivial texgens cannot have a texgen bug.
+  u32 texgen_generated = 0;
+  u32 texgen_nontrivial = 0;
+
   // XF lights by the kind they resolved to. Distant vs sphere is the whole
   // point of reading the attenuation function - a game whose suns show up as
   // spheres is a game rendering nearly black.
@@ -201,6 +207,11 @@ public:
   // is the pre-fix behaviour: the runtime's defaults never read a vertex colour
   // and have no way to hear about xfmem.matColor.
   bool GxColorEnabled() const { return m_gx_color; }
+
+  // False passes vertex attribute 0's texture coordinate through untouched,
+  // which is the pre-fix behaviour: right for the common identity-matrix case
+  // and wrong for every animated or scaled texture matrix.
+  bool GxTexGenEnabled() const { return m_gx_texgen; }
 
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
@@ -340,6 +351,7 @@ private:
   bool m_projection_fix = true;
   bool m_trace_projections = false;
   bool m_gx_color = true;
+  bool m_gx_texgen = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is

@@ -332,6 +332,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
+  m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
   m_view = IDENTITY_AFFINE;
@@ -1661,13 +1662,15 @@ void RemixApi::OnAfterFrame()
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
-                 "register, {} none | lights {} distant, {} sphere ({} spot)",
+                 "register, {} none | texgen {} ({} non-trivial) | lights {} distant, {} sphere "
+                 "({} spot)",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
                  m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
-                 m_stats.color_register, m_stats.color_none, m_stats.lights_distant,
-                 m_stats.lights_sphere, m_stats.lights_spot);
+                 m_stats.color_register, m_stats.color_none, m_stats.texgen_generated,
+                 m_stats.texgen_nontrivial, m_stats.lights_distant, m_stats.lights_sphere,
+                 m_stats.lights_spot);
   }
 
   LogProjectionVariants();

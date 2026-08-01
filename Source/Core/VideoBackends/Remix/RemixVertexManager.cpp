@@ -246,6 +246,265 @@ void Normalize(float* v)
   }
 }
 
+// The texture matrix index GX uses for texgen slot `coord` when the vertex
+// stream does not carry one of its own. Split across two XF registers, four
+// coords each.
+u32 DefaultTexMatrixIndex(u32 coord)
+{
+  switch (coord)
+  {
+  case 0:
+    return xfmem.MatrixIndexA.Tex0MtxIdx;
+  case 1:
+    return xfmem.MatrixIndexA.Tex1MtxIdx;
+  case 2:
+    return xfmem.MatrixIndexA.Tex2MtxIdx;
+  case 3:
+    return xfmem.MatrixIndexA.Tex3MtxIdx;
+  case 4:
+    return xfmem.MatrixIndexB.Tex4MtxIdx;
+  case 5:
+    return xfmem.MatrixIndexB.Tex5MtxIdx;
+  case 6:
+    return xfmem.MatrixIndexB.Tex6MtxIdx;
+  default:
+    return xfmem.MatrixIndexB.Tex7MtxIdx;
+  }
+}
+
+// Everything about a draw's texture coordinate generation that does not vary per
+// vertex, resolved once. `enabled` false means "pass vertex attribute 0 through
+// raw", which is both the pre-fix behaviour and the fallback whenever the state
+// is something this does not model.
+struct TexGenState
+{
+  bool enabled = false;
+  u32 coord = 0;
+  TexGenType type = TexGenType::Regular;
+  SourceRow source_row = SourceRow::Geom;
+  TexSize projection = TexSize::ST;
+  TexInputForm input_form = TexInputForm::ABC1;
+  // decl.texcoords slot the source row names, or -1 when the source is geometry.
+  int source_slot = -1;
+  u32 default_matrix = 0;
+  // Per-vertex texture matrix indices arrive baked into the coordinate's THIRD
+  // float (VertexLoader.cpp:191-198), already masked to 6 bits. Reading only two
+  // components - which is what the raw passthrough did - silently discards them.
+  int matrix_index_slot = -1;
+  bool dual_transform = false;
+  const float* post_matrix = nullptr;
+  bool post_normalize = false;
+};
+
+TexGenState ResolveTexGen(const PortableVertexDeclaration& decl, bool gx_texgen)
+{
+  TexGenState out;
+  if (!gx_texgen)
+    return out;
+
+  // Stage 0 names the texgen slot it samples; it is not always slot 0.
+  const u32 coord = bpmem.tevorders[0].getTexCoord(0);
+  if (coord >= xfmem.numTexGen.numTexGens || coord >= 8)
+    return out;
+
+  const TexMtxInfo& info = xfmem.texMtxInfo[coord];
+  out.coord = coord;
+  out.type = info.texgentype;
+  out.source_row = info.sourcerow;
+  out.projection = info.projection;
+  out.input_form = info.inputform;
+  out.default_matrix = DefaultTexMatrixIndex(coord);
+
+  if (info.sourcerow >= SourceRow::Tex0 && info.sourcerow <= SourceRow::Tex7)
+  {
+    const u32 slot =
+        static_cast<u32>(info.sourcerow.Value()) - static_cast<u32>(SourceRow::Tex0);
+    out.source_slot = (slot < 8 && decl.texcoords[slot].enable) ? static_cast<int>(slot) : -1;
+  }
+
+  if (decl.texcoords[coord].enable && decl.texcoords[coord].components >= 3)
+    out.matrix_index_slot = static_cast<int>(coord);
+
+  if (xfmem.dualTexTrans.enabled)
+  {
+    const PostMtxInfo& post = xfmem.postMtxInfo[coord];
+    out.dual_transform = true;
+    out.post_matrix = &xfmem.postMatrices[post.index * 4];
+    out.post_normalize = post.normalize;
+  }
+
+  out.enabled = true;
+  return out;
+}
+
+// Whether this draw's texgen produces exactly what reading vertex attribute 0
+// raw would have produced. Purely a diagnostic: a game reporting zero
+// non-trivial texgens is a game where this whole path cannot be responsible for
+// anything, which is worth being able to establish from a log.
+bool IsIdentityTexMatrix(const float* m)
+{
+  return m[0] == 1.0f && m[1] == 0.0f && m[2] == 0.0f && m[3] == 0.0f && m[4] == 0.0f &&
+         m[5] == 1.0f && m[6] == 0.0f && m[7] == 0.0f;
+}
+
+bool IsTrivialTexGen(const TexGenState& state)
+{
+  if (!state.enabled)
+    return true;
+  if (state.type != TexGenType::Regular || state.source_slot != 0 || state.matrix_index_slot >= 0)
+    return false;
+  if (!IsIdentityTexMatrix(&xfmem.posMatrices[state.default_matrix * 4]))
+    return false;
+  // Dual transform is a global XF enable, so games leave it on and point every
+  // coordinate at the identity post-matrix. Testing the enable rather than the
+  // matrix would call every draw in such a game non-trivial.
+  return !state.dual_transform || IsIdentityTexMatrix(state.post_matrix);
+}
+
+// One vertex through TransformTexCoordRegular (TransformUnit.cpp:112-192), plus
+// the non-Regular texgen types from its caller at 403-442.
+//
+// Deliberately NOT ported: the trailing bpmem.texcoords[].scale multiply at
+// TransformUnit.cpp:444-449. That converts to the texel-space coordinates the
+// software rasterizer samples in; every hardware backend keeps coordinates
+// normalized and lets the sampler scale, and so does Remix.
+void GenerateTexCoord(const TexGenState& state, const u8* vertex,
+                      const PortableVertexDeclaration& decl, const float* position,
+                      const float* normal, float* out_uv)
+{
+  float src[3] = {0.0f, 0.0f, 0.0f};
+  switch (state.type)
+  {
+  case TexGenType::Color0:
+  case TexGenType::Color1:
+  {
+    // The channel colour's first two components become the coordinate. Reading
+    // the vertex attribute rather than a lit channel is the same shortcut taken
+    // for the raster colour: the lighting term is the path tracer's job.
+    const int slot = state.type == TexGenType::Color0 ?
+                         (decl.colors[0].enable ? 0 : -1) :
+                         (decl.colors[1].enable ? 1 : (decl.colors[0].enable ? 0 : -1));
+    u32 color = 0xFFFFFFFFu;
+    if (slot >= 0)
+      std::memcpy(&color, vertex + decl.colors[slot].offset, sizeof(u32));
+    // Vertex colours are stored R, G, B, A in memory order.
+    out_uv[0] = static_cast<float>(color & 0xFFu) / 255.0f;
+    out_uv[1] = static_cast<float>((color >> 8) & 0xFFu) / 255.0f;
+    return;
+  }
+  case TexGenType::EmbossMap:
+  {
+    // Emboss adds a per-vertex offset derived from a light direction and the
+    // binormals, which is a bump-mapping trick with no meaning to a path tracer
+    // that lights the surface itself. Take the source coordinate without the
+    // offset rather than dropping the draw's texturing entirely.
+    if (state.source_slot >= 0)
+    {
+      const AttributeFormat& format = decl.texcoords[state.source_slot];
+      ReadFloats(vertex + format.offset, out_uv, std::min(format.components, 2));
+    }
+    return;
+  }
+  case TexGenType::Regular:
+  default:
+    break;
+  }
+
+  switch (state.source_row)
+  {
+  case SourceRow::Geom:
+    src[0] = position[0];
+    src[1] = position[1];
+    src[2] = position[2];
+    break;
+  case SourceRow::Normal:
+    src[0] = normal[0];
+    src[1] = normal[1];
+    src[2] = normal[2];
+    break;
+  case SourceRow::BinormalT:
+  case SourceRow::BinormalB:
+  {
+    // The tangent frame, when the vertex carries one. Dolphin substitutes
+    // cached values from the last vertex that did otherwise; that state lives in
+    // VertexShaderManager and is not worth reaching for here, since a texgen
+    // sourcing an absent binormal is emboss bump mapping we do not evaluate.
+    const int slot = state.source_row == SourceRow::BinormalT ? 1 : 2;
+    if (decl.normals[slot].enable)
+      ReadFloats(vertex + decl.normals[slot].offset, src, 3);
+    break;
+  }
+  default:
+    // Tex0..Tex7. The third component is 1, not whatever the attribute holds -
+    // that slot carries the texture matrix index, not a coordinate.
+    if (state.source_slot >= 0)
+    {
+      const AttributeFormat& format = decl.texcoords[state.source_slot];
+      ReadFloats(vertex + format.offset, src, std::min(format.components, 2));
+    }
+    src[2] = 1.0f;
+    break;
+  }
+
+  // Shadow the Hedgehog's cutscene eyelids depend on this (Dolphin issue 11458).
+  for (float& component : src)
+  {
+    if (std::isnan(component))
+      component = 1.0f;
+  }
+
+  u32 matrix_index = state.default_matrix;
+  if (state.matrix_index_slot >= 0)
+  {
+    float baked = 0.0f;
+    std::memcpy(&baked, vertex + decl.texcoords[state.matrix_index_slot].offset + 2 * sizeof(float),
+                sizeof(float));
+    matrix_index = static_cast<u32>(baked) & 0x3f;
+  }
+  const float* const matrix = &xfmem.posMatrices[matrix_index * 4];
+
+  // AB11 feeds (a, b, 1, 1) rather than (a, b, c, 1), which is why the third and
+  // fourth matrix columns both act as translation for it.
+  const bool ab11 = state.input_form == TexInputForm::AB11;
+  const float z_term = ab11 ? 1.0f : src[2];
+  const float w_term = 1.0f;
+  float dst[3];
+  dst[0] = matrix[0] * src[0] + matrix[1] * src[1] + matrix[2] * z_term + matrix[3] * w_term;
+  dst[1] = matrix[4] * src[0] + matrix[5] * src[1] + matrix[6] * z_term + matrix[7] * w_term;
+  dst[2] = state.projection == TexSize::STQ ?
+               matrix[8] * src[0] + matrix[9] * src[1] + matrix[10] * z_term + matrix[11] * w_term :
+               1.0f;
+
+  if (state.dual_transform)
+  {
+    float temp[3] = {dst[0], dst[1], dst[2]};
+    if (state.post_normalize)
+    {
+      Normalize(temp);
+    }
+    const float* const post = state.post_matrix;
+    dst[0] = post[0] * temp[0] + post[1] * temp[1] + post[2] * temp[2] + post[3];
+    dst[1] = post[4] * temp[0] + post[5] * temp[1] + post[6] * temp[2] + post[7];
+    dst[2] = post[8] * temp[0] + post[9] * temp[1] + post[10] * temp[2] + post[11];
+  }
+
+  if (dst[2] == 0.0f)
+  {
+    // Hardware special case, visible in Rogue Squadron 3's Hoth sky and The Last
+    // Story's shadow culling.
+    out_uv[0] = std::clamp(dst[0] / 2.0f, -1.0f, 1.0f);
+    out_uv[1] = std::clamp(dst[1] / 2.0f, -1.0f, 1.0f);
+    return;
+  }
+
+  // Projected coordinates divide by q. The console does this per pixel
+  // (PixelShaderGen.cpp:1966-1969); doing it per vertex is the approximation a
+  // mesh-cache design forces, and it is exact whenever q is constant across the
+  // triangle - which covers everything but genuine projective texturing.
+  out_uv[0] = dst[0] / dst[2];
+  out_uv[1] = dst[1] / dst[2];
+}
+
 // Remix takes exactly one camera per frame, but GX projection state is per
 // draw - and Dolphin flushes the batch whenever it changes, so mid-frame
 // switches are real and common. Worse, the parameterized camera has no field
@@ -512,6 +771,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   const bool has_texcoord = decl.texcoords[0].enable;
   const int texcoord_components = has_texcoord ? std::min(decl.texcoords[0].components, 2) : 0;
 
+  // Texture coordinates the way the console generates them, rather than "vertex
+  // attribute 0, verbatim". Both halves of that shortcut were wrong: stage 0
+  // names which texgen slot it samples, and the xfmem texture matrix on that
+  // slot is how every scrolling or scaled texture on the machine is animated.
+  const TexGenState texgen = ResolveTexGen(decl, g_remix_api->GxTexGenEnabled());
+  if (texgen.enabled)
+  {
+    ++stats.texgen_generated;
+    if (!IsTrivialTexGen(texgen))
+      ++stats.texgen_nontrivial;
+  }
+
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const RasterColor raster_color = ResolveRasterColor(decl, g_remix_api->GxColorEnabled());
   const int color_slot = raster_color.vertex_slot;
@@ -590,7 +861,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       dst.normal[2] = normal[2];
     }
 
-    if (texcoord_components > 0)
+    if (texgen.enabled)
+      GenerateTexCoord(texgen, src, decl, position, normal, dst.texcoord);
+    else if (texcoord_components > 0)
       ReadFloats(src + decl.texcoords[0].offset, dst.texcoord, texcoord_components);
 
     if (color_slot >= 0)
@@ -756,14 +1029,24 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // Log the TEXTURE content hash, not the material hash - the texture hash is
     // what RemixSkyTextures matches on. The material hash folds in sampler bits
     // and would silently never match.
+    const float* const tex_matrix = &xfmem.posMatrices[texgen.default_matrix * 4];
     INFO_LOG_FMT(VIDEO,
                  "Remix {} draw: ztest {} zfunc {} zwrite {} | blend {} | verts {} tris {} | "
-                 "tex {:#018x}",
+                 "tex {:#018x} | texgen coord {} type {} row {} (slot {}) proj {} form {} mtx {}{} "
+                 "[{} {} {} {} / {} {} {} {}] dual {}",
                  is_sky ? "SKY" : "world", bpmem.zmode.test_enable ? 1 : 0,
                  static_cast<u32>(bpmem.zmode.func.Value()), bpmem.zmode.update_enable ? 1 : 0,
                  bpmem.blendmode.blend_enable ? 1 : 0, out_vertices->size(),
-                 out_indices->size() / 3,
-                 albedo != nullptr ? albedo->GetContentHash() : 0);
+                 out_indices->size() / 3, albedo != nullptr ? albedo->GetContentHash() : 0,
+                 texgen.coord, static_cast<u32>(texgen.type), static_cast<u32>(texgen.source_row),
+                 texgen.source_slot, static_cast<u32>(texgen.projection),
+                 static_cast<u32>(texgen.input_form), texgen.default_matrix,
+                 texgen.matrix_index_slot >= 0 ? " (per-vertex)" : "", tex_matrix[0], tex_matrix[1],
+                 tex_matrix[2], tex_matrix[3], tex_matrix[4], tex_matrix[5], tex_matrix[6],
+                 tex_matrix[7],
+                 texgen.dual_transform ?
+                     (IsIdentityTexMatrix(texgen.post_matrix) ? "identity" : "ACTIVE") :
+                     "off");
   }
 
   g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));

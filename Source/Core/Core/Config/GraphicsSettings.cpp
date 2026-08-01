@@ -183,6 +183,11 @@ const Info<bool> GFX_REMIX_CAMERA_RECOVERY{{System::GFX, "Settings", "RemixCamer
 // defaults, where the vertex colour reaches the geometry buffer but nothing ever
 // reads it and a register tint is lost outright.
 const Info<bool> GFX_REMIX_GX_COLOR{{System::GFX, "Settings", "RemixGxColor"}, true};
+// Run GX texture coordinate generation instead of passing vertex attribute 0
+// through raw: the texgen slot TEV stage 0 actually samples, its source row, and
+// the xfmem texture matrix - which is how every scrolling or animated texture on
+// the console works, and is frozen without this. Off is the raw passthrough.
+const Info<bool> GFX_REMIX_GX_TEXGEN{{System::GFX, "Settings", "RemixGxTexGen"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
