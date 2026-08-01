@@ -408,6 +408,7 @@ private:
   bool m_gx_color = true;
   bool m_gx_texgen = true;
   bool m_gx_blend = true;
+  bool m_gx_light_fix = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is
@@ -440,6 +441,10 @@ private:
   // pick, and must differ per draw for clicks to resolve to one surface.
   u32 m_next_picking_value = 1;
   float m_light_scale = 1.0f;
+  // Stand-in for D3D9's Light.Range, which the ported radiance conversion needs
+  // and GX does not have. Only consulted when the distance-attenuation
+  // polynomial never falls off (GX_DA_OFF).
+  float m_light_range = 5000.0f;
 };
 
 extern std::unique_ptr<RemixApi> g_remix_api;

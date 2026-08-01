@@ -191,32 +191,138 @@ bool AffineSimilar(const Affine& a, const Affine& b)
          VIEW_TRANSLATION_EPSILON * (1.0f + std::sqrt(translation_scale_sq));
 }
 
+constexpr float PI_F = 3.14159265358979323846f;
+constexpr float RAD_TO_DEG = 180.0f / PI_F;
+constexpr float DEG_TO_RAD = PI_F / 180.0f;
+
 // A GX spot cone is not an angle - it is a quadratic in cos(theta),
 //   cosAtt = cosatt[0] + cosatt[1]*a + cosatt[2]*a*a,   a = dot(toLight, spotDir)
-// clamped at zero (TransformUnit.cpp CalculateLightAttn, Spot case). The cone
-// edge is wherever that first reaches zero coming in from the axis.
+// clamped at zero (TransformUnit.cpp CalculateLightAttn, Spot case). The OUTER
+// cone edge is wherever that first reaches zero coming in from the axis; the
+// INNER edge - where the falloff starts rather than finishes - is where it first
+// drops below most of its on-axis value. Remix wants both, as an outer angle
+// plus coneSoftness = cos(inner) - cos(outer), which is exactly the shape the
+// runtime's own D3D9 spot conversion builds (rtx_lights_data.cpp:417-420).
 //
 // Walked rather than solved: this runs at most eight times a frame, the
 // polynomial is arbitrary (games do set degenerate ones), and a root-finder
 // here would need more edge-case handling than the whole search costs.
-float SolveSpotConeAngle(const float cosatt[3])
+constexpr float SPOT_INNER_FRACTION = 0.9f;
+
+void SolveSpotCone(const float cosatt[3], float& outer_degrees, float& inner_degrees)
 {
   constexpr int STEPS = 180;
   const auto evaluate = [&](float a) { return cosatt[0] + cosatt[1] * a + cosatt[2] * a * a; };
 
-  // Lit on-axis or nothing sensible to measure - treat as unshaped.
-  if (!(evaluate(1.0f) > 0.0f))
-    return 180.0f;
+  outer_degrees = 180.0f;
+  inner_degrees = 180.0f;
 
+  // Not lit on-axis, or nothing sensible to measure - treat as unshaped.
+  const float on_axis = evaluate(1.0f);
+  if (!(on_axis > 0.0f))
+    return;
+
+  const float inner_threshold = SPOT_INNER_FRACTION * on_axis;
+  bool inner_found = false;
   for (int step = 1; step <= STEPS; ++step)
   {
     const float a = 1.0f - 2.0f * (static_cast<float>(step) / static_cast<float>(STEPS));
-    if (!(evaluate(a) > 0.0f))
+    const float value = evaluate(a);
+    const float degrees = std::acos(std::clamp(a, -1.0f, 1.0f)) * RAD_TO_DEG;
+    if (!inner_found && value < inner_threshold)
     {
-      return std::acos(std::clamp(a, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+      inner_degrees = degrees;
+      inner_found = true;
+    }
+    if (!(value > 0.0f))
+    {
+      outer_degrees = degrees;
+      break;
     }
   }
-  return 180.0f;
+  // A polynomial that is flat out to its own edge has no transition region, and
+  // cos(inner) - cos(outer) must not come out negative.
+  if (!inner_found || inner_degrees > outer_degrees)
+    inner_degrees = outer_degrees;
+}
+
+// ---------------------------------------------------------------------------
+// Radiance calibration, ported from the runtime's own legacy-light conversion
+// (LightUtils::calculateIntensity, rtx_light_utils.cpp:122-182).
+//
+// GX's distance attenuation is 1 / (distatt[0] + distatt[1]*d + distatt[2]*d^2)
+// - term for term the polynomial D3D9 spells Attenuation0/1/2 - so the same
+// conversion applies, and it is the one already look-validated across Remix's
+// whole D3D9 catalogue. Handing the raw 0-1 colour straight over as radiance,
+// which is what this replaces, is roughly two orders of magnitude too dim.
+// ---------------------------------------------------------------------------
+
+// The brightness the original light has to fall to in order to have "ended".
+// Deliberately in the game's own gamma space (rtx_lights.h:41).
+constexpr float LEGACY_LIGHT_END_VALUE = 1.0f / 255.0f;
+// The radiance the converted light will have at that same distance
+// (rtx_lights.h:46).
+constexpr float NEW_LIGHT_END_VALUE = 0.01f;
+// The runtime's fixed sphere radius for converted point/spot lights
+// (rtx_light_manager.h:243, lightConversionSphereLightFixedRadius). The formula
+// below is derived against it, so the two have to agree.
+constexpr float SPHERE_LIGHT_RADIUS = 4.0f;
+// Ceiling on the result, standing in for the runtime's lightConversionMaxIntensity.
+// A degenerate attenuation polynomial can otherwise solve to an absurd distance
+// and hand the tracer a light bright enough to swamp the frame.
+constexpr float MAX_LIGHT_RADIANCE = 100000.0f;
+
+// Distance at which `brightness` divided by the attenuation polynomial falls to
+// LEGACY_LIGHT_END_VALUE. `fallback_range` stands in for D3D9's Light.Range and
+// is what a polynomial with no falloff at all resolves to.
+float SolveLightEndDistance(const float distatt[3], float brightness, float fallback_range)
+{
+  constexpr float EPSILON = 0.000001f;
+  const float a = distatt[2], b = distatt[1], c = distatt[0];
+
+  if (c > 0.0f && brightness / c < LEGACY_LIGHT_END_VALUE)
+  {
+    // Already below the threshold right next to the light.
+    return 0.0f;
+  }
+  if (a < EPSILON)
+  {
+    if (b > EPSILON)
+    {
+      // Linear falloff: 1/(b*d + c) = LEGACY_LIGHT_END_VALUE.
+      return std::max(0.0f, ((brightness / LEGACY_LIGHT_END_VALUE) - c) / b);
+    }
+    // No falloff - GX_DA_OFF leaves distatt = (1,0,0), and the light is at full
+    // power until something else stops it. Nothing in GX says where that is.
+    return fallback_range;
+  }
+
+  // Quadratic: a*d^2 + b*d + (c - brightness/END) = 0, smaller positive root.
+  const float new_c = c - brightness / LEGACY_LIGHT_END_VALUE;
+  const float discriminant = b * b - 4.0f * a * new_c;
+  if (!(discriminant >= 0.0f))
+    return fallback_range;  // never reaches the threshold
+  const float root = std::sqrt(discriminant);
+  const float root1 = (-b + root) / (2.0f * a);
+  const float root2 = (-b - root) / (2.0f * a);
+  float end_distance = 0.0f;
+  if (root1 > 0.0f)
+    end_distance = root1;
+  if (root2 > 0.0f)
+    end_distance = root2;
+  return end_distance;
+}
+
+// Radiance a sphere light of `radius` needs so that it reaches
+// NEW_LIGHT_END_VALUE at the distance the original light ended. Derivation is in
+// rtx_light_utils.cpp:167-179; the result is (d^2 * t) / (pi * r^2).
+float LightEndDistanceToRadiance(float end_distance, float radius)
+{
+  const float distance_sq_to_radiance = NEW_LIGHT_END_VALUE / (PI_F * radius * radius);
+  const float radiance = distance_sq_to_radiance * end_distance * end_distance;
+  if (!std::isfinite(radiance))
+    return 0.0f;
+  return std::min(radiance, MAX_LIGHT_RADIANCE);
 }
 
 // remixapi_Transform::matrix and Affine are the same 3x4 row-major floats.
@@ -334,6 +440,8 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
+  m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
+  m_light_range = std::max(1.0f, Config::Get(Config::GFX_REMIX_LIGHT_RANGE));
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
   m_view = IDENTITY_AFFINE;
@@ -1404,6 +1512,25 @@ void RemixApi::SubmitLights()
     remixapi_LightInfoSphereEXT sphere = {};
     void* light_ext = nullptr;
 
+    // Radiance. Pre-fix this was the raw 0-1 colour, which is roughly two orders
+    // of magnitude short of what the runtime's own legacy-light conversion
+    // produces for the same attenuation curve; the calibrated path solves the
+    // GX distance-attenuation polynomial for where the light ends and derives
+    // the radiance from that. Colours stay in gamma space deliberately, exactly
+    // as rtx_light_utils.cpp:190-193 does.
+    const float brightness = std::max({r, g, b});
+    float radiance[3] = {r * m_light_scale, g * m_light_scale, b * m_light_scale};
+    const float sphere_radius = m_gx_light_fix ? SPHERE_LIGHT_RADIUS : 5.0f;
+    float end_distance = 0.0f;
+    if (m_gx_light_fix && is_positional && brightness > 0.0f)
+    {
+      end_distance = SolveLightEndDistance(src.distatt, brightness, m_light_range);
+      const float intensity = LightEndDistanceToRadiance(end_distance, sphere_radius);
+      radiance[0] = (r / brightness) * intensity * m_light_scale;
+      radiance[1] = (g / brightness) * intensity * m_light_scale;
+      radiance[2] = (b / brightness) * intensity * m_light_scale;
+    }
+
     if (is_positional)
     {
       sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
@@ -1411,13 +1538,25 @@ void RemixApi::SubmitLights()
       sphere.position = {vector[0], vector[1], vector[2]};
       // GX point lights are analytically infinitesimal; give them a small but
       // non-zero radius so the tracer produces soft rather than hard shadows.
-      sphere.radius = 5.0f;
+      // The fixed 4.0 is the runtime's own converted-light radius
+      // (rtx_light_manager.h:243), and the radiance formula above is derived
+      // against it, so the two are not independently choosable.
+      sphere.radius = sphere_radius;
       sphere.volumetricRadianceScale = 1.0f;
 
       // The spot cone is the angle at which the cosatt polynomial in
       // cos(theta) reaches zero. Solve it rather than guessing a width; fall
       // back to a hemisphere when the polynomial has no usable root.
-      float direction[3] = {src.ddir[0], src.ddir[1], src.ddir[2]};
+      //
+      // Sign: both Dolphin renderers compute attn = max(0, dot(ldir, ddir))
+      // with ldir = normalize(light.pos - vertex) (TransformUnit.cpp:245-255,
+      // LightingShaderGen.cpp:43-49), so xfmem's ddir points from the SCENE
+      // TOWARD the light. Remix's shaping direction is the EMISSION axis
+      // (rtx_lights_data.cpp:399-411) - the other way round. Pre-fix this
+      // submitted +ddir, i.e. a cone aimed away from everything it was lighting.
+      const float ddir_sign = m_gx_light_fix ? -1.0f : 1.0f;
+      float direction[3] = {ddir_sign * src.ddir[0], ddir_sign * src.ddir[1],
+                            ddir_sign * src.ddir[2]};
       if (m_camera_recovery)
       {
         const Affine& iv = m_view_inverse;
@@ -1429,10 +1568,18 @@ void RemixApi::SubmitLights()
       Normalize3(direction);
       if (direction[0] != 0.0f || direction[1] != 0.0f || direction[2] != 0.0f)
       {
+        float outer_degrees = 180.0f;
+        float inner_degrees = 180.0f;
+        SolveSpotCone(src.cosatt, outer_degrees, inner_degrees);
         sphere.shaping_hasvalue = 1;
         sphere.shaping_value.direction = {direction[0], direction[1], direction[2]};
-        sphere.shaping_value.coneAngleDegrees = SolveSpotConeAngle(src.cosatt);
-        sphere.shaping_value.coneSoftness = 0.0f;
+        sphere.shaping_value.coneAngleDegrees = outer_degrees;
+        // cos(inner) - cos(outer), the runtime's own D3D9 formula
+        // (rtx_lights_data.cpp:419). Pre-fix this was 0, a hard-edged cone.
+        sphere.shaping_value.coneSoftness =
+            m_gx_light_fix ? std::max(0.0f, std::cos(inner_degrees * DEG_TO_RAD) -
+                                                std::cos(outer_degrees * DEG_TO_RAD)) :
+                             0.0f;
         sphere.shaping_value.focusExponent = 0.0f;
       }
       light_ext = &sphere;
@@ -1462,7 +1609,7 @@ void RemixApi::SubmitLights()
     info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
     info.pNext = light_ext;
     info.hash = XF_LIGHT_HASH_BASE + i;
-    info.radiance = {r * m_light_scale, g * m_light_scale, b * m_light_scale};
+    info.radiance = {radiance[0], radiance[1], radiance[2]};
     info.isDynamic = 1;
     info.ignoreViewModel = 0;
 

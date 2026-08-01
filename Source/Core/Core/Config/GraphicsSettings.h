@@ -128,6 +128,8 @@ extern const Info<bool> GFX_REMIX_CAMERA_RECOVERY;
 extern const Info<bool> GFX_REMIX_GX_COLOR;
 extern const Info<bool> GFX_REMIX_GX_TEXGEN;
 extern const Info<bool> GFX_REMIX_GX_BLEND;
+extern const Info<bool> GFX_REMIX_GX_LIGHT_FIX;
+extern const Info<float> GFX_REMIX_LIGHT_RANGE;
 
 // Graphics.Enhancements
 

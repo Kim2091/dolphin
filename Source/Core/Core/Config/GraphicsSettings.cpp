@@ -193,6 +193,20 @@ const Info<bool> GFX_REMIX_GX_TEXGEN{{System::GFX, "Settings", "RemixGxTexGen"},
 // submitted as opaque geometry that also casts full shadows. Off submits
 // everything opaque, which is what the backend did before.
 const Info<bool> GFX_REMIX_GX_BLEND{{System::GFX, "Settings", "RemixGxBlend"}, true};
+// Translate GX lights the way the console's own renderers read them, instead of
+// approximately. Three things change: a spot cone is aimed along -ddir (xfmem's
+// ddir points from the scene TOWARD the light, so the pre-fix cone faced
+// backwards), the cosatt polynomial's inner edge becomes a real coneSoftness
+// instead of a hard 0, and radiance is derived from the distance attenuation the
+// way the Remix runtime's own D3D9 legacy-light conversion does it rather than
+// being handed the raw 0-1 colour, which is roughly a hundred times too dim.
+// Off reproduces the pre-fix behaviour exactly.
+const Info<bool> GFX_REMIX_GX_LIGHT_FIX{{System::GFX, "Settings", "RemixGxLightFix"}, true};
+// Distance, in GC world units, at which a light with NO distance attenuation
+// (GX_DA_OFF leaves distatt = (1,0,0), so the polynomial never falls off) is
+// considered to have ended. It stands in for D3D9's Light.Range, which the
+// radiance conversion needs and GX simply does not have.
+const Info<float> GFX_REMIX_LIGHT_RANGE{{System::GFX, "Settings", "RemixLightRange"}, 5000.0f};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
