@@ -191,6 +191,34 @@ bool AffineSimilar(const Affine& a, const Affine& b)
          VIEW_TRANSLATION_EPSILON * (1.0f + std::sqrt(translation_scale_sq));
 }
 
+// A GX spot cone is not an angle - it is a quadratic in cos(theta),
+//   cosAtt = cosatt[0] + cosatt[1]*a + cosatt[2]*a*a,   a = dot(toLight, spotDir)
+// clamped at zero (TransformUnit.cpp CalculateLightAttn, Spot case). The cone
+// edge is wherever that first reaches zero coming in from the axis.
+//
+// Walked rather than solved: this runs at most eight times a frame, the
+// polynomial is arbitrary (games do set degenerate ones), and a root-finder
+// here would need more edge-case handling than the whole search costs.
+float SolveSpotConeAngle(const float cosatt[3])
+{
+  constexpr int STEPS = 180;
+  const auto evaluate = [&](float a) { return cosatt[0] + cosatt[1] * a + cosatt[2] * a * a; };
+
+  // Lit on-axis or nothing sensible to measure - treat as unshaped.
+  if (!(evaluate(1.0f) > 0.0f))
+    return 180.0f;
+
+  for (int step = 1; step <= STEPS; ++step)
+  {
+    const float a = 1.0f - 2.0f * (static_cast<float>(step) / static_cast<float>(STEPS));
+    if (!(evaluate(a) > 0.0f))
+    {
+      return std::acos(std::clamp(a, -1.0f, 1.0f)) * (180.0f / 3.14159265358979323846f);
+    }
+  }
+  return 180.0f;
+}
+
 // remixapi_Transform::matrix and Affine are the same 3x4 row-major floats.
 Affine FromRemixTransform(const remixapi_Transform& transform)
 {
@@ -765,7 +793,7 @@ bool RemixApi::UploadTexture(const RemixTexture& texture)
 }
 
 MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                                     u8 wrap_mode_v)
+                                     u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference)
 {
   MaterialRef result;
   if (!m_valid)
@@ -775,19 +803,23 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   if (texture != nullptr && texture->HasData() && UploadTexture(*texture))
     texture_hash = texture->GetContentHash();
 
-  // Sampler state participates in material identity because Remix bakes it into
-  // the material, and the same texture is legitimately sampled with different
-  // wrap modes by different draws.
+  // Sampler AND alpha-test state participate in material identity because Remix
+  // bakes both into the material, and the same texture is legitimately sampled
+  // with different wrap modes - or cut out at a different alpha threshold - by
+  // different draws. Leaving the alpha test out of the key would let whichever
+  // variant registered first decide the cutout for every other draw.
+  const u64 state_key = (static_cast<u64>(alpha_test_type) << 32) |
+                        (static_cast<u64>(alpha_reference) << 24) |
+                        (static_cast<u64>(filter_mode) << 16) |
+                        (static_cast<u64>(wrap_mode_u) << 8) | static_cast<u64>(wrap_mode_v);
   u64 material_hash;
   if (texture_hash != 0)
   {
-    material_hash = FoldHash(texture_hash, (static_cast<u64>(filter_mode) << 16) |
-                                               (static_cast<u64>(wrap_mode_u) << 8) |
-                                               static_cast<u64>(wrap_mode_v));
+    material_hash = FoldHash(texture_hash, state_key);
   }
   else
   {
-    material_hash = FALLBACK_MATERIAL_HASH;
+    material_hash = FoldHash(FALLBACK_MATERIAL_HASH, state_key);
   }
   material_hash = NonZeroHash(material_hash);
 
@@ -818,10 +850,11 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   opaque_ext.metallicConstant = 0.0f;
   opaque_ext.anisotropy = 0.0f;
   opaque_ext.useDrawCallAlphaState = 0;
-  // 7 == "always pass": v1 renders everything opaque, TEV alpha handling is out
-  // of scope.
-  opaque_ext.alphaTestType = 7;
-  opaque_ext.alphaReferenceValue = 0;
+  // GX CompareMode (Never=0 .. Always=7) is already the numbering Remix wants,
+  // so the draw's own alpha test carries straight across. 7 still means "no
+  // test", which is what a draw without one resolves to.
+  opaque_ext.alphaTestType = alpha_test_type;
+  opaque_ext.alphaReferenceValue = alpha_reference;
 
   remixapi_MaterialInfo info = {};
   info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
@@ -1252,11 +1285,25 @@ void RemixApi::SubmitLights()
   // into world space by V^-1 exactly as the geometry is, or the lighting stays
   // welded to the camera while the world holds still. The enable mask lives in
   // the per-channel lighting configs rather than on the lights themselves.
+  // A light's meaning depends on the ATTENUATION FUNCTION of the channel that
+  // references it, not on the light itself - so collect both together. First
+  // channel to claim a light wins; a light referenced twice with conflicting
+  // functions is not something GX geometry can express anyway.
   u32 light_mask = 0;
+  std::array<AttenuationFunc, 8> attenuation = {};
+  const auto claim = [&](const LitChannel& channel) {
+    const u32 channel_mask = channel.GetFullLightMask();
+    for (u32 i = 0; i < attenuation.size(); ++i)
+    {
+      if ((channel_mask & (1u << i)) != 0 && (light_mask & (1u << i)) == 0)
+        attenuation[i] = channel.attnfunc;
+    }
+    light_mask |= channel_mask;
+  };
   for (u32 i = 0; i < xfmem.numChan.numColorChans && i < 2; ++i)
   {
-    light_mask |= xfmem.color[i].GetFullLightMask();
-    light_mask |= xfmem.alpha[i].GetFullLightMask();
+    claim(xfmem.color[i]);
+    claim(xfmem.alpha[i]);
   }
 
   u32 drawn = 0;
@@ -1273,35 +1320,116 @@ void RemixApi::SubmitLights()
     if (r <= 0.0f && g <= 0.0f && b <= 0.0f)
       continue;
 
-    float position[3] = {src.dpos[0], src.dpos[1], src.dpos[2]};
+    // GX has no distinct light TYPES - the attenuation function decides what the
+    // same bytes mean, and getting this wrong is not subtle:
+    //
+    //   None / Dir : attn is literally 1.0 (TransformUnit.cpp CalculateLightAttn)
+    //                - no distance falloff whatsoever. Games build suns this way,
+    //                as an ordinary light parked hundreds of thousands of units
+    //                away. Handing that to a sphere light applies real 1/r^2 and
+    //                the sun contributes essentially nothing, so the scene goes
+    //                black - while still counting as "a light was drawn" and thus
+    //                suppressing the fallback that would have saved it.
+    //   Spec       : dpos/ddir are the OTHER arm of a union - they are sdir and
+    //                shalfangle, i.e. DIRECTIONS. Read as a position, a unit
+    //                vector puts the light basically at the view origin.
+    //   Spot       : a genuine positional light with a cone, cosatt/distatt.
+    //
+    // So only Spot is really a point light. The rest are directional.
+    const AttenuationFunc attnfunc = attenuation[i];
+    const bool is_positional = attnfunc == AttenuationFunc::Spot;
+
+    float vector[3] = {src.dpos[0], src.dpos[1], src.dpos[2]};
     if (m_camera_recovery)
     {
+      // Positions take the translation, directions do not.
       const Affine& iv = m_view_inverse;
-      const float x = position[0], y = position[1], z = position[2];
-      position[0] = iv[0] * x + iv[1] * y + iv[2] * z + iv[3];
-      position[1] = iv[4] * x + iv[5] * y + iv[6] * z + iv[7];
-      position[2] = iv[8] * x + iv[9] * y + iv[10] * z + iv[11];
+      const float x = vector[0], y = vector[1], z = vector[2];
+      const float w = is_positional ? 1.0f : 0.0f;
+      vector[0] = iv[0] * x + iv[1] * y + iv[2] * z + iv[3] * w;
+      vector[1] = iv[4] * x + iv[5] * y + iv[6] * z + iv[7] * w;
+      vector[2] = iv[8] * x + iv[9] * y + iv[10] * z + iv[11] * w;
     }
 
+    remixapi_LightInfoDistantEXT distant = {};
     remixapi_LightInfoSphereEXT sphere = {};
-    sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-    sphere.pNext = nullptr;
-    sphere.position = {position[0], position[1], position[2]};
-    // GX point lights are analytically infinitesimal; give them a small but
-    // non-zero radius so the tracer produces soft rather than hard shadows.
-    sphere.radius = 5.0f;
-    sphere.shaping_hasvalue = 0;
-    sphere.volumetricRadianceScale = 1.0f;
+    void* light_ext = nullptr;
+
+    if (is_positional)
+    {
+      sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+      sphere.pNext = nullptr;
+      sphere.position = {vector[0], vector[1], vector[2]};
+      // GX point lights are analytically infinitesimal; give them a small but
+      // non-zero radius so the tracer produces soft rather than hard shadows.
+      sphere.radius = 5.0f;
+      sphere.volumetricRadianceScale = 1.0f;
+
+      // The spot cone is the angle at which the cosatt polynomial in
+      // cos(theta) reaches zero. Solve it rather than guessing a width; fall
+      // back to a hemisphere when the polynomial has no usable root.
+      float direction[3] = {src.ddir[0], src.ddir[1], src.ddir[2]};
+      if (m_camera_recovery)
+      {
+        const Affine& iv = m_view_inverse;
+        const float x = direction[0], y = direction[1], z = direction[2];
+        direction[0] = iv[0] * x + iv[1] * y + iv[2] * z;
+        direction[1] = iv[4] * x + iv[5] * y + iv[6] * z;
+        direction[2] = iv[8] * x + iv[9] * y + iv[10] * z;
+      }
+      Normalize3(direction);
+      if (direction[0] != 0.0f || direction[1] != 0.0f || direction[2] != 0.0f)
+      {
+        sphere.shaping_hasvalue = 1;
+        sphere.shaping_value.direction = {direction[0], direction[1], direction[2]};
+        sphere.shaping_value.coneAngleDegrees = SolveSpotConeAngle(src.cosatt);
+        sphere.shaping_value.coneSoftness = 0.0f;
+        sphere.shaping_value.focusExponent = 0.0f;
+      }
+      light_ext = &sphere;
+      ++m_stats.lights_sphere;
+      if (sphere.shaping_hasvalue != 0)
+        ++m_stats.lights_spot;
+    }
+    else
+    {
+      // Direction of TRAVEL, so the light points from its position toward the
+      // scene: the negated, normalised light vector.
+      float direction[3] = {-vector[0], -vector[1], -vector[2]};
+      Normalize3(direction);
+      if (direction[0] == 0.0f && direction[1] == 0.0f && direction[2] == 0.0f)
+        continue;
+      distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
+      distant.pNext = nullptr;
+      distant.direction = {direction[0], direction[1], direction[2]};
+      // Roughly the sun's angular size, which is what this usually is.
+      distant.angularDiameterDegrees = 0.5f;
+      distant.volumetricRadianceScale = 1.0f;
+      light_ext = &distant;
+      ++m_stats.lights_distant;
+    }
 
     remixapi_LightInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-    info.pNext = &sphere;
+    info.pNext = light_ext;
     info.hash = XF_LIGHT_HASH_BASE + i;
     info.radiance = {r * m_light_scale, g * m_light_scale, b * m_light_scale};
     info.isDynamic = 1;
     info.ignoreViewModel = 0;
 
     LightEntry& entry = m_lights[i];
+    // A light can change kind between frames when the channel referencing it
+    // changes attenuation function. Remix bakes the light type in at create
+    // time, so an update cannot carry a sphere handle over to a distant one -
+    // the handle has to be retired and remade.
+    if (entry.handle != nullptr && entry.positional != is_positional)
+    {
+      remixapi_LightHandle stale = entry.handle;
+      CallGuarded("DestroyLight(kind change)", [&] { m_interface.DestroyLight(stale); });
+      entry.handle = nullptr;
+    }
+    entry.positional = is_positional;
+
     if (entry.handle == nullptr)
     {
       remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
@@ -1371,7 +1499,8 @@ bool RemixApi::EnsureFallbackMesh()
   if (m_fallback_mesh != nullptr)
     return true;
 
-  const MaterialRef material = EnsureMaterial(nullptr, 1, 1, 1);
+  // Alpha test 7 == none: the fallback triangle must never be cut away.
+  const MaterialRef material = EnsureMaterial(nullptr, 1, 1, 1, 7, 0);
   if (material.handle == nullptr)
     return false;
 
@@ -1497,12 +1626,14 @@ void RemixApi::OnAfterFrame()
   if (m_log_stats && (m_frame_index % 60) == 0)
   {
     INFO_LOG_FMT(VIDEO,
-                 "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} | meshes "
-                 "created {} (live {}) | instances {} (sky {})",
+                 "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
+                 "| meshes created {} (live {}) | instances {} (sky {}) | lights {} distant, {} "
+                 "sphere ({} spot)",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
-                 m_stats.skipped_degenerate, m_stats.meshes_created, m_meshes.size(),
-                 m_stats.instances_drawn, m_stats.sky_draws);
+                 m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
+                 m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws,
+                 m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot);
   }
 
   LogProjectionVariants();

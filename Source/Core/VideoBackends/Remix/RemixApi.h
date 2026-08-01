@@ -39,6 +39,9 @@ struct FrameStats
   u32 skipped_ortho = 0;
   u32 skipped_efb_texture = 0;
   u32 skipped_degenerate = 0;
+  // Draws that write neither colour nor alpha, or whose alpha test can never
+  // pass. Depth-only geometry in a backend that has no depth buffer.
+  u32 skipped_invisible = 0;
   u32 meshes_created = 0;
   u32 instances_drawn = 0;
   u32 sky_draws = 0;
@@ -68,6 +71,13 @@ struct FrameStats
   u32 view_reanchors = 0;
   u32 w_stable = 0;
   u32 w_compared = 0;
+
+  // XF lights by the kind they resolved to. Distant vs sphere is the whole
+  // point of reading the attenuation function - a game whose suns show up as
+  // spheres is a game rendering nearly black.
+  u32 lights_distant = 0;
+  u32 lights_sphere = 0;
+  u32 lights_spot = 0;
 };
 
 // Result of resolving a draw's stage-0 texture to a Remix material. The hash is
@@ -134,8 +144,11 @@ public:
 
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
+  // alpha_test_type / alpha_reference come from the draw's GX alpha test and
+  // fold into material identity along with the sampler state, since Remix bakes
+  // both into the material.
   MaterialRef EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                             u8 wrap_mode_v);
+                             u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference);
 
   // Creates the mesh on a cache miss and queues one instance of it. The draw is
   // NOT emitted here: the recovered camera is not known until the frame's draws
@@ -188,6 +201,9 @@ private:
   struct LightEntry
   {
     remixapi_LightHandle handle = nullptr;
+    // Which Remix light kind the handle was created as. Baked in at create
+    // time, so a GX light that switches attenuation function needs a new one.
+    bool positional = false;
   };
 
   // One distinct projection seen during a frame, with how much geometry rode on

@@ -43,6 +43,46 @@ bool IsSkyDraw(const ZMode& zmode)
   return depth_test_off && !zmode.update_enable;
 }
 
+// GX alpha testing is two comparators combined by a logic op. Remix's material
+// carries a single comparator, and GX's CompareMode numbering (Never=0 ..
+// Always=7) is already the numbering Remix expects, so the common shapes
+// translate directly rather than approximately.
+//
+// Pinning this to "always pass" - which is what v1 did - is what makes every
+// cutout in a game render as a solid card: foliage, fences, chain-link, tree
+// billboards and particles are all a quad plus an alpha test.
+void ResolveAlphaTest(const AlphaTest& alpha_test, u8& type, u8& reference)
+{
+  type = 7;  // Always
+  reference = 0;
+
+  // Only And decomposes cleanly into one comparator. Or/Xor/Xnor with two live
+  // comparators cannot be expressed at all, and guessing one of the two would
+  // cut away geometry the game draws - leave those permissive.
+  if (alpha_test.logic != AlphaTestOp::And)
+    return;
+
+  const bool comp0_trivial = alpha_test.comp0 == CompareMode::Always;
+  const bool comp1_trivial = alpha_test.comp1 == CompareMode::Always;
+  if (!comp0_trivial && comp1_trivial)
+  {
+    type = static_cast<u8>(alpha_test.comp0.Value());
+    reference = static_cast<u8>(alpha_test.ref0.Value());
+  }
+  else if (comp0_trivial && !comp1_trivial)
+  {
+    type = static_cast<u8>(alpha_test.comp1.Value());
+    reference = static_cast<u8>(alpha_test.ref1.Value());
+  }
+  else if (!comp0_trivial && !comp1_trivial)
+  {
+    // A genuine range test (typically Greater(lo) AND Less(hi)). Keeping the
+    // first half preserves the cutout; the far edge is rarely load-bearing.
+    type = static_cast<u8>(alpha_test.comp0.Value());
+    reference = static_cast<u8>(alpha_test.ref0.Value());
+  }
+}
+
 u32 ToRemixVertexColor(u32 dolphin_color)
 {
   return (dolphin_color & 0xFF00FF00u) | ((dolphin_color >> 16) & 0x000000FFu) |
@@ -62,10 +102,27 @@ void TransformPosition(const float* matrix, const float* in, float* out)
   out[2] = in[0] * matrix[8] + in[1] * matrix[9] + in[2] * matrix[10] + matrix[11];
 }
 
-// Same matrix without the translation column. GX matrix-palette entries are
-// rigid in practice, so the rotation part of the position matrix is a good
-// enough normal transform for v1; a genuinely non-uniformly scaled palette
-// entry would want xfmem.normalMatrices instead.
+// Same matrix without the translation column, for use with a normal matrix from
+// xfmem.normalMatrices. Note those are 3 rows of 3 rather than 3 of 4, so the
+// caller passes a stride; see NormalMatrixFor.
+void TransformNormal3(const float* matrix, const float* in, float* out)
+{
+  out[0] = in[0] * matrix[0] + in[1] * matrix[1] + in[2] * matrix[2];
+  out[1] = in[0] * matrix[3] + in[1] * matrix[4] + in[2] * matrix[5];
+  out[2] = in[0] * matrix[6] + in[1] * matrix[7] + in[2] * matrix[8];
+}
+
+// The normal matrix paired with a position matrix index. There are only 32 of
+// them against 64 position matrices, so the index wraps - masking with 63 (or
+// reusing the position matrix, as v1 did) reads past the end or silently
+// applies the wrong basis to lighting. TransformUnit.cpp uses & 31.
+const float* NormalMatrixFor(u32 position_matrix_index)
+{
+  return &xfmem.normalMatrices[(position_matrix_index & 31) * 3];
+}
+
+// Same matrix without the translation column. Kept for the position-matrix
+// path, where the rotation part is the right transform for a rigid entry.
 void TransformNormal(const float* matrix, const float* in, float* out)
 {
   out[0] = in[0] * matrix[0] + in[1] * matrix[1] + in[2] * matrix[2];
@@ -234,6 +291,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     return;
   }
 
+  // Draws that cannot put colour on screen. A rasterizer still runs these for
+  // their depth side effects - Z-prepasses, water and shadow masks, occlusion
+  // proxies - but there is no depth buffer here for them to write to, so
+  // submitting them just adds solid geometry the game never meant to be seen.
+  // Mirrors the rule in RenderState.cpp: color_update && TestResult() != Fail.
+  if ((!bpmem.blendmode.color_update && !bpmem.blendmode.alpha_update) ||
+      bpmem.alpha_test.TestResult() == AlphaTestResult::Fail)
+  {
+    ++stats.skipped_invisible;
+    return;
+  }
+
   const NativeVertexFormat* format = VertexLoaderManager::GetCurrentVertexFormat();
   if (format == nullptr)
   {
@@ -289,19 +358,29 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     wrap_mode_v = static_cast<u8>(std::min<u32>(static_cast<u32>(mode.wrap_t.Value()), 2));
   }
 
-  const MaterialRef material =
-      g_remix_api->EnsureMaterial(albedo, filter_mode, wrap_mode_u, wrap_mode_v);
+  u8 alpha_test_type = 7;
+  u8 alpha_reference = 0;
+  ResolveAlphaTest(bpmem.alpha_test, alpha_test_type, alpha_reference);
+
+  const MaterialRef material = g_remix_api->EnsureMaterial(albedo, filter_mode, wrap_mode_u,
+                                                           wrap_mode_v, alpha_test_type,
+                                                           alpha_reference);
   if (material.handle == nullptr)
     return;
 
   // ---- Decode the vertex stream ------------------------------------------
 
   const bool per_vertex_matrix = decl.posmtx.enable;
+  const bool bake_vertices = per_vertex_matrix;
   const int position_components = std::min(decl.position.components, 3);
   const bool has_normals = decl.normals[0].enable;
   const bool has_texcoord = decl.texcoords[0].enable;
   const int texcoord_components = has_texcoord ? std::min(decl.texcoords[0].components, 2) : 0;
-  const bool has_color = decl.colors[0].enable;
+  // A vertex carrying only color1 feeds channel 0 - the hardware does not
+  // require the channels to be populated in order (VertexShaderGen.cpp does the
+  // same substitution). Reading colors[0] unconditionally turned that geometry
+  // white.
+  const int color_slot = decl.colors[0].enable ? 0 : (decl.colors[1].enable ? 1 : -1);
 
   m_vertices.clear();
   m_vertices.resize(vertex_count);
@@ -318,14 +397,14 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     if (has_normals)
       ReadFloats(src + decl.normals[0].offset, normal, 3);
 
-    if (per_vertex_matrix)
+    if (bake_vertices)
     {
-      // Matrix-palette draw (skinned / multi-matrix geometry): each vertex
-      // names its own modelview. There is no per-vertex transform on the Remix
-      // side without real skinning data, so bake the transform in and submit
-      // with an identity instance transform. The mesh hash then covers the
-      // transformed bytes, so animated meshes re-create every frame and lean on
-      // the idle-mesh LRU - an accepted v1 cost.
+      // Genuinely multi-matrix geometry: each vertex names its own modelview.
+      // There is no per-vertex transform on the Remix side without real skinning
+      // data, so bake the transform in and submit with an identity instance
+      // transform. The mesh hash then covers the transformed bytes, so these
+      // re-create every frame and lean on the idle-mesh LRU - an accepted cost,
+      // now paid only by the draws that actually need it.
       u32 matrix_index = 0;
       std::memcpy(&matrix_index, src + decl.posmtx.offset, sizeof(u32));
       const float* const matrix = &xfmem.posMatrices[(matrix_index & 0x3f) * 4];
@@ -338,7 +417,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
       if (has_normals)
       {
-        TransformNormal(matrix, normal, transformed);
+        // Normals ride their own matrix, not the position one. GX pairs them by
+        // index but there are only 32 normal matrices to 64 position matrices,
+        // so the index wraps.
+        TransformNormal3(NormalMatrixFor(matrix_index), normal, transformed);
         Normalize(transformed);
         dst.normal[0] = transformed[0];
         dst.normal[1] = transformed[1];
@@ -358,10 +440,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     if (texcoord_components > 0)
       ReadFloats(src + decl.texcoords[0].offset, dst.texcoord, texcoord_components);
 
-    if (has_color)
+    if (color_slot >= 0)
     {
       u32 color = 0;
-      std::memcpy(&color, src + decl.colors[0].offset, sizeof(u32));
+      std::memcpy(&color, src + decl.colors[color_slot].offset, sizeof(u32));
       dst.color = ToRemixVertexColor(color);
     }
     else
@@ -441,7 +523,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // rather than cancelling out of it. Null on the matrix-palette path, which has
   // no single modelview to offer.
   const float* raw_modelview = nullptr;
-  if (per_vertex_matrix)
+  if (bake_vertices)
   {
     transform.matrix[0][0] = 1.0f;
     transform.matrix[1][1] = 1.0f;
