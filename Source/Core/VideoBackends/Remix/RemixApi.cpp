@@ -333,6 +333,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
+  m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
   m_view = IDENTITY_AFFINE;
@@ -851,7 +852,13 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   opaque_ext.roughnessConstant = 0.8f;
   opaque_ext.metallicConstant = 0.0f;
   opaque_ext.anisotropy = 0.0f;
-  opaque_ext.useDrawCallAlphaState = 0;
+  // Which alpha state the runtime believes: the material's, or the draw call's.
+  // The draw call's is the only one that can express blending, because the
+  // runtime derives translucent/emissive/multiplicative from the draw's blend
+  // FACTORS (rtx_instance_manager.cpp:716-820) and a material can only say
+  // "blend on/off". Alpha test then also comes from the instance, which is why
+  // both are set there.
+  opaque_ext.useDrawCallAlphaState = m_gx_blend ? 1 : 0;
   // GX CompareMode (Never=0 .. Always=7) is already the numbering Remix wants,
   // so the draw's own alpha test carries straight across. 7 still means "no
   // test", which is what a draw without one resolves to.
@@ -1010,17 +1017,22 @@ void RemixApi::FlushPendingInstances()
     blend.textureAlphaOperation = pending.blend.alpha_operation;
     blend.tFactor = pending.blend.tfactor;
     blend.isVertexColorBakedLighting = pending.blend.vertex_color_is_baked_lighting ? 1 : 0;
-    // Alpha test and blending stay on the material for now (the material sets
-    // useDrawCallAlphaState = 0, so the runtime reads them from there and these
-    // fields are inert). Left explicit so it is obvious they are not being
-    // silently defaulted to something the material contradicts.
-    blend.alphaTestEnabled = 0;
-    blend.alphaTestCompareOp = 7;  // Always
-    blend.alphaBlendEnabled = 0;
+    blend.alphaTestEnabled = pending.blend.alpha_test_enabled ? 1 : 0;
+    blend.alphaTestCompareOp = pending.blend.alpha_test_compare;
+    blend.alphaTestReferenceValue = pending.blend.alpha_test_reference;
+    blend.alphaBlendEnabled = pending.blend.blend_enabled ? 1 : 0;
+    blend.srcColorBlendFactor = pending.blend.src_color_factor;
+    blend.dstColorBlendFactor = pending.blend.dst_color_factor;
+    blend.colorBlendOp = pending.blend.color_blend_op;
+    blend.srcAlphaBlendFactor = pending.blend.src_alpha_factor;
+    blend.dstAlphaBlendFactor = pending.blend.dst_alpha_factor;
+    blend.alphaBlendOp = pending.blend.alpha_blend_op;
+    blend.writeMask = pending.blend.write_mask;
 
     remixapi_InstanceInfo instance = {};
     instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    instance.pNext = m_gx_color ? static_cast<void*>(&blend) : static_cast<void*>(&picking);
+    const bool need_blend_ext = m_gx_color || m_gx_blend;
+    instance.pNext = need_blend_ext ? static_cast<void*>(&blend) : static_cast<void*>(&picking);
     instance.categoryFlags = pending.category_flags;
     instance.mesh = pending.mesh;
     // The submitted transform is V^-1 * (C * MV), and the camera is V, so Remix
@@ -1662,14 +1674,15 @@ void RemixApi::OnAfterFrame()
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
-                 "register, {} none | texgen {} ({} non-trivial) | lights {} distant, {} sphere "
-                 "({} spot)",
+                 "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
+                 "| lights {} distant, {} sphere ({} spot)",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
                  m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
                  m_stats.color_register, m_stats.color_none, m_stats.texgen_generated,
-                 m_stats.texgen_nontrivial, m_stats.lights_distant, m_stats.lights_sphere,
+                 m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
+                 m_stats.logic_op, m_stats.lights_distant, m_stats.lights_sphere,
                  m_stats.lights_spot);
   }
 

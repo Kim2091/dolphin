@@ -138,12 +138,17 @@ struct RasterColor
   // of the mesh hash, so a draw tinted through the register keeps one mesh
   // handle across every tint it is drawn with.
   int vertex_slot = -1;
-  u8 arg2 = REMIX_TEX_ARG_NONE;
+  u8 color_arg2 = REMIX_TEX_ARG_NONE;
+  // Resolved separately: colour and alpha are two independent LitChannels with
+  // their own material sources, so a draw legitimately takes its tint from the
+  // vertex stream and its opacity from the register, or the reverse.
+  u8 alpha_arg2 = REMIX_TEX_ARG_NONE;
   u32 tfactor = 0xFFFFFFFFu;
   bool baked_lighting = false;
 };
 
-RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_semantics)
+RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_semantics,
+                               bool resolve_alpha)
 {
   RasterColor out;
 
@@ -173,24 +178,39 @@ RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_se
   if (channel >= xfmem.numChan.numColorChans)
     return out;
 
+  out.tfactor = MatColorToRemix(xfmem.matColor[channel]);
+  const int vertex_slot = VertexSlotForChannel(decl, channel);
+
   const LitChannel& color_channel = xfmem.color[channel];
   if (color_channel.matsource == MatSource::MatColorRegister)
   {
-    out.arg2 = REMIX_TEX_ARG_TFACTOR;
-    out.tfactor = MatColorToRemix(xfmem.matColor[channel]);
-    return out;
+    out.color_arg2 = REMIX_TEX_ARG_TFACTOR;
+  }
+  else if (vertex_slot >= 0)
+  {
+    out.color_arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
+    out.vertex_slot = vertex_slot;
+    // With lighting off the channel colour IS the vertex colour, which on GC is
+    // overwhelmingly baked lighting - that is why the games use it. With
+    // lighting on, the vertex colour is the material term the hardware
+    // multiplies the lights into, so it is a real material colour and must not
+    // be normalized.
+    out.baked_lighting = !color_channel.enablelighting;
   }
 
-  out.vertex_slot = VertexSlotForChannel(decl, channel);
-  if (out.vertex_slot < 0)
+  if (!resolve_alpha)
     return out;
 
-  out.arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
-  // With lighting off the channel colour IS the vertex colour, which on GC is
-  // overwhelmingly baked lighting - that is why the games use it. With lighting
-  // on, the vertex colour is the material term the hardware multiplies the
-  // lights into, so it is a real material colour and must not be normalized.
-  out.baked_lighting = !color_channel.enablelighting;
+  const LitChannel& alpha_channel = xfmem.alpha[channel];
+  if (alpha_channel.matsource == MatSource::MatColorRegister)
+  {
+    out.alpha_arg2 = REMIX_TEX_ARG_TFACTOR;
+  }
+  else if (vertex_slot >= 0)
+  {
+    out.alpha_arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
+    out.vertex_slot = vertex_slot;
+  }
   return out;
 }
 
@@ -246,7 +266,155 @@ void Normalize(float* v)
   }
 }
 
-// The texture matrix index GX uses for texgen slot `coord` when the vertex
+// GX blend factors in Vulkan's numbering, which is what the runtime's legacy
+// blend classifier matches against. Deliberately the NON dual-source table from
+// VKPipeline.cpp:168-180: Dolphin's own Vulkan pipeline uses SRC1_ALPHA to
+// emulate GX's separate alpha output, but Remix recognises no such factor and
+// would classify every one of those draws as unblended.
+constexpr u8 VK_FACTOR_ZERO = 0;
+constexpr u8 VK_FACTOR_ONE = 1;
+constexpr u8 VK_BLEND_ADD = 0;
+constexpr u8 VK_BLEND_REVERSE_SUBTRACT = 2;
+
+u8 ToVkSrcFactor(SrcBlendFactor factor)
+{
+  // Zero, One, DstClr, InvDstClr, SrcAlpha, InvSrcAlpha, DstAlpha, InvDstAlpha
+  static constexpr u8 table[8] = {0, 1, 4, 5, 6, 7, 8, 9};
+  return table[static_cast<u32>(factor) & 7];
+}
+
+u8 ToVkDstFactor(DstBlendFactor factor)
+{
+  // Zero, One, SrcClr, InvSrcClr, SrcAlpha, InvSrcAlpha, DstAlpha, InvDstAlpha
+  static constexpr u8 table[8] = {0, 1, 2, 3, 6, 7, 8, 9};
+  return table[static_cast<u32>(factor) & 7];
+}
+
+// The two substitutions the hardware makes when the EFB has no alpha channel or
+// when a colour factor is asked of the alpha equation. Straight out of
+// RenderState.cpp:78-108, and load-bearing: leaving DstAlpha in place on an
+// RGB8 target makes the runtime read a blend mode the console never performed.
+SrcBlendFactor RemoveDstAlphaUsage(SrcBlendFactor factor)
+{
+  switch (factor)
+  {
+  case SrcBlendFactor::DstAlpha:
+    return SrcBlendFactor::One;
+  case SrcBlendFactor::InvDstAlpha:
+    return SrcBlendFactor::Zero;
+  default:
+    return factor;
+  }
+}
+
+DstBlendFactor RemoveDstAlphaUsage(DstBlendFactor factor)
+{
+  switch (factor)
+  {
+  case DstBlendFactor::DstAlpha:
+    return DstBlendFactor::One;
+  case DstBlendFactor::InvDstAlpha:
+    return DstBlendFactor::Zero;
+  default:
+    return factor;
+  }
+}
+
+SrcBlendFactor RemoveDstColorUsage(SrcBlendFactor factor)
+{
+  switch (factor)
+  {
+  case SrcBlendFactor::DstClr:
+    return SrcBlendFactor::DstAlpha;
+  case SrcBlendFactor::InvDstClr:
+    return SrcBlendFactor::InvDstAlpha;
+  default:
+    return factor;
+  }
+}
+
+DstBlendFactor RemoveSrcColorUsage(DstBlendFactor factor)
+{
+  switch (factor)
+  {
+  case DstBlendFactor::SrcClr:
+    return DstBlendFactor::SrcAlpha;
+  case DstBlendFactor::InvSrcClr:
+    return DstBlendFactor::InvSrcAlpha;
+  default:
+    return factor;
+  }
+}
+
+// The draw's blend state, translated the way BlendingState::Generate does it
+// (RenderState.cpp:110-197). Everything else in the backend classifies; this one
+// translates, because the runtime already owns a classifier for exactly this
+// state and it is the same one every D3D9 title goes through - so a GX draw
+// arrives at translucent, emissive or multiplicative by the same route a native
+// one would, rather than by a second guess made here.
+//
+// Without it every fire, glow, light shaft, window and water surface is opaque
+// geometry - and in a path tracer that is worse than in a rasterizer, because
+// those cards also cast full shadows.
+void ResolveBlend(DrawBlendState& out, FrameStats& stats)
+{
+  const BlendMode& mode = bpmem.blendmode;
+
+  // GX can only write destination alpha when the EFB format actually has one.
+  const bool target_has_alpha = bpmem.zcontrol.pixel_format == PixelFormat::RGBA6_Z24;
+  const bool alpha_test_may_succeed = bpmem.alpha_test.TestResult() != AlphaTestResult::Fail;
+  const bool color_update = mode.color_update && alpha_test_may_succeed;
+  const bool alpha_update = mode.alpha_update && target_has_alpha && alpha_test_may_succeed;
+  const bool dst_alpha = bpmem.dstalpha.enable && alpha_update;
+
+  out.write_mask = static_cast<u8>((color_update ? 0x7 : 0x0) | (alpha_update ? 0x8 : 0x0));
+
+  if (mode.blend_enable)
+  {
+    out.blend_enabled = true;
+    ++stats.blended;
+
+    if (mode.subtract)
+    {
+      // GX subtract ignores the factor registers entirely: dst - src.
+      out.color_blend_op = VK_BLEND_REVERSE_SUBTRACT;
+      out.src_color_factor = VK_FACTOR_ONE;
+      out.dst_color_factor = VK_FACTOR_ONE;
+      out.alpha_blend_op = dst_alpha ? VK_BLEND_ADD : VK_BLEND_REVERSE_SUBTRACT;
+      out.src_alpha_factor = VK_FACTOR_ONE;
+      out.dst_alpha_factor = dst_alpha ? VK_FACTOR_ZERO : VK_FACTOR_ONE;
+      return;
+    }
+
+    SrcBlendFactor src = mode.src_factor;
+    DstBlendFactor dst = mode.dst_factor;
+    if (!target_has_alpha)
+    {
+      src = RemoveDstAlphaUsage(src);
+      dst = RemoveDstAlphaUsage(dst);
+    }
+    // The alpha equation cannot reference a colour, and note the crossover: the
+    // SOURCE factor loses its destination-colour term and vice versa.
+    const SrcBlendFactor src_alpha = RemoveDstColorUsage(src);
+    const DstBlendFactor dst_alpha_factor = RemoveSrcColorUsage(dst);
+
+    out.color_blend_op = VK_BLEND_ADD;
+    out.alpha_blend_op = VK_BLEND_ADD;
+    out.src_color_factor = ToVkSrcFactor(src);
+    out.dst_color_factor = ToVkDstFactor(dst);
+    out.src_alpha_factor = dst_alpha ? VK_FACTOR_ONE : ToVkSrcFactor(src_alpha);
+    out.dst_alpha_factor = dst_alpha ? VK_FACTOR_ZERO : ToVkDstFactor(dst_alpha_factor);
+    return;
+  }
+
+  if (mode.logic_op_enable && mode.logic_mode != LogicOp::NoOp)
+  {
+    // A raster logic op has no blend-equation equivalent, so Remix has nowhere
+    // to put it. Counted rather than approximated: guessing here would turn XOR
+    // overlays into visible translucent geometry.
+    ++stats.logic_op;
+  }
+}
 // stream does not carry one of its own. Split across two XF registers, four
 // coords each.
 u32 DefaultTexMatrixIndex(u32 coord)
@@ -784,9 +952,11 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   }
 
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
-  const RasterColor raster_color = ResolveRasterColor(decl, g_remix_api->GxColorEnabled());
+  const bool gx_blend = g_remix_api->GxBlendEnabled();
+  const RasterColor raster_color =
+      ResolveRasterColor(decl, g_remix_api->GxColorEnabled(), gx_blend);
   const int color_slot = raster_color.vertex_slot;
-  switch (raster_color.arg2)
+  switch (raster_color.color_arg2)
   {
   case REMIX_TEX_ARG_VERTEX_COLOR0:
     ++stats.color_vertex;
@@ -801,10 +971,32 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   DrawBlendState blend;
   blend.color_arg1 = REMIX_TEX_ARG_TEXTURE;
-  blend.color_arg2 = raster_color.arg2;
+  blend.color_arg2 = raster_color.color_arg2;
   blend.color_operation = REMIX_TEX_OP_MODULATE;
   blend.tfactor = raster_color.tfactor;
   blend.vertex_color_is_baked_lighting = raster_color.baked_lighting;
+
+  if (gx_blend)
+  {
+    // GX's stage-0 alpha is the texture's modulated by the rasterized alpha, so
+    // the opacity a blend or a cutout works from is that product - not the
+    // texture alpha alone. Safe to apply unconditionally: the runtime marks a
+    // surface fully opaque, and ignores opacity entirely, whenever neither
+    // blending nor an alpha test is live (rtx_instance_manager.cpp:861).
+    blend.alpha_arg1 = REMIX_TEX_ARG_TEXTURE;
+    blend.alpha_arg2 = raster_color.alpha_arg2;
+    blend.alpha_operation = raster_color.alpha_arg2 == REMIX_TEX_ARG_NONE ?
+                                REMIX_TEX_OP_SELECT_ARG1 :
+                                REMIX_TEX_OP_MODULATE;
+
+    blend.alpha_test_compare = alpha_test_type;
+    blend.alpha_test_reference = alpha_reference;
+    blend.alpha_test_enabled = alpha_test_type != 7;
+    if (blend.alpha_test_enabled)
+      ++stats.alpha_tested;
+
+    ResolveBlend(blend, stats);
+  }
 
   m_vertices.clear();
   m_vertices.resize(vertex_count);
@@ -1033,7 +1225,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     INFO_LOG_FMT(VIDEO,
                  "Remix {} draw: ztest {} zfunc {} zwrite {} | blend {} | verts {} tris {} | "
                  "tex {:#018x} | texgen coord {} type {} row {} (slot {}) proj {} form {} mtx {}{} "
-                 "[{} {} {} {} / {} {} {} {}] dual {}",
+                 "[{} {} {} {} / {} {} {} {}] dual {} | blend {}->{} op {} alpha {}->{} op {} "
+                 "mask {:#x} | atest {} ref {}",
                  is_sky ? "SKY" : "world", bpmem.zmode.test_enable ? 1 : 0,
                  static_cast<u32>(bpmem.zmode.func.Value()), bpmem.zmode.update_enable ? 1 : 0,
                  bpmem.blendmode.blend_enable ? 1 : 0, out_vertices->size(),
@@ -1046,7 +1239,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                  tex_matrix[7],
                  texgen.dual_transform ?
                      (IsIdentityTexMatrix(texgen.post_matrix) ? "identity" : "ACTIVE") :
-                     "off");
+                     "off",
+                 blend.src_color_factor, blend.dst_color_factor, blend.color_blend_op,
+                 blend.src_alpha_factor, blend.dst_alpha_factor, blend.alpha_blend_op,
+                 blend.write_mask, blend.alpha_test_compare, blend.alpha_test_reference);
   }
 
   g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));

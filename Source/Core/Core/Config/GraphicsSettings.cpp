@@ -188,6 +188,11 @@ const Info<bool> GFX_REMIX_GX_COLOR{{System::GFX, "Settings", "RemixGxColor"}, t
 // the xfmem texture matrix - which is how every scrolling or animated texture on
 // the console works, and is frozen without this. Off is the raw passthrough.
 const Info<bool> GFX_REMIX_GX_TEXGEN{{System::GFX, "Settings", "RemixGxTexGen"}, true};
+// Translate the draw's GX blend state and hand it to the runtime's own legacy
+// blend classifier, so fire, glows, light shafts, windows and water stop being
+// submitted as opaque geometry that also casts full shadows. Off submits
+// everything opaque, which is what the backend did before.
+const Info<bool> GFX_REMIX_GX_BLEND{{System::GFX, "Settings", "RemixGxBlend"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

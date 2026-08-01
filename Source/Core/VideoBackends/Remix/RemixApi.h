@@ -87,6 +87,13 @@ struct FrameStats
   u32 texgen_generated = 0;
   u32 texgen_nontrivial = 0;
 
+  // Draws submitted as something other than plain opaque geometry. `blended` is
+  // the whole point of translating blend state; `logic_op` counts draws using a
+  // raster logic op, which has no Remix equivalent and stays opaque.
+  u32 blended = 0;
+  u32 alpha_tested = 0;
+  u32 logic_op = 0;
+
   // XF lights by the kind they resolved to. Distant vs sphere is the whole
   // point of reading the attenuation function - a game whose suns show up as
   // spheres is a game rendering nearly black.
@@ -149,6 +156,25 @@ struct DrawBlendState
   // hue survives and the path tracer supplies the brightness; that is wrong when
   // the vertex colour is a genuine material colour instead.
   bool vertex_color_is_baked_lighting = false;
+
+  // Alpha test and blending, in Vulkan's numbering because that is what the
+  // runtime's legacy classifier (rtx_instance_manager.cpp:716-820) matches
+  // against to decide translucent vs emissive vs multiplicative. Reaching that
+  // classifier at all needs the material to set useDrawCallAlphaState; with it
+  // clear the runtime answers from the material instead and these are inert.
+  //
+  // Defaults are "opaque, no test", i.e. what the material used to say.
+  bool alpha_test_enabled = false;
+  u8 alpha_test_compare = 7;   // VK_COMPARE_OP_ALWAYS, and GX's Always
+  u8 alpha_test_reference = 0;
+  bool blend_enabled = false;
+  u8 src_color_factor = 1;  // VK_BLEND_FACTOR_ONE
+  u8 dst_color_factor = 0;  // VK_BLEND_FACTOR_ZERO
+  u8 color_blend_op = 0;    // VK_BLEND_OP_ADD
+  u8 src_alpha_factor = 1;
+  u8 dst_alpha_factor = 0;
+  u8 alpha_blend_op = 0;
+  u8 write_mask = 0xF;  // R | G | B | A
 };
 
 // Owner of everything that talks to the Remix runtime. Created by
@@ -212,6 +238,11 @@ public:
   // which is the pre-fix behaviour: right for the common identity-matrix case
   // and wrong for every animated or scaled texture matrix.
   bool GxTexGenEnabled() const { return m_gx_texgen; }
+
+  // False keeps every draw opaque with its alpha test on the material, which is
+  // the pre-fix behaviour. On, the material defers to the draw call and the
+  // per-instance blend state below becomes the thing the runtime reads.
+  bool GxBlendEnabled() const { return m_gx_blend; }
 
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
@@ -352,6 +383,7 @@ private:
   bool m_trace_projections = false;
   bool m_gx_color = true;
   bool m_gx_texgen = true;
+  bool m_gx_blend = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is

@@ -127,6 +127,7 @@ extern const Info<bool> GFX_REMIX_TRACE_PROJECTIONS;
 extern const Info<bool> GFX_REMIX_CAMERA_RECOVERY;
 extern const Info<bool> GFX_REMIX_GX_COLOR;
 extern const Info<bool> GFX_REMIX_GX_TEXGEN;
+extern const Info<bool> GFX_REMIX_GX_BLEND;
 
 // Graphics.Enhancements
 
