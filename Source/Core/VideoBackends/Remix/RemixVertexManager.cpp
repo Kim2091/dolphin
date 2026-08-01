@@ -1007,8 +1007,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // reflect only the last draw, which is how Wind Waker managed to enable light
   // 0 all frame and still have every light dropped.
   u32 draw_light_mask = 0;
+  u32 draw_color_light_mask = 0;
   std::array<u8, 8> draw_attenuation = {};
-  const auto claim_lights = [&](const LitChannel& lit_channel) {
+  const auto claim_lights = [&](const LitChannel& lit_channel, bool color_channel) {
     const u32 channel_mask = lit_channel.GetFullLightMask();
     for (u32 i = 0; i < draw_attenuation.size(); ++i)
     {
@@ -1016,14 +1017,20 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
         draw_attenuation[i] = static_cast<u8>(lit_channel.attnfunc.Value());
     }
     draw_light_mask |= channel_mask;
+    if (color_channel)
+      draw_color_light_mask |= channel_mask;
   };
+  // BOTH colour channels before either alpha channel. First claim decides the
+  // light's kind, and an alpha channel only ever reads the light's color[0]
+  // (TransformUnit.cpp:290-314) - so when the two disagree about the attenuation
+  // function, the colour channel's reading is the one describing what the light
+  // does to the picture.
   for (u32 channel = 0; channel < xfmem.numChan.numColorChans && channel < 2; ++channel)
-  {
-    claim_lights(xfmem.color[channel]);
-    claim_lights(xfmem.alpha[channel]);
-  }
+    claim_lights(xfmem.color[channel], true);
+  for (u32 channel = 0; channel < xfmem.numChan.numColorChans && channel < 2; ++channel)
+    claim_lights(xfmem.alpha[channel], false);
   stats.draw_light_mask |= draw_light_mask;
-  g_remix_api->NoteDrawLights(draw_light_mask, draw_attenuation);
+  g_remix_api->NoteDrawLights(draw_light_mask, draw_color_light_mask, draw_attenuation);
 
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const bool gx_blend = g_remix_api->GxBlendEnabled();

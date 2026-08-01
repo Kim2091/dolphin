@@ -12,6 +12,11 @@
 #include "Common/CommonTypes.h"
 #include "Common/HookableEvent.h"
 
+// For the XF Light register layout. The backend snapshots those registers on
+// the draw path rather than reading them at frame end, so the struct has to be
+// storable here.
+#include "VideoCommon/XFMemory.h"
+
 // Vendored from the user's Remix Plus fork; see Externals/remix/remix_c.h.
 // Angle brackets are deliberate: MSVC's /external:anglebrackets keeps the
 // third-party header out of Dolphin's /W4 /WX budget. It pulls in <windows.h>,
@@ -112,6 +117,19 @@ struct FrameStats
   u32 lights_distant = 0;
   u32 lights_sphere = 0;
   u32 lights_spot = 0;
+
+  // How per-draw the light REGISTERS turn out to be. `lights_rewritten` counts
+  // claims of a slot whose 64 register bytes had changed since the first draw
+  // that claimed it this frame; `lights_conflicted` counts claims that disagree
+  // about the attenuation function. First claim wins either way - these exist so
+  // that a game which animates a light slot mid-frame stops being invisible.
+  // `lights_alpha_only` counts submitted lights that no COLOUR channel ever
+  // claimed: GX feeds those only into a channel's alpha (TransformUnit.cpp
+  // LightAlpha reads color[0] alone), so submitting them as full RGB lights is
+  // an over-translation. Counter first, no behaviour change.
+  u32 lights_rewritten = 0;
+  u32 lights_conflicted = 0;
+  u32 lights_alpha_only = 0;
 };
 
 // Result of resolving a draw's stage-0 texture to a Remix material. The hash is
@@ -294,7 +312,16 @@ public:
   //
   // First draw to claim a light decides its kind; a light referenced twice with
   // conflicting functions is not something GX geometry can express anyway.
-  void NoteDrawLights(u32 mask, const std::array<u8, 8>& attenuation);
+  //
+  // The light REGISTERS are per-draw state for the same reason, and are
+  // snapshotted here on first claim rather than read at frame end: XFStructs.cpp
+  // flushes the vertex manager on every XF write, so the register values at draw
+  // time are well defined, while the frame-end values are whatever the last
+  // draw happened to leave behind.
+  //
+  // color_mask is the subset of `mask` claimed by a COLOUR channel rather than
+  // an alpha one. It is only counted, not acted on.
+  void NoteDrawLights(u32 mask, u32 color_mask, const std::array<u8, 8>& attenuation);
 
   FrameStats& Stats() { return m_stats; }
 
@@ -426,7 +453,12 @@ private:
 
   // Per-frame accumulation of the above, cleared with the stats.
   u32 m_frame_light_mask = 0;
+  // Subset of m_frame_light_mask claimed by a colour channel. Diagnostic only.
+  u32 m_frame_light_color_mask = 0;
   std::array<u8, 8> m_frame_light_attenuation = {};
+  // The XF light registers as they stood at the draw that first claimed each
+  // slot this frame. SubmitLights consumes these, never xfmem directly.
+  std::array<Light, 8> m_frame_lights = {};
 
   std::array<LightEntry, 8> m_lights = {};
   remixapi_LightHandle m_fallback_light = nullptr;

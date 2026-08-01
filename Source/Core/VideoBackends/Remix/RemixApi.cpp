@@ -1007,14 +1007,37 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   return result;
 }
 
-void RemixApi::NoteDrawLights(u32 mask, const std::array<u8, 8>& attenuation)
+void RemixApi::NoteDrawLights(u32 mask, u32 color_mask, const std::array<u8, 8>& attenuation)
 {
   for (u32 i = 0; i < m_frame_light_attenuation.size(); ++i)
   {
-    if ((mask & (1u << i)) != 0 && (m_frame_light_mask & (1u << i)) == 0)
+    const u32 bit = 1u << i;
+    if ((mask & bit) == 0)
+      continue;
+
+    // The registers are per-DRAW state, exactly like the enable mask and the
+    // attenuation function turned out to be. Reading them at frame end sees only
+    // whatever the last draw of the frame left in xfmem; snapshotting them here,
+    // at the draw that first switched the light on, is what the geometry lit by
+    // that light actually saw. At most eight copies a frame.
+    const Light& src = xfmem.lights[i];
+    if ((m_frame_light_mask & bit) == 0)
+    {
       m_frame_light_attenuation[i] = attenuation[i];
+      m_frame_lights[i] = src;
+      continue;
+    }
+
+    // Already claimed. First claim still wins - splitting one GX slot into
+    // several Remix lights is not worth it until a game shows these counters
+    // non-zero - but the disagreement stops being silent.
+    if (std::memcmp(&m_frame_lights[i], &src, sizeof(Light)) != 0)
+      ++m_stats.lights_rewritten;
+    if (m_frame_light_attenuation[i] != attenuation[i])
+      ++m_stats.lights_conflicted;
   }
   m_frame_light_mask |= mask;
+  m_frame_light_color_mask |= color_mask;
 }
 
 void RemixApi::SubmitMesh(const MaterialRef& material,
@@ -1457,9 +1480,9 @@ void RemixApi::SubmitLights()
   // while the geometry that needed them rendered on the fallback. The draw path
   // accumulates them instead; see NoteDrawLights.
   //
-  // The light REGISTERS below (xfmem.lights) are still a frame-end read. They
-  // are genuinely global rather than per-draw, so that is only wrong for a game
-  // that moves a light mid-frame.
+  // The light REGISTERS are accumulated the same way - see NoteDrawLights, which
+  // snapshots each slot at the draw that first claimed it. Nothing here reads
+  // xfmem.lights directly any more.
   const u32 light_mask = m_frame_light_mask;
   const std::array<u8, 8>& attenuation = m_frame_light_attenuation;
 
@@ -1469,13 +1492,17 @@ void RemixApi::SubmitLights()
     if ((light_mask & (1u << i)) == 0)
       continue;
 
-    const Light& src = xfmem.lights[i];
+    const Light& src = m_frame_lights[i];
     // xfmem light colors are packed abgr in u8[4].
     const float r = static_cast<float>(src.color[3]) / 255.0f;
     const float g = static_cast<float>(src.color[2]) / 255.0f;
     const float b = static_cast<float>(src.color[1]) / 255.0f;
     if (r <= 0.0f && g <= 0.0f && b <= 0.0f)
       continue;
+    // Claimed only by an alpha channel: GX would feed this light into a
+    // channel's alpha alone (color[0]), not its RGB. Counted, not acted on.
+    if ((m_frame_light_color_mask & (1u << i)) == 0)
+      ++m_stats.lights_alpha_only;
 
     // GX has no distinct light TYPES - the attenuation function decides what the
     // same bytes mean, and getting this wrong is not subtle:
@@ -1836,7 +1863,7 @@ void RemixApi::OnAfterFrame()
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
                  "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
-                 "enabled mask {:#04x}",
+                 "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {}",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
@@ -1845,7 +1872,8 @@ void RemixApi::OnAfterFrame()
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,
-                 m_stats.draw_light_mask);
+                 m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
+                 m_stats.lights_alpha_only);
   }
 
   LogProjectionVariants();
@@ -1853,7 +1881,9 @@ void RemixApi::OnAfterFrame()
 
   m_stats = {};
   m_frame_light_mask = 0;
+  m_frame_light_color_mask = 0;
   m_frame_light_attenuation = {};
+  m_frame_lights = {};
   m_projection_latched = false;
   m_reference_usable = false;
   m_projection_variants = {};
