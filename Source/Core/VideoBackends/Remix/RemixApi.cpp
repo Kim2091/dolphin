@@ -1522,10 +1522,20 @@ void RemixApi::SubmitLights()
     float radiance[3] = {r * m_light_scale, g * m_light_scale, b * m_light_scale};
     const float sphere_radius = m_gx_light_fix ? SPHERE_LIGHT_RADIUS : 5.0f;
     float end_distance = 0.0f;
-    if (m_gx_light_fix && is_positional && brightness > 0.0f)
+    if (m_gx_light_fix && brightness > 0.0f)
     {
-      end_distance = SolveLightEndDistance(src.distatt, brightness, m_light_range);
-      const float intensity = LightEndDistanceToRadiance(end_distance, sphere_radius);
+      // A distant light has no falloff to solve, so the runtime's directional
+      // precedent applies instead: normalized colour at a fixed intensity
+      // (rtx_lights_data.cpp:359 with lightConversionDistantLightFixedIntensity,
+      // rtx_light_manager.h:245, whose default is 1.0). m_light_scale plays that
+      // multiplier here so RemixLightScale stays the single brightness knob and
+      // its own default of 1.0 reproduces the runtime's number exactly.
+      float intensity = 1.0f;
+      if (is_positional)
+      {
+        end_distance = SolveLightEndDistance(src.distatt, brightness, m_light_range);
+        intensity = LightEndDistanceToRadiance(end_distance, sphere_radius);
+      }
       radiance[0] = (r / brightness) * intensity * m_light_scale;
       radiance[1] = (g / brightness) * intensity * m_light_scale;
       radiance[2] = (b / brightness) * intensity * m_light_scale;
