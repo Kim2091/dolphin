@@ -154,6 +154,19 @@ const Info<int> GFX_REMIX_SKY_MODE{{System::GFX, "Settings", "RemixSkyMode"}, 0}
 // category flags before the grid's texture-category lookup ever runs. Passing
 // the SKY bit ourselves is the path that does work.
 const Info<std::string> GFX_REMIX_SKY_TEXTURES{{System::GFX, "Settings", "RemixSkyTextures"}, ""};
+// Remix takes one camera per frame, but GX projection state is per draw and
+// Dolphin flushes the batch whenever it changes. Folding each draw's projection
+// difference into its instance transform is what keeps mid-frame projection
+// switches - and the off-centre raw[1]/raw[3] shear terms, which the
+// parameterized camera cannot express at all - from moving geometry on screen.
+// Off is the pre-fix behaviour: first perspective projection of the frame wins
+// and every other draw is rendered through it.
+const Info<bool> GFX_REMIX_PROJECTION_FIX{{System::GFX, "Settings", "RemixProjectionFix"}, true};
+// Log every distinct projection seen per frame, every frame. The per-frame
+// summary already reports variants whenever there is more than one (or any
+// off-centre term), so this is only needed to watch a projection change live.
+const Info<bool> GFX_REMIX_TRACE_PROJECTIONS{
+    {System::GFX, "Settings", "RemixTraceProjections"}, false};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

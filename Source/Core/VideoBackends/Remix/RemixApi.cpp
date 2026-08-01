@@ -140,6 +140,8 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
     return true;
 
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
+  m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
+  m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_sky_mode = Config::Get(Config::GFX_REMIX_SKY_MODE);
 
   // "0xabc,0xdef" -> the set of stage-0 texture hashes to treat as skybox.
@@ -437,12 +439,112 @@ const RemixTexture* RemixApi::GetBoundTexture(u32 index) const
   return index < m_bound_textures.size() ? m_bound_textures[index] : nullptr;
 }
 
-void RemixApi::LatchProjection(const std::array<float, 6>& raw_projection)
+namespace
 {
-  if (m_projection_latched)
+// Two projections are the same one if every raw term matches to a relative
+// epsilon. All six participate, not just the four the correction uses: a pair
+// differing only in near/far is still worth seeing in the log, and it costs
+// nothing because such a pair yields a no-op correction anyway.
+bool SameProjection(const std::array<float, 6>& a, const std::array<float, 6>& b)
+{
+  for (size_t i = 0; i < a.size(); ++i)
+  {
+    const float scale = std::max({1.0f, std::abs(a[i]), std::abs(b[i])});
+    if (std::abs(a[i] - b[i]) > 1e-6f * scale)
+      return false;
+  }
+  return true;
+}
+
+// Recover the field of view and aspect the parameterized camera needs from a
+// GX perspective projection:
+//   raw[0] = 1 / (tan(fovY/2) * aspect),  raw[2] = 1 / tan(fovY/2)
+// Returns false when the result is not a frustum the camera can represent, in
+// which case SetupCamera keeps a fabricated default - and, crucially, draws
+// must NOT be folded onto it, because it encodes no raw term at all.
+//
+// Shared by SetupCamera and ObserveProjection deliberately: the projection
+// correction is defined relative to the camera's effective frustum, so the two
+// cannot be allowed to disagree about what that frustum is.
+bool RecoverFovAspect(const std::array<float, 6>& raw, float& fov_y_deg, float& aspect)
+{
+  if (!(raw[2] > 0.0001f) || !(raw[0] > 0.0001f))
+    return false;
+  fov_y_deg = 2.0f * std::atan(1.0f / raw[2]) * (180.0f / 3.14159265358979323846f);
+  aspect = raw[2] / raw[0];
+  return fov_y_deg >= 5.0f && fov_y_deg <= 170.0f && aspect >= 0.25f && aspect <= 8.0f;
+}
+}  // namespace
+
+int RemixApi::ObserveProjection(const std::array<float, 6>& raw_projection)
+{
+  if (!m_projection_latched)
+  {
+    m_raw_projection = raw_projection;
+    m_projection_latched = true;
+    float fov_y_deg = 0.0f;
+    float aspect = 0.0f;
+    m_reference_usable = RecoverFovAspect(raw_projection, fov_y_deg, aspect);
+  }
+
+  for (u32 i = 0; i < m_projection_variant_count; ++i)
+  {
+    if (SameProjection(m_projection_variants[i].raw, raw_projection))
+      return static_cast<int>(i);
+  }
+
+  if (m_projection_variant_count >= MAX_PROJECTION_VARIANTS)
+  {
+    ++m_stats.projection_overflow;
+    return -1;
+  }
+
+  const u32 slot = m_projection_variant_count++;
+  m_projection_variants[slot].raw = raw_projection;
+  return static_cast<int>(slot);
+}
+
+void RemixApi::NoteProjectionUse(int slot, u32 vertex_count)
+{
+  if (slot < 0 || static_cast<u32>(slot) >= m_projection_variant_count)
     return;
-  m_raw_projection = raw_projection;
-  m_projection_latched = true;
+  ++m_projection_variants[slot].draws;
+  m_projection_variants[slot].vertices += vertex_count;
+}
+
+void RemixApi::LogProjectionVariants()
+{
+  if (!m_log_stats)
+    return;
+
+  // Self-silencing by default: a game that keeps one centred projection all
+  // frame has nothing to report, and this runs at 60 Hz. Anything else - a
+  // mid-frame switch, or an off-centre frustum - is exactly the condition the
+  // single-camera design cannot represent, so say so.
+  const bool interesting = m_projection_variant_count > 1 || m_stats.projection_oblique > 0 ||
+                           m_stats.projection_overflow > 0 || m_stats.projection_uncorrectable > 0;
+  if (!m_trace_projections && (!interesting || (m_frame_index % 60) != 0))
+    return;
+
+  INFO_LOG_FMT(VIDEO,
+               "Remix frame {} projections: {} variant(s), reference #0 | corrected {} draw(s), "
+               "off-centre {}, UNCORRECTABLE {} | table overflow {} | fix {}",
+               m_frame_index, m_projection_variant_count, m_stats.projection_corrected,
+               m_stats.projection_oblique, m_stats.projection_uncorrectable,
+               m_stats.projection_overflow, m_projection_fix ? "on" : "off");
+
+  for (u32 i = 0; i < m_projection_variant_count; ++i)
+  {
+    const ProjectionVariant& variant = m_projection_variants[i];
+    // raw[1] and raw[3] are the off-centre shear terms. They are the reason a
+    // parameterized camera alone cannot reproduce the frame: it has no field
+    // for them, so on the pre-fix path they were silently dropped.
+    INFO_LOG_FMT(VIDEO,
+                 "  #{}{} raw {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} | draws {} verts {}{}", i,
+                 i == 0 ? " (ref)" : "     ", variant.raw[0], variant.raw[1], variant.raw[2],
+                 variant.raw[3], variant.raw[4], variant.raw[5], variant.draws, variant.vertices,
+                 (variant.raw[1] != 0.0f || variant.raw[3] != 0.0f) ? "  <-- off-centre" : "");
+  }
 }
 
 bool RemixApi::UploadTexture(const RemixTexture& texture)
@@ -705,27 +807,40 @@ void RemixApi::SetupCamera()
     //   m[11] = raw[5] = -f * n / (f - n)
     // hence fovY = 2*atan(1/raw[2]), aspect = raw[2]/raw[0],
     // far = raw[5]/raw[4] and near = raw[5]/(raw[4] - 1).
-    if (raw[2] > 0.0001f && raw[0] > 0.0001f)
+    float fov_y_deg = 0.0f;
+    float aspect = 0.0f;
+    if (RecoverFovAspect(m_raw_projection, fov_y_deg, aspect))
     {
-      const float fov_y_deg =
-          2.0f * std::atan(1.0f / raw[2]) * (180.0f / 3.14159265358979323846f);
-      const float aspect = raw[2] / raw[0];
-      if (fov_y_deg >= 5.0f && fov_y_deg <= 170.0f && aspect >= 0.25f && aspect <= 8.0f)
-      {
-        params.fovYInDegrees = fov_y_deg;
-        params.aspect = aspect;
-      }
+      params.fovYInDegrees = fov_y_deg;
+      params.aspect = aspect;
     }
-    if (std::abs(raw[4]) > 0.0000001f && std::abs(raw[4] - 1.0f) > 0.0000001f)
+    // Depth is the one part of the projection that folding onto the instance
+    // transform cannot carry: the correction leaves view-space z alone, so each
+    // draw keeps its own depth range and the camera has to span all of them.
+    // Taking the union across the frame's variants is what stops a draw with a
+    // longer far plane from being clipped by whichever projection happened to
+    // be latched first. Variant #0 is the reference, so it is always included.
+    float near_plane = 0.0f;
+    float far_plane = 0.0f;
+    bool depth_valid = false;
+    for (u32 i = 0; i < m_projection_variant_count; ++i)
     {
-      const float far_plane = raw[5] / raw[4];
-      const float near_plane = raw[5] / (raw[4] - 1.0f);
+      const std::array<float, 6>& variant = m_projection_variants[i].raw;
+      if (std::abs(variant[4]) <= 0.0000001f || std::abs(variant[4] - 1.0f) <= 0.0000001f)
+        continue;
+      const float variant_far = variant[5] / variant[4];
+      const float variant_near = variant[5] / (variant[4] - 1.0f);
       // Never let a transient degenerate frustum reach the tracer.
-      if (near_plane > 0.0001f && far_plane > near_plane)
-      {
-        params.nearPlane = std::clamp(near_plane, 0.01f, 100.0f);
-        params.farPlane = std::clamp(far_plane, params.nearPlane + 1.0f, 10000000.0f);
-      }
+      if (!(variant_near > 0.0001f) || !(variant_far > variant_near))
+        continue;
+      near_plane = depth_valid ? std::min(near_plane, variant_near) : variant_near;
+      far_plane = depth_valid ? std::max(far_plane, variant_far) : variant_far;
+      depth_valid = true;
+    }
+    if (depth_valid)
+    {
+      params.nearPlane = std::clamp(near_plane, 0.01f, 100.0f);
+      params.farPlane = std::clamp(far_plane, params.nearPlane + 1.0f, 10000000.0f);
     }
 
     // Log the recovered frustum once: the near/far recovery above is derived,
@@ -991,8 +1106,13 @@ void RemixApi::OnAfterFrame()
                  m_stats.instances_drawn, m_stats.sky_draws);
   }
 
+  LogProjectionVariants();
+
   m_stats = {};
   m_projection_latched = false;
+  m_reference_usable = false;
+  m_projection_variants = {};
+  m_projection_variant_count = 0;
   ++m_frame_index;
 }
 

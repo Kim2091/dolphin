@@ -37,6 +37,19 @@ struct FrameStats
   u32 meshes_created = 0;
   u32 instances_drawn = 0;
   u32 sky_draws = 0;
+  // Draws whose projection differed from the frame's reference and were folded
+  // back onto it, and how many of those carried an off-centre frustum. Both are
+  // zero on a game that never switches projection mid-frame.
+  u32 projection_corrected = 0;
+  u32 projection_oblique = 0;
+  // Draws whose projection could not be folded onto the reference at all (the
+  // implied scale was absurd, or the reference was degenerate). These render
+  // through the wrong frustum, so a non-zero count is a real defect - not the
+  // same thing as a draw that simply needed no correction.
+  u32 projection_uncorrectable = 0;
+  // Draws arriving after the per-frame variant table filled up. Non-zero means
+  // the projection log below is incomplete, not that anything rendered wrong.
+  u32 projection_overflow = 0;
 };
 
 // Result of resolving a draw's stage-0 texture to a Remix material. The hash is
@@ -75,9 +88,31 @@ public:
 
   // --- Called from RemixVertexManager ---
 
-  // Latches the frame's camera projection. First perspective draw of a frame
-  // wins; a frame with only orthographic draws keeps the previous camera.
-  void LatchProjection(const std::array<float, 6>& raw_projection);
+  // Accounts for one perspective draw's projection and returns its slot in the
+  // frame's variant table, or -1 if the table is full. The first perspective
+  // draw of a frame also latches the reference projection that SetupCamera
+  // turns into the camera; a frame with only orthographic draws keeps the
+  // previous camera.
+  int ObserveProjection(const std::array<float, 6>& raw_projection);
+
+  // Records that a draw which actually reached SubmitMesh used variant `slot`.
+  // The reference is "first perspective draw of the frame", and these counts
+  // are how we find out whether that draw is the one carrying the scene.
+  void NoteProjectionUse(int slot, u32 vertex_count);
+
+  // The frame's reference projection - the one SetupCamera is built from, and
+  // therefore the one every other draw has to be folded onto. False until a
+  // perspective draw has been seen this frame, and also false when that draw's
+  // frustum was too degenerate for the camera to represent: SetupCamera then
+  // falls back to a fabricated default that encodes none of these raw terms, so
+  // folding draws onto them would aim at a camera that is not there.
+  bool HasReferenceProjection() const { return m_projection_latched && m_reference_usable; }
+  const std::array<float, 6>& ReferenceProjection() const { return m_raw_projection; }
+
+  // False restores the pre-fix behaviour: submit each draw's modelview as-is
+  // and let the frame's single camera misframe everything that does not share
+  // the reference projection.
+  bool ProjectionFixEnabled() const { return m_projection_fix; }
 
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
@@ -127,7 +162,18 @@ private:
     remixapi_LightHandle handle = nullptr;
   };
 
+  // One distinct projection seen during a frame, with how much geometry rode on
+  // it. Bounded because a runaway game must not be able to grow this per frame.
+  struct ProjectionVariant
+  {
+    std::array<float, 6> raw = {};
+    u32 draws = 0;
+    u32 vertices = 0;
+  };
+  static constexpr size_t MAX_PROJECTION_VARIANTS = 8;
+
   void OnAfterFrame();
+  void LogProjectionVariants();
   void SetupCamera();
   void SubmitLights();
   void SubmitFallbackTriangle();
@@ -155,7 +201,12 @@ private:
 
   std::array<float, 6> m_raw_projection = {};
   bool m_projection_latched = false;
+  bool m_reference_usable = false;
   bool m_camera_valid = false;
+  std::array<ProjectionVariant, MAX_PROJECTION_VARIANTS> m_projection_variants = {};
+  u32 m_projection_variant_count = 0;
+  bool m_projection_fix = true;
+  bool m_trace_projections = false;
 
   std::array<LightEntry, 8> m_lights = {};
   remixapi_LightHandle m_fallback_light = nullptr;

@@ -84,6 +84,110 @@ void Normalize(float* v)
   }
 }
 
+// Remix takes exactly one camera per frame, but GX projection state is per
+// draw - and Dolphin flushes the batch whenever it changes, so mid-frame
+// switches are real and common. Worse, the parameterized camera has no field
+// that can express raw[1]/raw[3], the terms that shear the frustum off-centre.
+//
+// Both losses are recoverable, because relative to the frustum Remix actually
+// renders with, the difference is exactly affine in view space. GX perspective
+// clip space is
+//   clip.x = raw[0]*x + raw[1]*z
+//   clip.y = raw[2]*y + raw[3]*z
+//   clip.w = -z
+// and the camera SetupCamera submits is the reference projection made CENTRED -
+// fovY and aspect carry raw[0]/raw[2], and nothing carries raw[1]/raw[3]. So
+// the target to solve against is (raw0_r, 0, raw2_r, 0), not the reference's
+// own raw terms. Requiring that camera to land the point where the draw's
+// projection would, with z (and therefore w) untouched, gives
+//   raw0_r*x' == raw0_d*x + raw1_d*z
+//   =>  x' = (raw0_d/raw0_r)*x + (raw1_d/raw0_r)*z
+// and likewise for y through raw[2]/raw[3]. A scale plus a shear along z, with
+// no perspective term, so it composes straight onto the instance transform.
+//
+// Note what that means for a frame with a single off-centre projection: the
+// reference draw does not correct to identity, it corrects by its own shear.
+// That is the point - the camera dropped raw[1]/raw[3], so even the draw that
+// defined the camera has to have them folded back in.
+struct ProjectionCorrection
+{
+  float x_scale = 1.0f;
+  float x_shear = 0.0f;
+  float y_scale = 1.0f;
+  float y_shear = 0.0f;
+};
+
+// Past this ratio the reference is not a plausible frustum for the draw, and
+// folding onto it would smear geometry across the screen rather than place it.
+// Leaving such a draw uncorrected is the recoverable failure.
+constexpr float MAX_PROJECTION_SCALE = 64.0f;
+
+// "Nothing to do" and "refused to do it" both leave the transform alone, but
+// they mean opposite things when reading the frame log - one says the frame is
+// consistent, the other says a draw is knowingly being rendered through the
+// wrong frustum. Counted separately for that reason.
+enum class CorrectionResult
+{
+  NotNeeded,
+  Apply,
+  Unrepresentable,
+};
+
+CorrectionResult BuildProjectionCorrection(const std::array<float, 6>& draw,
+                                           const std::array<float, 6>& reference,
+                                           ProjectionCorrection& out)
+{
+  // A reference with no x or y scale is not a frustum at all; there is nothing
+  // meaningful to fold onto.
+  if (std::abs(reference[0]) < 1e-6f || std::abs(reference[2]) < 1e-6f)
+    return CorrectionResult::Unrepresentable;
+
+  // reference[1] / reference[3] deliberately do not appear: the camera never
+  // applied them, so the draw's own off-centre terms fold in whole.
+  out.x_scale = draw[0] / reference[0];
+  out.x_shear = draw[1] / reference[0];
+  out.y_scale = draw[2] / reference[2];
+  out.y_shear = draw[3] / reference[2];
+
+  if (!std::isfinite(out.x_scale) || !std::isfinite(out.x_shear) ||
+      !std::isfinite(out.y_scale) || !std::isfinite(out.y_shear))
+  {
+    return CorrectionResult::Unrepresentable;
+  }
+
+  if (std::abs(out.x_scale) > MAX_PROJECTION_SCALE ||
+      std::abs(out.y_scale) > MAX_PROJECTION_SCALE ||
+      std::abs(out.x_scale) < 1.0f / MAX_PROJECTION_SCALE ||
+      std::abs(out.y_scale) < 1.0f / MAX_PROJECTION_SCALE)
+  {
+    return CorrectionResult::Unrepresentable;
+  }
+
+  // Identity is the common case on a well-behaved game - one centred
+  // projection all frame - and skipping it keeps float noise off that path.
+  const bool needed = std::abs(out.x_scale - 1.0f) > 1e-6f ||
+                      std::abs(out.y_scale - 1.0f) > 1e-6f || std::abs(out.x_shear) > 1e-6f ||
+                      std::abs(out.y_shear) > 1e-6f;
+  return needed ? CorrectionResult::Apply : CorrectionResult::NotNeeded;
+}
+
+// transform <- C * transform, both 3x4 row-major with an implicit [0 0 0 1]
+// fourth row. C's fourth column is zero, so one expression covers the
+// translation column as well, and row 2 passes through untouched.
+//
+// Caveat: the shear makes C non-rigid, so strictly the normals want C's inverse
+// transpose. The correction is near-identity for everything except a genuine
+// FOV switch, so this reads as slightly skewed shading on mismatched draws
+// rather than as a visible fault - worth revisiting if a game leans on it.
+void ApplyProjectionCorrection(const ProjectionCorrection& c, remixapi_Transform& transform)
+{
+  for (int j = 0; j < 4; ++j)
+  {
+    const float row2 = transform.matrix[2][j];
+    transform.matrix[0][j] = c.x_scale * transform.matrix[0][j] + c.x_shear * row2;
+    transform.matrix[1][j] = c.y_scale * transform.matrix[1][j] + c.y_shear * row2;
+  }
+}
 }  // namespace
 
 VertexManager::VertexManager() = default;
@@ -109,8 +213,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     return;
   }
 
-  // First perspective draw of the frame defines the camera.
-  g_remix_api->LatchProjection(xfmem.projection.rawProjection);
+  // First perspective draw of the frame defines the camera; every distinct
+  // projection after it is tracked so the frame log can say whether the
+  // reference is the one actually carrying the scene.
+  const int projection_slot = g_remix_api->ObserveProjection(xfmem.projection.rawProjection);
 
   // bSupportsPrimitiveRestart is false for this backend, so every quad/strip/fan
   // has already been expanded into a plain triangle list by the index generator
@@ -347,6 +453,34 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     std::memcpy(&transform.matrix[0][0], matrix, sizeof(float) * 12);
   }
 
+  // Fold this draw's projection onto the frame's reference, so the one camera
+  // SetupCamera submits still frames every draw the way the game did. Without
+  // it, anything that did not set the reference projection is rendered through
+  // someone else's frustum: a different FOV puts it at the wrong screen angle,
+  // and a dropped off-centre term reads almost exactly like a small camera
+  // rotation - so that geometry swings against the rest of the scene as the
+  // view turns, which is the whole symptom this exists to kill.
+  if (xfmem.projection.rawProjection[1] != 0.0f || xfmem.projection.rawProjection[3] != 0.0f)
+    ++stats.projection_oblique;
+
+  if (g_remix_api->ProjectionFixEnabled() && g_remix_api->HasReferenceProjection())
+  {
+    ProjectionCorrection correction;
+    switch (BuildProjectionCorrection(xfmem.projection.rawProjection,
+                                      g_remix_api->ReferenceProjection(), correction))
+    {
+    case CorrectionResult::Apply:
+      ApplyProjectionCorrection(correction, transform);
+      ++stats.projection_corrected;
+      break;
+    case CorrectionResult::Unrepresentable:
+      ++stats.projection_uncorrectable;
+      break;
+    case CorrectionResult::NotNeeded:
+      break;
+    }
+  }
+
   // Two routes to sky. The explicit texture list is the reliable one - it names
   // the exact skybox texture, so it cannot mistake clouds or overlays for the
   // horizon dome the way the depth heuristic did. The heuristic remains behind
@@ -386,6 +520,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                  albedo != nullptr ? albedo->GetContentHash() : 0);
   }
 
+  g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
   g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags);
 }
 

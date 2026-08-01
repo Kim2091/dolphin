@@ -122,6 +122,8 @@ extern const Info<float> GFX_REMIX_LIGHT_SCALE;
 extern const Info<bool> GFX_REMIX_LOG_STATS;
 extern const Info<int> GFX_REMIX_SKY_MODE;
 extern const Info<std::string> GFX_REMIX_SKY_TEXTURES;
+extern const Info<bool> GFX_REMIX_PROJECTION_FIX;
+extern const Info<bool> GFX_REMIX_TRACE_PROJECTIONS;
 
 // Graphics.Enhancements
 
