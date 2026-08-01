@@ -1360,9 +1360,20 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                  blend.write_mask, blend.alpha_test_compare, blend.alpha_test_reference);
   }
 
+  // Recorded, never classified on: the sky auto-detector keys on the transform
+  // signature alone, and these are what let its verdicts be checked against the
+  // weaker signals - and what makes a classification hand-transcribable into
+  // rtx.skyBoxGeometries or RemixSkyTextures.
+  DrawDiagnostics diagnostics;
+  diagnostics.texture_hash = albedo != nullptr ? albedo->GetContentHash() : 0;
+  diagnostics.depth_test = bpmem.zmode.test_enable;
+  diagnostics.depth_func = static_cast<u8>(bpmem.zmode.func.Value());
+  diagnostics.depth_write = bpmem.zmode.update_enable;
+  diagnostics.draw_index = stats.draws_seen;
+
   g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
   g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags, blend,
-                          raw_modelview);
+                          raw_modelview, diagnostics);
 }
 
 }  // namespace Remix

@@ -232,6 +232,29 @@ const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS{{System::GFX, "Settings", "RemixVie
 // animated object arguing with the static world, and the camera is not the part
 // of a title screen swinging around. Off is pure max-inliers.
 const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, true};
+// Identify skyboxes by the one property that defines them: they translate with
+// the camera. Under camera recovery a skybox's recovered world transform slides
+// with the camera position while its rotation holds still, so the frame-to-frame
+// ratio is a pure translation equal to the camera's own position delta - which
+// static world geometry (ratio = identity) and camera-welded overlays (rotation
+// tracks the camera) both fail. This needs RemixCameraRecovery on, and it can
+// only make progress on frames where the camera actually translates.
+//   0 = off, manual RemixSkyTextures only - exactly the pre-feature behaviour
+//   1 = classify, count and log, but tag nothing (the default)
+//   2 = classify and tag matching draws as sky
+// Nothing about the retired depth-state heuristic is involved; that is
+// RemixSkyMode, and it stays off.
+const Info<int> GFX_REMIX_SKY_AUTO_DETECT{{System::GFX, "Settings", "RemixSkyAutoDetect"}, 1};
+// Consecutive informative frames a mesh has to satisfy the signature before it
+// is classified. Classification is sticky for the session: sky must not flicker,
+// and a restart clears the set.
+const Info<int> GFX_REMIX_SKY_AUTO_FRAMES{{System::GFX, "Settings", "RemixSkyAutoFrames"}, 30};
+// Minimum size, as a fraction of the frame's far plane, for a draw to be
+// considered a skybox. A dome spans a large part of the frustum; a camera-welded
+// view model does not, and during a translation-only window that size check is
+// the only thing separating them.
+const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT{
+    {System::GFX, "Settings", "RemixSkyAutoMinExtent"}, 0.25f};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

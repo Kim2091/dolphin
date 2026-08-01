@@ -133,6 +133,9 @@ extern const Info<float> GFX_REMIX_LIGHT_RANGE;
 extern const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX;
 extern const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS;
 extern const Info<bool> GFX_REMIX_VIEW_TIE_BREAK;
+extern const Info<int> GFX_REMIX_SKY_AUTO_DETECT;
+extern const Info<int> GFX_REMIX_SKY_AUTO_FRAMES;
+extern const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT;
 
 // Graphics.Enhancements
 

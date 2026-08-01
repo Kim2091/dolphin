@@ -155,11 +155,39 @@ struct FrameStats
   u32 lights_diffuse_none = 0;
   u32 lights_diffuse_sign = 0;
   u32 lights_spec = 0;
+  // Sky auto-detection. `sky_auto_candidates` is how many meshes satisfied the
+  // transform signature this frame; `sky_auto_tagged` is how many instances were
+  // actually given the SKY bit because of it. The sticky classified-set size is
+  // reported alongside them and holding constant frame to frame IS the stability
+  // check - a set that keeps growing is a classifier chasing noise.
+  u32 sky_auto_candidates = 0;
+  u32 sky_auto_classified = 0;
+  u32 sky_auto_tagged = 0;
+  // Classified sky meshes removed from the camera electorate. A skybox votes for
+  // the camera's rotation delta with the translation missing, which is an
+  // actively wrong hypothesis rather than merely a useless one.
+  u32 view_sky_excluded = 0;
   // A lit draw whose channel ambient register was bright enough to matter. GX
   // ambient has no Remix analogue at all - the path tracer's GI has to stand in
   // for it - so this quantifies how much of the frame's light was ambient before
   // anyone reaches for RemixLightScale.
   bool ambient_bright = false;
+};
+
+// Per-draw facts the sky classifier RECORDS but never classifies on. They exist
+// so the weaker signals - depth state, submission order, texture identity - can
+// be checked against the transform signature's verdicts instead of guessed at,
+// and so a classification log line names something the user can paste into
+// rtx.skyBoxGeometries or RemixSkyTextures to make it permanent.
+struct DrawDiagnostics
+{
+  // The stage-0 TEXTURE content hash, not the material hash: the material hash
+  // folds in sampler state and would never match a hand-written list.
+  u64 texture_hash = 0;
+  bool depth_test = false;
+  u8 depth_func = 0;
+  bool depth_write = false;
+  u32 draw_index = 0;
 };
 
 // What one draw said about the XF lights it switched on. Every field here is
@@ -345,7 +373,7 @@ public:
                   const std::vector<remixapi_HardcodedVertex>& vertices,
                   const std::vector<u32>& indices, const remixapi_Transform& transform,
                   remixapi_InstanceCategoryFlags category_flags, const DrawBlendState& blend,
-                  const float* raw_modelview);
+                  const float* raw_modelview, const DrawDiagnostics& diagnostics);
 
   // Records which XF lights a draw switched on, and what each one MEANS to that
   // draw - GX puts the attenuation function on the referencing channel, not on
@@ -393,6 +421,22 @@ private:
   {
     remixapi_MeshHandle handle = nullptr;
     u64 last_used_frame = 0;
+    // Object-space bounding radius, measured once at create time from the
+    // decoded vertices. Scaled by the modelview at classification time, this is
+    // what separates a sky dome from small camera-welded geometry.
+    float object_radius = 0.0f;
+    // Last draw of this mesh, for the classification log line only.
+    DrawDiagnostics diagnostics;
+  };
+
+  // A mesh that has been matching the sky transform signature. Only frames on
+  // which the camera actually translated count - see the informative-frame gate
+  // in EstimateView.
+  struct SkyCandidate
+  {
+    u32 streak = 0;
+    u32 informative_frames = 0;
+    float scaled_extent = 0.0f;
   };
 
   struct LightEntry
@@ -450,7 +494,15 @@ private:
 
   void OnAfterFrame();
   void LogProjectionVariants();
+  // Union of every projection variant's depth range this frame. Shared by
+  // SetupCamera and the sky classifier's size gate so the two cannot disagree
+  // about how far away "far" is.
+  bool ComputeDepthRange(float& near_plane, float& far_plane) const;
   void EstimateView();
+  // The transform-signature test, run inside EstimateView's W-delta loop where
+  // the ratio W(t)*W(t-1)^-1 is already in hand.
+  void ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affine& modelview,
+                   const float camera_delta[3], float far_plane);
   void FlushPendingInstances();
   void LogCameraRecovery();
   void SetupCamera();
@@ -538,6 +590,15 @@ private:
   bool m_log_stats = true;
   int m_sky_mode = 0;
   std::unordered_set<u64> m_sky_textures;
+  // Sky auto-detection: 0 off, 1 detect and log only, 2 detect and tag.
+  int m_sky_auto_detect = 1;
+  u32 m_sky_auto_frames = 30;
+  float m_sky_auto_min_extent = 0.25f;
+  std::unordered_map<u64, SkyCandidate> m_sky_candidates;
+  // Sticky for the session. A classified mesh is never un-classified: sky that
+  // flickers in and out is worse than sky that is occasionally wrong, and a
+  // restart clears it.
+  std::unordered_set<u64> m_sky_classified;
   // Per-frame object-picking id. Must be non-zero for the runtime to record a
   // pick, and must differ per draw for clicks to resolve to one surface.
   u32 m_next_picking_value = 1;

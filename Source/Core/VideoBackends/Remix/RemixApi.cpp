@@ -86,6 +86,24 @@ int s_view_spike_log_count = 0;
 // inlier count, before the vote is treated as too close to call on size alone.
 constexpr u32 VIEW_TIE_BREAK_PERCENT = 75;
 
+// --- Sky auto-detection tolerances --------------------------------------
+// How straight the sky ratio's rotation part has to be. Same class as
+// VIEW_ROTATION_EPSILON, a little looser because the ratio is built from an
+// ESTIMATED view and inherits its error.
+constexpr float SKY_ROTATION_EPSILON = 5e-3f;
+// How closely the ratio's translation has to match the camera's own position
+// delta, relative to the size of that delta.
+constexpr float SKY_TRANSLATION_RELATIVE_EPSILON = 0.1f;
+// How far the camera must travel in a frame for that frame to say anything. Below
+// this the sky and the static world are genuinely indistinguishable by this test
+// - a parked or rotation-only camera - and the frame is simply skipped.
+constexpr float SKY_INFORMATIVE_FRACTION = 1e-4f;
+// Ceiling on how many meshes may be tracked as candidates at once, so a game
+// churning geometry cannot grow the map without bound.
+constexpr size_t MAX_SKY_CANDIDATES = 4096;
+constexpr int SKY_CLASSIFY_LOG_CAP = 32;
+int s_sky_classify_log_count = 0;
+
 // Rotation angle of an affine's 3x3, in degrees: trace = 1 + 2cos(theta).
 float AffineRotationDegrees(const Affine& m)
 {
@@ -514,6 +532,12 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_view_inverse = IDENTITY_AFFINE;
   m_view_inverse_previous = IDENTITY_AFFINE;
   m_sky_mode = Config::Get(Config::GFX_REMIX_SKY_MODE);
+  m_sky_auto_detect = std::clamp(Config::Get(Config::GFX_REMIX_SKY_AUTO_DETECT), 0, 2);
+  m_sky_auto_frames =
+      static_cast<u32>(std::max(1, Config::Get(Config::GFX_REMIX_SKY_AUTO_FRAMES)));
+  m_sky_auto_min_extent = std::max(0.0f, Config::Get(Config::GFX_REMIX_SKY_AUTO_MIN_EXTENT));
+  m_sky_candidates.clear();
+  m_sky_classified.clear();
 
   // "0xabc,0xdef" -> the set of stage-0 texture hashes to treat as skybox.
   // Separators are anything that is not a hex digit or an 'x', so commas,
@@ -795,6 +819,11 @@ void RemixApi::DestroyAllHandles()
   m_view_samples.clear();
   m_view_samples_previous.clear();
   m_view_duplicate_hashes.clear();
+  // Sky classifications key off mesh hashes whose meshes have just been
+  // destroyed, and the signature that produced them was measured against a view
+  // that is about to restart from the identity.
+  m_sky_candidates.clear();
+  m_sky_classified.clear();
   m_view = IDENTITY_AFFINE;
   m_view_inverse = IDENTITY_AFFINE;
   m_view_inverse_previous = IDENTITY_AFFINE;
@@ -1113,7 +1142,8 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
                           const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices, const remixapi_Transform& transform,
                           remixapi_InstanceCategoryFlags category_flags,
-                          const DrawBlendState& blend, const float* raw_modelview)
+                          const DrawBlendState& blend, const float* raw_modelview,
+                          const DrawDiagnostics& diagnostics)
 {
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
@@ -1135,6 +1165,7 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
   {
     mesh_handle = it->second.handle;
     it->second.last_used_frame = m_frame_index;
+    it->second.diagnostics = diagnostics;
   }
   else
   {
@@ -1173,7 +1204,26 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
       return;
     }
 
-    m_meshes.emplace(mesh_hash, MeshEntry{mesh_handle, m_frame_index});
+    // Object-space bounding radius, measured once here where the decoded
+    // vertices are already in hand. The sky classifier's size gate scales this
+    // by the modelview and compares it against the far plane; without it,
+    // camera-welded geometry is indistinguishable from a dome during a
+    // translation-only window.
+    float radius_sq = 0.0f;
+    for (const remixapi_HardcodedVertex& vertex : vertices)
+    {
+      const float length_sq = vertex.position[0] * vertex.position[0] +
+                              vertex.position[1] * vertex.position[1] +
+                              vertex.position[2] * vertex.position[2];
+      radius_sq = std::max(radius_sq, length_sq);
+    }
+
+    MeshEntry entry;
+    entry.handle = mesh_handle;
+    entry.last_used_frame = m_frame_index;
+    entry.object_radius = std::sqrt(radius_sq);
+    entry.diagnostics = diagnostics;
+    m_meshes.emplace(mesh_hash, entry);
     ++m_stats.meshes_created;
   }
 
@@ -1469,6 +1519,25 @@ void RemixApi::EstimateView()
   // its position, so its translation term is the distance the object actually
   // moved rather than where it happens to sit - which puts this on the same
   // footing as the inlier test instead of scaling with distance from origin.
+  //
+  // The sky classifier rides this same loop: the ratio it needs is the one
+  // already being built here, and the two tests are complementary readings of
+  // it. Static world geometry has ratio == identity, which is what w_stable
+  // counts; a skybox has ratio == a pure translation equal to the camera's own
+  // position delta, because its modelview carries the camera's ROTATION but not
+  // its translation, so W = V^-1 * MV slides with the camera while its rotation
+  // holds still. A camera-welded overlay fails the rotation half whenever the
+  // camera turns.
+  //
+  // The camera's world position is the translation column of V^-1.
+  const float camera_delta[3] = {m_view_inverse[3] - m_view_inverse_previous[3],
+                                 m_view_inverse[7] - m_view_inverse_previous[7],
+                                 m_view_inverse[11] - m_view_inverse_previous[11]};
+  float near_plane = 0.0f;
+  float far_plane = 0.0f;
+  if (!ComputeDepthRange(near_plane, far_plane))
+    far_plane = 0.0f;
+
   for (const auto& [mesh_hash, current] : m_view_samples)
   {
     const auto previous = m_view_samples_previous.find(mesh_hash);
@@ -1485,7 +1554,116 @@ void RemixApi::EstimateView()
         AffineMultiply(AffineMultiply(m_view_inverse, current), previous_world_inverse);
     if (AffineSimilar(ratio, IDENTITY_AFFINE))
       ++m_stats.w_stable;
+    if (m_sky_auto_detect != 0)
+      ClassifySky(mesh_hash, ratio, current, camera_delta, far_plane);
   }
+
+  m_stats.sky_auto_classified = static_cast<u32>(m_sky_classified.size());
+}
+
+void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affine& modelview,
+                           const float camera_delta[3], float far_plane)
+{
+  // Sky must not flicker, so a classification is sticky for the session. It also
+  // means a classified mesh costs nothing to re-test.
+  if (m_sky_classified.count(mesh_hash) != 0)
+    return;
+
+  // Informative-frame gate. With the camera parked, or turning without
+  // translating, a skybox and the static world produce the SAME ratio and the
+  // test cannot tell them apart. Such a frame neither advances nor decays a
+  // candidate: no progress is made and nothing is mis-tagged, and the manual
+  // RemixSkyTextures / rtx.skyBoxGeometries list remains the documented
+  // fallback for exactly this case.
+  const float camera_distance = std::sqrt(camera_delta[0] * camera_delta[0] +
+                                          camera_delta[1] * camera_delta[1] +
+                                          camera_delta[2] * camera_delta[2]);
+  if (!(far_plane > 0.0f) || !(camera_distance > SKY_INFORMATIVE_FRACTION * far_plane))
+    return;
+
+  // Rotation half: the ratio's 3x3 must be the identity. A camera-welded view
+  // model fails here the moment the camera turns.
+  float rotation_diff_sq = 0.0f;
+  for (int i = 0; i < 3; ++i)
+  {
+    for (int j = 0; j < 3; ++j)
+    {
+      const float d = world_ratio[i * 4 + j] - IDENTITY_AFFINE[i * 4 + j];
+      rotation_diff_sq += d * d;
+    }
+  }
+  const bool rotation_holds = std::sqrt(rotation_diff_sq) <= SKY_ROTATION_EPSILON;
+
+  // Translation half: it must be the camera's own position delta. Static world
+  // geometry fails here - its ratio translation is zero, which is what makes
+  // this test the exact complement of w_stable.
+  const float translation_error[3] = {world_ratio[3] - camera_delta[0],
+                                      world_ratio[7] - camera_delta[1],
+                                      world_ratio[11] - camera_delta[2]};
+  const float translation_error_length =
+      std::sqrt(translation_error[0] * translation_error[0] +
+                translation_error[1] * translation_error[1] +
+                translation_error[2] * translation_error[2]);
+  const bool follows_camera =
+      translation_error_length <= SKY_TRANSLATION_RELATIVE_EPSILON * camera_distance;
+
+  // Size half: a dome spans a large fraction of the frustum. Scale the mesh's
+  // object-space radius by the modelview's largest row norm, which is the most
+  // any direction can be stretched by it.
+  float scaled_extent = 0.0f;
+  const auto mesh = m_meshes.find(mesh_hash);
+  if (mesh != m_meshes.end())
+  {
+    float max_row_norm = 0.0f;
+    for (int i = 0; i < 3; ++i)
+    {
+      const float norm = std::sqrt(modelview[i * 4 + 0] * modelview[i * 4 + 0] +
+                                   modelview[i * 4 + 1] * modelview[i * 4 + 1] +
+                                   modelview[i * 4 + 2] * modelview[i * 4 + 2]);
+      max_row_norm = std::max(max_row_norm, norm);
+    }
+    scaled_extent = mesh->second.object_radius * max_row_norm;
+  }
+  const bool big_enough = scaled_extent >= m_sky_auto_min_extent * far_plane;
+
+  if (!(rotation_holds && follows_camera && big_enough))
+  {
+    // One disagreeing INFORMATIVE frame resets an unclassified candidate. A
+    // moving object can match by coincidence; it cannot match persistently.
+    if (const auto it = m_sky_candidates.find(mesh_hash); it != m_sky_candidates.end())
+      it->second.streak = 0;
+    return;
+  }
+
+  ++m_stats.sky_auto_candidates;
+  if (m_sky_candidates.size() >= MAX_SKY_CANDIDATES && m_sky_candidates.count(mesh_hash) == 0)
+    return;
+
+  SkyCandidate& candidate = m_sky_candidates[mesh_hash];
+  ++candidate.streak;
+  ++candidate.informative_frames;
+  candidate.scaled_extent = scaled_extent;
+  if (candidate.streak < m_sky_auto_frames)
+    return;
+
+  m_sky_classified.insert(mesh_hash);
+  if (!m_log_stats || s_sky_classify_log_count >= SKY_CLASSIFY_LOG_CAP)
+    return;
+  ++s_sky_classify_log_count;
+
+  // The graduation path: everything needed to make this permanent by hand is on
+  // this line. The depth state and draw index are recorded to check the weaker
+  // signals against reality - they are not what classified anything.
+  const DrawDiagnostics& diagnostics =
+      mesh != m_meshes.end() ? mesh->second.diagnostics : DrawDiagnostics{};
+  INFO_LOG_FMT(VIDEO,
+               "Remix SKY AUTO frame {}: mesh {:#018x} tex {:#018x} | extent {:.1f} vs far {:.1f} "
+               "({:.2f}x) | {} informative frames | ztest {} zfunc {} zwrite {} draw #{} | "
+               "classified set now {}",
+               m_frame_index, mesh_hash, diagnostics.texture_hash, scaled_extent, far_plane,
+               far_plane > 0.0f ? scaled_extent / far_plane : 0.0f, candidate.informative_frames,
+               diagnostics.depth_test ? 1 : 0, diagnostics.depth_func,
+               diagnostics.depth_write ? 1 : 0, diagnostics.draw_index, m_sky_classified.size());
 }
 
 void RemixApi::LogCameraRecovery()
@@ -1527,6 +1705,30 @@ void RemixApi::LogCameraRecovery()
   // last 60" rather than "the worst frame ever".
   m_view_max_rotation_deg = 0.0f;
   m_view_max_translation = 0.0f;
+}
+
+// Union of every projection variant's depth range this frame. Taking the union
+// is what stops a draw with a longer far plane from being clipped by whichever
+// projection happened to be latched first; variant #0 is the reference, so it is
+// always included.
+bool RemixApi::ComputeDepthRange(float& near_plane, float& far_plane) const
+{
+  bool depth_valid = false;
+  for (u32 i = 0; i < m_projection_variant_count; ++i)
+  {
+    const std::array<float, 6>& variant = m_projection_variants[i].raw;
+    if (std::abs(variant[4]) <= 0.0000001f || std::abs(variant[4] - 1.0f) <= 0.0000001f)
+      continue;
+    const float variant_far = variant[5] / variant[4];
+    const float variant_near = variant[5] / (variant[4] - 1.0f);
+    // Never let a transient degenerate frustum reach the tracer.
+    if (!(variant_near > 0.0001f) || !(variant_far > variant_near))
+      continue;
+    near_plane = depth_valid ? std::min(near_plane, variant_near) : variant_near;
+    far_plane = depth_valid ? std::max(far_plane, variant_far) : variant_far;
+    depth_valid = true;
+  }
+  return depth_valid;
 }
 
 void RemixApi::SetupCamera()
@@ -1597,26 +1799,9 @@ void RemixApi::SetupCamera()
     // Depth is the one part of the projection that folding onto the instance
     // transform cannot carry: the correction leaves view-space z alone, so each
     // draw keeps its own depth range and the camera has to span all of them.
-    // Taking the union across the frame's variants is what stops a draw with a
-    // longer far plane from being clipped by whichever projection happened to
-    // be latched first. Variant #0 is the reference, so it is always included.
     float near_plane = 0.0f;
     float far_plane = 0.0f;
-    bool depth_valid = false;
-    for (u32 i = 0; i < m_projection_variant_count; ++i)
-    {
-      const std::array<float, 6>& variant = m_projection_variants[i].raw;
-      if (std::abs(variant[4]) <= 0.0000001f || std::abs(variant[4] - 1.0f) <= 0.0000001f)
-        continue;
-      const float variant_far = variant[5] / variant[4];
-      const float variant_near = variant[5] / (variant[4] - 1.0f);
-      // Never let a transient degenerate frustum reach the tracer.
-      if (!(variant_near > 0.0001f) || !(variant_far > variant_near))
-        continue;
-      near_plane = depth_valid ? std::min(near_plane, variant_near) : variant_near;
-      far_plane = depth_valid ? std::max(far_plane, variant_far) : variant_far;
-      depth_valid = true;
-    }
+    const bool depth_valid = ComputeDepthRange(near_plane, far_plane);
     if (depth_valid)
     {
       params.nearPlane = std::clamp(near_plane, 0.01f, 100.0f);
@@ -2096,7 +2281,8 @@ void RemixApi::OnAfterFrame()
                  "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
-                 "diffuse none {} sign {} | spec {} | GX ambient {}",
+                 "diffuse none {} sign {} | spec {} | GX ambient {} | sky auto: candidates {}, "
+                 "classified {}, tagged {} (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
@@ -2108,7 +2294,8 @@ void RemixApi::OnAfterFrame()
                  m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
                  m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
-                 m_stats.ambient_bright ? "bright" : "dim");
+                 m_stats.ambient_bright ? "bright" : "dim", m_stats.sky_auto_candidates,
+                 m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_sky_auto_detect);
   }
 
   LogProjectionVariants();
