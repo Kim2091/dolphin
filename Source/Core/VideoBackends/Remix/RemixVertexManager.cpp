@@ -371,7 +371,37 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // ---- Decode the vertex stream ------------------------------------------
 
   const bool per_vertex_matrix = decl.posmtx.enable;
-  const bool bake_vertices = per_vertex_matrix;
+
+  // A matrix-palette draw very often names only ONE matrix: the vertex format
+  // carries the attribute because the game set it up that way, but the object
+  // is rigid. Those do not need baking, and baking them is expensive - a baked
+  // draw hashes transformed vertex bytes, so it mints a fresh mesh handle every
+  // frame the camera moves and leans on the 300-frame reaper to clean up after
+  // it. Left in object space with the single matrix on the instance instead,
+  // the hash is stable: one handle, reused, and with usable motion vectors.
+  //
+  // Costs one extra pass over the posmtx attribute, which is 4 bytes a vertex.
+  u32 uniform_matrix_index = 0;
+  bool uniform_matrix = per_vertex_matrix;
+  if (per_vertex_matrix)
+  {
+    std::memcpy(&uniform_matrix_index, m_base_buffer_pointer + decl.posmtx.offset, sizeof(u32));
+    uniform_matrix_index &= 0x3f;
+    for (u32 i = 1; i < vertex_count; ++i)
+    {
+      u32 index = 0;
+      std::memcpy(&index, m_base_buffer_pointer + static_cast<size_t>(i) * stride + decl.posmtx.offset,
+                  sizeof(u32));
+      if ((index & 0x3f) != uniform_matrix_index)
+      {
+        uniform_matrix = false;
+        break;
+      }
+    }
+  }
+  // Only genuinely multi-matrix geometry gets its vertices transformed.
+  const bool bake_vertices = per_vertex_matrix && !uniform_matrix;
+
   const int position_components = std::min(decl.position.components, 3);
   const bool has_normals = decl.normals[0].enable;
   const bool has_texcoord = decl.texcoords[0].enable;
@@ -536,7 +566,13 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // the GX pipeline, so this is an object-to-VIEW transform; either the camera
     // sits at the origin and it doubles as object-to-world, or camera recovery
     // is on and RemixApi turns it into one (see RemixApi::SetupCamera).
-    raw_modelview = &xfmem.posMatrices[g_main_cp_state.matrix_index_a.PosNormalMtxIdx * 4];
+    //
+    // A single-matrix palette draw takes the matrix its vertices all named;
+    // everything else takes the CP-state one.
+    const u32 matrix_index =
+        uniform_matrix ? uniform_matrix_index :
+                         static_cast<u32>(g_main_cp_state.matrix_index_a.PosNormalMtxIdx);
+    raw_modelview = &xfmem.posMatrices[matrix_index * 4];
     std::memcpy(&transform.matrix[0][0], raw_modelview, sizeof(float) * 12);
   }
 

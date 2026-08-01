@@ -1077,7 +1077,13 @@ void RemixApi::EstimateView()
   }
   m_stats.view_inliers = best_inliers;
 
-  const u32 required = std::max<u32>(3, static_cast<u32>(deltas.size()) / 4);
+  // Consensus needed to believe the winner. A pure fraction of the sample count
+  // is wrong: outliers are part of that count, so a frame full of moving objects
+  // raises the bar to accept the static ones - the opposite of what should
+  // happen. Capping it fixes that. A dozen objects agreeing on a rigid delta is
+  // decisive evidence whether they share the frame with five movers or fifty.
+  const u32 required =
+      std::clamp<u32>(static_cast<u32>(deltas.size()) / 4, 3, MAX_VIEW_CONSENSUS_REQUIRED);
   if (!deltas.empty() && best_inliers >= required && AffineIsRigid(deltas[best]))
   {
     m_view_miss_streak = 0;

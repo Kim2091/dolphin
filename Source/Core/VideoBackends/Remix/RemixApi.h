@@ -232,6 +232,12 @@ private:
   // than world geometry, and a bad vote costs more than a missing one.
   static constexpr u32 MIN_VIEW_SAMPLE_VERTICES = 16;
   static constexpr u32 VIEW_MISS_STREAK_BEFORE_REANCHOR = 4;
+  // Ceiling on how many agreeing draws the consensus may demand, so that a
+  // scene full of moving objects cannot price the static ones out of the vote.
+  // Six draws agreeing on one rigid delta is already decisive - they would have
+  // to be moving in exact lockstep to fake it - and a genuine cut fails on
+  // having almost no correspondences at all, not on this number.
+  static constexpr u32 MAX_VIEW_CONSENSUS_REQUIRED = 6;
 
   void OnAfterFrame();
   void LogProjectionVariants();
