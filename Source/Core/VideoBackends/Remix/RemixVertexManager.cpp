@@ -89,6 +89,111 @@ u32 ToRemixVertexColor(u32 dolphin_color)
          ((dolphin_color & 0x000000FFu) << 16);
 }
 
+// xfmem.matColor is a u32 whose bytes are R, G, B, A from the high end down
+// (TransformUnit.cpp:329 memcpys it into an ABGR-indexed array, and 372 takes
+// alpha from the low byte). Remix wants the same B, G, R, A memory order the
+// vertex colour uses.
+u32 MatColorToRemix(u32 mat_color)
+{
+  const u32 r = (mat_color >> 24) & 0xFFu;
+  const u32 g = (mat_color >> 16) & 0xFFu;
+  const u32 b = (mat_color >> 8) & 0xFFu;
+  const u32 a = mat_color & 0xFFu;
+  return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+// Which vertex colour attribute feeds XF colour channel `channel`, or -1 when
+// nothing does. Mirrors ParseColorAttributes (SWVertexLoader.cpp:163-190): the
+// hardware does not require the two attributes to be populated in order, so a
+// vertex carrying only colour1 has it redirected to channel 0 - and channel 1
+// then has no vertex source at all.
+int VertexSlotForChannel(const PortableVertexDeclaration& decl, u32 channel)
+{
+  if (decl.colors[0].enable)
+    return channel == 0 ? 0 : (decl.colors[1].enable ? 1 : -1);
+  if (decl.colors[1].enable)
+    return channel == 0 ? 1 : -1;
+  return -1;
+}
+
+// What TEV stage 0 rasterizes as its colour, reduced to something Remix can
+// apply. GX resolves this per vertex in the XF unit (TransformColor,
+// TransformUnit.cpp:316-375); we borrow all of it except the lighting
+// accumulation, which the path tracer replaces.
+//
+// Two rules are easy to miss and both were being missed. Stage 0 does not
+// necessarily rasterize channel 0 - bpmem.tevorders names the channel. And when
+// that channel's matsource is MatColorRegister the vertex colour is ignored
+// ENTIRELY and xfmem.matColor supplies the colour, which is how games tint
+// objects through GXSetChanMatColor; every such tint was being dropped.
+//
+// A channel past xfmem.numChan.numColorChans reads as zero in the real pipeline
+// (VertexShaderGen.cpp:910-916). Passing that on as black would be faithful to a
+// TEV we are not emulating and would turn geometry black wherever stage 0 does
+// not actually consume the raster colour, so it resolves to "no tint" instead.
+struct RasterColor
+{
+  // Vertex colour attribute to hand Remix, or -1 to write opaque white. Writing
+  // white when the colour is unused is not just tidiness: vertex bytes are part
+  // of the mesh hash, so a draw tinted through the register keeps one mesh
+  // handle across every tint it is drawn with.
+  int vertex_slot = -1;
+  u8 arg2 = REMIX_TEX_ARG_NONE;
+  u32 tfactor = 0xFFFFFFFFu;
+  bool baked_lighting = false;
+};
+
+RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_semantics)
+{
+  RasterColor out;
+
+  // Pre-fix behaviour, kept as a clean A/B: channel 0's vertex colour whatever
+  // the draw actually rasterizes, and no texture-stage state - which leaves the
+  // runtime at defaults that never read a vertex colour at all.
+  if (!gx_semantics)
+  {
+    out.vertex_slot = VertexSlotForChannel(decl, 0);
+    return out;
+  }
+
+  u32 channel;
+  switch (bpmem.tevorders[0].getColorChan(0))
+  {
+  case RasColorChan::Color0:
+    channel = 0;
+    break;
+  case RasColorChan::Color1:
+    channel = 1;
+    break;
+  default:
+    // Alpha bump or a hardwired zero: not a lit colour channel at all.
+    return out;
+  }
+
+  if (channel >= xfmem.numChan.numColorChans)
+    return out;
+
+  const LitChannel& color_channel = xfmem.color[channel];
+  if (color_channel.matsource == MatSource::MatColorRegister)
+  {
+    out.arg2 = REMIX_TEX_ARG_TFACTOR;
+    out.tfactor = MatColorToRemix(xfmem.matColor[channel]);
+    return out;
+  }
+
+  out.vertex_slot = VertexSlotForChannel(decl, channel);
+  if (out.vertex_slot < 0)
+    return out;
+
+  out.arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
+  // With lighting off the channel colour IS the vertex colour, which on GC is
+  // overwhelmingly baked lighting - that is why the games use it. With lighting
+  // on, the vertex colour is the material term the hardware multiplies the
+  // lights into, so it is a real material colour and must not be normalized.
+  out.baked_lighting = !color_channel.enablelighting;
+  return out;
+}
+
 void ReadFloats(const u8* src, float* dst, int count)
 {
   std::memcpy(dst, src, sizeof(float) * static_cast<size_t>(count));
@@ -406,11 +511,29 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   const bool has_normals = decl.normals[0].enable;
   const bool has_texcoord = decl.texcoords[0].enable;
   const int texcoord_components = has_texcoord ? std::min(decl.texcoords[0].components, 2) : 0;
-  // A vertex carrying only color1 feeds channel 0 - the hardware does not
-  // require the channels to be populated in order (VertexShaderGen.cpp does the
-  // same substitution). Reading colors[0] unconditionally turned that geometry
-  // white.
-  const int color_slot = decl.colors[0].enable ? 0 : (decl.colors[1].enable ? 1 : -1);
+
+  // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
+  const RasterColor raster_color = ResolveRasterColor(decl, g_remix_api->GxColorEnabled());
+  const int color_slot = raster_color.vertex_slot;
+  switch (raster_color.arg2)
+  {
+  case REMIX_TEX_ARG_VERTEX_COLOR0:
+    ++stats.color_vertex;
+    break;
+  case REMIX_TEX_ARG_TFACTOR:
+    ++stats.color_register;
+    break;
+  default:
+    ++stats.color_none;
+    break;
+  }
+
+  DrawBlendState blend;
+  blend.color_arg1 = REMIX_TEX_ARG_TEXTURE;
+  blend.color_arg2 = raster_color.arg2;
+  blend.color_operation = REMIX_TEX_OP_MODULATE;
+  blend.tfactor = raster_color.tfactor;
+  blend.vertex_color_is_baked_lighting = raster_color.baked_lighting;
 
   m_vertices.clear();
   m_vertices.resize(vertex_count);
@@ -644,7 +767,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   }
 
   g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
-  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags,
+  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags, blend,
                           raw_modelview);
 }
 

@@ -176,6 +176,13 @@ const Info<bool> GFX_REMIX_TRACE_PROJECTIONS{
 // world space holds still. Off is byte-identical to the identity-view path.
 const Info<bool> GFX_REMIX_CAMERA_RECOVERY{{System::GFX, "Settings", "RemixCameraRecovery"},
                                            false};
+// Resolve what TEV stage 0 actually rasterizes as its colour - the channel named
+// by tevorders, and either the vertex colour or the xfmem.matColor register
+// depending on that channel's material source - and hand it to Remix as a
+// texture-stage argument so it modulates albedo. Off leaves the runtime at its
+// defaults, where the vertex colour reaches the geometry buffer but nothing ever
+// reads it and a register tint is lost outright.
+const Info<bool> GFX_REMIX_GX_COLOR{{System::GFX, "Settings", "RemixGxColor"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

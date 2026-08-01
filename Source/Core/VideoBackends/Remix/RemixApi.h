@@ -72,6 +72,15 @@ struct FrameStats
   u32 w_stable = 0;
   u32 w_compared = 0;
 
+  // Where TEV stage 0's rasterized colour came from, by GX's own rules.
+  // `color_register` is the case that was being dropped outright - a game
+  // tinting geometry through GXSetChanMatColor - and `color_none` counts draws
+  // whose stage 0 does not rasterize an enabled colour channel at all, which
+  // read as untinted.
+  u32 color_vertex = 0;
+  u32 color_register = 0;
+  u32 color_none = 0;
+
   // XF lights by the kind they resolved to. Distant vs sphere is the whole
   // point of reading the attenuation function - a game whose suns show up as
   // spheres is a game rendering nearly black.
@@ -88,6 +97,52 @@ struct MaterialRef
 {
   remixapi_MaterialHandle handle = nullptr;
   u64 hash = 0;
+};
+
+// Remix's RtTextureArgSource, as passed through remixapi_InstanceInfoBlendEXT.
+// Named here because the C header carries the fields as bare uint32_t.
+enum : u8
+{
+  REMIX_TEX_ARG_NONE = 0,
+  REMIX_TEX_ARG_TEXTURE = 1,
+  REMIX_TEX_ARG_VERTEX_COLOR0 = 2,
+  REMIX_TEX_ARG_TFACTOR = 3,
+};
+
+// Remix's DxvkRtTextureOperation (D3DTEXTUREOP by another name).
+enum : u8
+{
+  REMIX_TEX_OP_DISABLE = 0,
+  REMIX_TEX_OP_SELECT_ARG1 = 1,
+  REMIX_TEX_OP_SELECT_ARG2 = 2,
+  REMIX_TEX_OP_MODULATE = 3,
+};
+
+// The parts of a draw's GX state that Remix consumes per INSTANCE rather than
+// per material, through remixapi_InstanceInfoBlendEXT. Deliberately outside
+// material and mesh identity: two draws differing only here still share one mesh
+// handle, which is the whole reason a per-draw register tint goes in tfactor
+// rather than being baked into the vertex colours.
+//
+// The defaults reproduce the runtime's own defaults for an instance with no
+// BlendEXT attached, so attaching one with this struct untouched changes
+// nothing.
+struct DrawBlendState
+{
+  u8 color_arg1 = REMIX_TEX_ARG_TEXTURE;
+  u8 color_arg2 = REMIX_TEX_ARG_NONE;
+  u8 color_operation = REMIX_TEX_OP_MODULATE;
+  u8 alpha_arg1 = REMIX_TEX_ARG_TEXTURE;
+  u8 alpha_arg2 = REMIX_TEX_ARG_NONE;
+  u8 alpha_operation = REMIX_TEX_OP_SELECT_ARG1;
+  // Packed 0xAARRGGBB - Remix reads tFactor as B8G8R8A8, the same packing as
+  // remixapi_HardcodedVertex::color.
+  u32 tfactor = 0xFFFFFFFFu;
+  // GC/Wii geometry very often carries lighting baked into its vertex colours.
+  // The runtime divides such a colour by its own largest component so only the
+  // hue survives and the path tracer supplies the brightness; that is wrong when
+  // the vertex colour is a genuine material colour instead.
+  bool vertex_color_is_baked_lighting = false;
 };
 
 // Owner of everything that talks to the Remix runtime. Created by
@@ -142,6 +197,11 @@ public:
   // the reference projection.
   bool ProjectionFixEnabled() const { return m_projection_fix; }
 
+  // False submits the raw vertex colour and no texture-stage state at all, which
+  // is the pre-fix behaviour: the runtime's defaults never read a vertex colour
+  // and have no way to hear about xfmem.matColor.
+  bool GxColorEnabled() const { return m_gx_color; }
+
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
   // alpha_test_type / alpha_reference come from the draw's GX alpha test and
@@ -167,7 +227,8 @@ public:
   void SubmitMesh(const MaterialRef& material,
                   const std::vector<remixapi_HardcodedVertex>& vertices,
                   const std::vector<u32>& indices, const remixapi_Transform& transform,
-                  remixapi_InstanceCategoryFlags category_flags, const float* raw_modelview);
+                  remixapi_InstanceCategoryFlags category_flags, const DrawBlendState& blend,
+                  const float* raw_modelview);
 
   FrameStats& Stats() { return m_stats; }
 
@@ -222,6 +283,7 @@ private:
     remixapi_MeshHandle mesh = nullptr;
     remixapi_Transform transform = {};
     remixapi_InstanceCategoryFlags category_flags = 0;
+    DrawBlendState blend;
     u64 mesh_hash = 0;
   };
   // How many draws may vote on the camera delta, and how many of those the
@@ -277,6 +339,7 @@ private:
   u32 m_projection_variant_count = 0;
   bool m_projection_fix = true;
   bool m_trace_projections = false;
+  bool m_gx_color = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is

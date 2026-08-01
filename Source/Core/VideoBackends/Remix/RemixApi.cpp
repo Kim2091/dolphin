@@ -331,6 +331,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_camera_recovery = Config::Get(Config::GFX_REMIX_CAMERA_RECOVERY);
+  m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
   m_view = IDENTITY_AFFINE;
@@ -894,7 +895,7 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
                           const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices, const remixapi_Transform& transform,
                           remixapi_InstanceCategoryFlags category_flags,
-                          const float* raw_modelview)
+                          const DrawBlendState& blend, const float* raw_modelview)
 {
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
@@ -972,7 +973,8 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
     m_view_samples.emplace(mesh_hash, modelview);
   }
 
-  m_pending_instances.push_back(PendingInstance{mesh_handle, transform, category_flags, mesh_hash});
+  m_pending_instances.push_back(
+      PendingInstance{mesh_handle, transform, category_flags, blend, mesh_hash});
 }
 
 void RemixApi::FlushPendingInstances()
@@ -990,9 +992,34 @@ void RemixApi::FlushPendingInstances()
     if (m_next_picking_value == 0)
       m_next_picking_value = 1;
 
+    // Fixed-function texture-stage state. Without it the runtime keeps its own
+    // defaults - argument 1 is the texture, argument 2 is nothing - and the
+    // vertex colour we so carefully decode reaches the geometry buffer only to
+    // be read by no one. Everything GX resolves per draw rather than per
+    // material rides here rather than in the material, so it cannot split a mesh
+    // handle.
+    remixapi_InstanceInfoBlendEXT blend = {};
+    blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+    blend.pNext = &picking;
+    blend.textureColorArg1Source = pending.blend.color_arg1;
+    blend.textureColorArg2Source = pending.blend.color_arg2;
+    blend.textureColorOperation = pending.blend.color_operation;
+    blend.textureAlphaArg1Source = pending.blend.alpha_arg1;
+    blend.textureAlphaArg2Source = pending.blend.alpha_arg2;
+    blend.textureAlphaOperation = pending.blend.alpha_operation;
+    blend.tFactor = pending.blend.tfactor;
+    blend.isVertexColorBakedLighting = pending.blend.vertex_color_is_baked_lighting ? 1 : 0;
+    // Alpha test and blending stay on the material for now (the material sets
+    // useDrawCallAlphaState = 0, so the runtime reads them from there and these
+    // fields are inert). Left explicit so it is obvious they are not being
+    // silently defaulted to something the material contradicts.
+    blend.alphaTestEnabled = 0;
+    blend.alphaTestCompareOp = 7;  // Always
+    blend.alphaBlendEnabled = 0;
+
     remixapi_InstanceInfo instance = {};
     instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    instance.pNext = &picking;
+    instance.pNext = m_gx_color ? static_cast<void*>(&blend) : static_cast<void*>(&picking);
     instance.categoryFlags = pending.category_flags;
     instance.mesh = pending.mesh;
     // The submitted transform is V^-1 * (C * MV), and the camera is V, so Remix
@@ -1633,13 +1660,14 @@ void RemixApi::OnAfterFrame()
   {
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
-                 "| meshes created {} (live {}) | instances {} (sky {}) | lights {} distant, {} "
-                 "sphere ({} spot)",
+                 "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
+                 "register, {} none | lights {} distant, {} sphere ({} spot)",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
-                 m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws,
-                 m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot);
+                 m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
+                 m_stats.color_register, m_stats.color_none, m_stats.lights_distant,
+                 m_stats.lights_sphere, m_stats.lights_spot);
   }
 
   LogProjectionVariants();
