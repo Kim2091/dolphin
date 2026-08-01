@@ -36,6 +36,7 @@ struct FrameStats
   u32 skipped_degenerate = 0;
   u32 meshes_created = 0;
   u32 instances_drawn = 0;
+  u32 sky_draws = 0;
 };
 
 // Result of resolving a draw's stage-0 texture to a Remix material. The hash is
@@ -84,11 +85,35 @@ public:
                              u8 wrap_mode_v);
 
   // Creates the mesh on a cache miss and always draws one instance of it.
+  // category_flags is per-instance (REMIXAPI_INSTANCE_CATEGORY_BIT_*) and so is
+  // deliberately NOT folded into the mesh hash - the same geometry tagged two
+  // ways still shares one mesh handle, which is what we want.
   void SubmitMesh(const MaterialRef& material,
                   const std::vector<remixapi_HardcodedVertex>& vertices,
-                  const std::vector<u32>& indices, const remixapi_Transform& transform);
+                  const std::vector<u32>& indices, const remixapi_Transform& transform,
+                  remixapi_InstanceCategoryFlags category_flags);
 
   FrameStats& Stats() { return m_stats; }
+
+  // Cached at Initialize rather than read per draw - the classifier runs on
+  // every batch, and Config::Get is not free at that rate.
+  // 0 = ignore the depth heuristic, 1 = tag as sky, 2 = drop sky draws. The
+  // heuristic is off by default: it matched the wrong draws in practice (clouds
+  // and overlays rather than the horizon dome, which is drawn depth-tested).
+  int SkyMode() const { return m_sky_mode; }
+
+  // True when this stage-0 texture was listed in GFX_REMIX_SKY_TEXTURES. This
+  // is the reliable route to sky: the runtime's texture-grid categories never
+  // reach API draws, but the SKY bit passed on the instance does.
+  bool IsSkyTexture(u64 content_hash) const
+  {
+    return !m_sky_textures.empty() && m_sky_textures.count(content_hash) != 0;
+  }
+
+  // True on the occasional frame we dump per-draw depth state on, so the sky
+  // heuristic can be checked against what the game actually emits instead of
+  // being guessed at. Bounded to one frame in 120, first few draws only.
+  bool ShouldTraceDraws() const { return m_log_stats && (m_frame_index % 120) == 0; }
 
 private:
   struct MeshEntry
@@ -139,6 +164,11 @@ private:
   FrameStats m_stats;
   u64 m_frame_index = 0;
   bool m_log_stats = true;
+  int m_sky_mode = 0;
+  std::unordered_set<u64> m_sky_textures;
+  // Per-frame object-picking id. Must be non-zero for the runtime to record a
+  // pick, and must differ per draw for clicks to resolve to one surface.
+  u32 m_next_picking_value = 1;
   float m_light_scale = 1.0f;
 };
 

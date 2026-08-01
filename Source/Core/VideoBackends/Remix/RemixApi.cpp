@@ -140,6 +140,37 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
     return true;
 
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
+  m_sky_mode = Config::Get(Config::GFX_REMIX_SKY_MODE);
+
+  // "0xabc,0xdef" -> the set of stage-0 texture hashes to treat as skybox.
+  // Separators are anything that is not a hex digit or an 'x', so commas,
+  // spaces and newlines all work.
+  m_sky_textures.clear();
+  const std::string sky_list = Config::Get(Config::GFX_REMIX_SKY_TEXTURES);
+  for (size_t i = 0; i < sky_list.size();)
+  {
+    if (std::isxdigit(static_cast<unsigned char>(sky_list[i])) == 0)
+    {
+      ++i;
+      continue;
+    }
+    size_t consumed = 0;
+    try
+    {
+      const u64 hash = std::stoull(sky_list.substr(i), &consumed, 16);
+      if (hash != 0)
+        m_sky_textures.insert(hash);
+    }
+    catch (const std::exception&)
+    {
+      // Malformed or out-of-range entry: skip this token rather than take the
+      // whole backend down over a typo in a config string.
+      consumed = 0;
+    }
+    i += std::max<size_t>(consumed, 1);
+  }
+  if (!m_sky_textures.empty())
+    INFO_LOG_FMT(VIDEO, "Remix: {} sky texture hash(es) configured", m_sky_textures.size());
   m_light_scale = Config::Get(Config::GFX_REMIX_LIGHT_SCALE);
 
   const std::string dll_path_utf8 = Config::Get(Config::GFX_REMIX_DLL_PATH);
@@ -548,7 +579,8 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
 
 void RemixApi::SubmitMesh(const MaterialRef& material,
                           const std::vector<remixapi_HardcodedVertex>& vertices,
-                          const std::vector<u32>& indices, const remixapi_Transform& transform)
+                          const std::vector<u32>& indices, const remixapi_Transform& transform,
+                          remixapi_InstanceCategoryFlags category_flags)
 {
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
@@ -612,10 +644,21 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
     ++m_stats.meshes_created;
   }
 
+  // Object picking: the runtime only records a pick for a non-zero value, and
+  // only resolves a click to a texture when the draw carries one. Without this
+  // the dev menu highlights API geometry on hover (that path reads the picking
+  // buffer directly) but clicking selects nothing.
+  remixapi_InstanceInfoObjectPickingEXT picking = {};
+  picking.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_OBJECT_PICKING_EXT;
+  picking.pNext = nullptr;
+  picking.objectPickingValue = m_next_picking_value++;
+  if (m_next_picking_value == 0)
+    m_next_picking_value = 1;
+
   remixapi_InstanceInfo instance = {};
   instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-  instance.pNext = nullptr;
-  instance.categoryFlags = 0;
+  instance.pNext = &picking;
+  instance.categoryFlags = category_flags;
   instance.mesh = mesh_handle;
   instance.transform = transform;
   // v1 pins double-sided: GC winding under our right-handed identity view is
@@ -941,11 +984,11 @@ void RemixApi::OnAfterFrame()
   {
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} | meshes "
-                 "created {} (live {}) | instances {}",
+                 "created {} (live {}) | instances {} (sky {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.meshes_created, m_meshes.size(),
-                 m_stats.instances_drawn);
+                 m_stats.instances_drawn, m_stats.sky_draws);
   }
 
   m_stats = {};

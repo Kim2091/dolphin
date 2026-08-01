@@ -140,6 +140,20 @@ const Info<std::string> GFX_REMIX_DLL_PATH{{System::GFX, "Settings", "RemixDllPa
 const Info<float> GFX_REMIX_SCENE_SCALE{{System::GFX, "Settings", "RemixSceneScale"}, 1.0f};
 const Info<float> GFX_REMIX_LIGHT_SCALE{{System::GFX, "Settings", "RemixLightScale"}, 1.0f};
 const Info<bool> GFX_REMIX_LOG_STATS{{System::GFX, "Settings", "RemixLogStats"}, true};
+// What to do with draws the sky heuristic matches:
+//   0 = nothing (submit them as ordinary world geometry)
+//   1 = tag REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
+//   2 = drop them entirely, leaving clear sky for Remix's own atmosphere
+// 2 exists because tagging alone still hands Remix geometry to render as the
+// skybox, which can occlude a replacement atmosphere just as the raw draw did.
+const Info<int> GFX_REMIX_SKY_MODE{{System::GFX, "Settings", "RemixSkyMode"}, 0};
+// Comma-separated stage-0 texture hashes (as logged by the Remix backend, e.g.
+// "0x8b1d0f1752d9a3c1,0x…") whose draws are the skybox. Explicit hashes beat a
+// depth-state heuristic: the runtime's own texture-grid categories cannot reach
+// API-submitted draws, because cameraType is frozen from the instance's API
+// category flags before the grid's texture-category lookup ever runs. Passing
+// the SKY bit ourselves is the path that does work.
+const Info<std::string> GFX_REMIX_SKY_TEXTURES{{System::GFX, "Settings", "RemixSkyTextures"}, ""};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstring>
 
+#include "Common/Logging/Log.h"
+
 #include "VideoBackends/Remix/RemixApi.h"
 #include "VideoBackends/Remix/RemixTexture.h"
 
@@ -25,6 +27,22 @@ namespace
 // Dolphin's vertex loader writes vertex colors as a u32 whose memory order is
 // R, G, B, A. Remix reads remixapi_HardcodedVertex::color as
 // VK_FORMAT_B8G8R8A8_UNORM, i.e. memory order B, G, R, A. Swap the two ends.
+// A GC/Wii skybox is geometry that everything else is meant to draw over: it
+// carries no usable depth, so it is emitted with the depth test off (or set to
+// Always) AND with depth writes off. Both halves are required. Depth-write-off
+// on its own is the ordinary signature of alpha-blended geometry, which must
+// stay world geometry; it is the absent depth *test* that says "nothing is ever
+// behind this", which is exactly what sky means.
+//
+// Tagging matters beyond looks: an untagged skybox is near geometry to the path
+// tracer, so it occludes Remix's own sky/atmosphere instead of being replaced
+// by it.
+bool IsSkyDraw(const ZMode& zmode)
+{
+  const bool depth_test_off = !zmode.test_enable || zmode.func == CompareMode::Always;
+  return depth_test_off && !zmode.update_enable;
+}
+
 u32 ToRemixVertexColor(u32 dolphin_color)
 {
   return (dolphin_color & 0xFF00FF00u) | ((dolphin_color >> 16) & 0x000000FFu) |
@@ -65,6 +83,7 @@ void Normalize(float* v)
     v[2] /= length;
   }
 }
+
 }  // namespace
 
 VertexManager::VertexManager() = default;
@@ -328,7 +347,46 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     std::memcpy(&transform.matrix[0][0], matrix, sizeof(float) * 12);
   }
 
-  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform);
+  // Two routes to sky. The explicit texture list is the reliable one - it names
+  // the exact skybox texture, so it cannot mistake clouds or overlays for the
+  // horizon dome the way the depth heuristic did. The heuristic remains behind
+  // RemixSkyMode for games where the hash is not known yet, defaulted off.
+  const int sky_mode = g_remix_api->SkyMode();
+  const bool is_sky = (albedo != nullptr && g_remix_api->IsSkyTexture(albedo->GetContentHash())) ||
+                      (sky_mode != 0 && IsSkyDraw(bpmem.zmode));
+  if (is_sky)
+    ++stats.sky_draws;
+
+  // Mode 2 drops sky geometry outright. Tagging it as sky still hands Remix
+  // something to draw where the sky is; removing it is the only way to leave
+  // that volume genuinely empty for a replacement atmosphere.
+  if (is_sky && sky_mode == 2)
+    return;
+
+  remixapi_InstanceCategoryFlags category_flags = 0;
+  if (is_sky)
+    category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+
+  // Trace the draws the heuristic MATCHED (plus a couple that it did not, for
+  // contrast) - knowing what got tagged is what says whether the heuristic is
+  // picking out the skybox or just hoovering up every depth-test-less draw.
+  if (g_remix_api->ShouldTraceDraws() &&
+      ((is_sky && stats.sky_draws <= 8) || (!is_sky && stats.instances_drawn < 3)))
+  {
+    // Log the TEXTURE content hash, not the material hash - the texture hash is
+    // what RemixSkyTextures matches on. The material hash folds in sampler bits
+    // and would silently never match.
+    INFO_LOG_FMT(VIDEO,
+                 "Remix {} draw: ztest {} zfunc {} zwrite {} | blend {} | verts {} tris {} | "
+                 "tex {:#018x}",
+                 is_sky ? "SKY" : "world", bpmem.zmode.test_enable ? 1 : 0,
+                 static_cast<u32>(bpmem.zmode.func.Value()), bpmem.zmode.update_enable ? 1 : 0,
+                 bpmem.blendmode.blend_enable ? 1 : 0, out_vertices->size(),
+                 out_indices->size() / 3,
+                 albedo != nullptr ? albedo->GetContentHash() : 0);
+  }
+
+  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags);
 }
 
 }  // namespace Remix
