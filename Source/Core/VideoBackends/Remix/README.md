@@ -124,6 +124,7 @@ reverting to exactly the pre-fix behaviour when set to `False`:
 | `RemixGxRasChannel` | `True` | Takes the rasterized colour channel from the TEV stage that actually reads `RasColor`/`RasAlpha`, not from stage 0. GX names that channel per stage, and the consuming stage is routinely not stage 0. World draws only; `RemixUiRasChannel` governs the UI overlay. |
 | `RemixUiRasChannel` | `True` | The same rule for orthographic (UI overlay) draws. **This is the knob that removes Wind Waker's leaked title-screen HUD** — hearts, D-pad, item icons, the R counter. Not settled: the same build was also missing PRESS START and produced an empty overlay on one frame, so it may over-suppress. `False` reinstates the leak. Judge it on a frame that contains PRESS START, never on one without. |
 | `RemixWorldScissorSkip` | `True` | Skips world draws whose scissor result is empty. The world path read scissor state nowhere, so a draw the game hid by scissoring it away was drawn in full — and cast shadows. Only the all-or-nothing case is acted on; a path tracer has no screen-space clip. |
+| `RemixViewportFix` | `True` | Folds each draw's `xfmem.viewport` difference from the frame's reference rect into its instance transform, alongside the projection fold and through the same affine. Without it a draw the game gave a sub-screen rect — F-Zero GX's position-ladder portraits, PiP panels — is rendered through the reference rect and lands in the middle of the world. Reduces term-for-term to the projection-only correction when the rects match, so a game that never moves its viewport (Wind Waker measures `viewport changes 0`) is bit-identical either way. Does nothing while `RemixProjectionFix` is off. |
 
 **Performance:** the main lever is `RemixUiOverlayScale` (default `1.0`). The UI
 overlay is rasterized on the CPU and is fill-rate bound, so `0.5` quarters its
@@ -149,7 +150,11 @@ rasterizer composited as a screen overlay.
 
 **Known broken or missing:**
 
-- Split-screen — `xfmem.viewport` is only partly honoured.
+- Split-screen — one world camera cannot express two views. Each half carries its
+  own view matrix, and `RemixViewportFix` folds *placement*, not a second camera:
+  it puts the reference player's draws in their half and leaves the other
+  player's wrong. Sub-screen viewports that share the frame's view — PiP
+  portraits, position ladders, viewmodel-style rects — are handled.
 - BC-compressed custom texture packs, and mipmaps.
 - Points and lines are not submitted.
 - Skinned characters can ghost: matrix-palette draws are CPU-transformed and

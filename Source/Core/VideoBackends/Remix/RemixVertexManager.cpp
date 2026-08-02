@@ -1032,12 +1032,54 @@ void GenerateTexCoord(const TexGenState& state, const u8* vertex,
 // reference draw does not correct to identity, it corrects by its own shear.
 // That is the point - the camera dropped raw[1]/raw[3], so even the draw that
 // defined the camera has to have them folded back in.
+//
+// The VIEWPORT is the same problem one step further out, and it folds into the
+// same affine. GX finishes the mapping to the EFB per draw as
+//   screen.x = (clip.x / clip.w) * wd + cx      (Clipper.cpp:553-554)
+// with cx the scissor-adjusted centre. Remix's one camera renders the CENTRED
+// reference projection into the full presented image - which is to say, into
+// the REFERENCE draw's rect. Requiring that camera to land the corrected point
+// x' on the same EFB pixel the draw's own projection and viewport would land x,
+// with z (and therefore w) untouched:
+//   raw0_r*x'*wd_r + cx_r*(-z) == (raw0_d*x + raw1_d*z)*wd_d + cx_d*(-z)
+//   =>  x' = [(wd_d*raw0_d)/(wd_r*raw0_r)]*x
+//          + [(wd_d*raw1_d - (cx_d - cx_r))/(wd_r*raw0_r)]*z
+// and likewise for y through ht, cy, raw[2] and raw[3]. Still a scale plus a
+// shear along z with no perspective term, so it composes onto the instance
+// transform exactly as before.
+//
+// Two things worth reading off that result. First, it is the end-to-end
+// solution rather than two corrections applied in sequence, so the composition
+// ORDER cannot resurface as a bug: expanded, it is viewport OUTERMOST (scale
+// a'*a, shear a'*b + b'), and the other order - which would scale the viewport
+// offset by the draw's FOV ratio - is simply not what the algebra says.
+// Second, cx_r appears only as a DIFFERENCE against cx_d, and wd_r only as the
+// scale the camera implicitly renders at: the reference's own offset never
+// enters the target side, for exactly the reason raw[1]_r/raw[3]_r do not - the
+// camera does not apply it.
+//
+// With the draw's viewport equal to the reference's, wd_d/wd_r is 1 and
+// cx_d - cx_r is 0, and every term reduces to the projection-only expression
+// above. That is the regression guarantee, and it is why there is one
+// correction here and not two mechanisms.
 struct ProjectionCorrection
 {
   float x_scale = 1.0f;
   float x_shear = 0.0f;
   float y_scale = 1.0f;
   float y_shear = 0.0f;
+};
+
+// One draw's viewport expressed against the frame's reference viewport, in the
+// two dimensionless terms the correction above needs. The defaults are the
+// identity: a draw sharing the reference rect, and every draw at all when
+// RemixViewportFix is off.
+struct ViewportFold
+{
+  float x_scale = 1.0f;
+  float y_scale = 1.0f;
+  float x_offset = 0.0f;
+  float y_offset = 0.0f;
 };
 
 // Past this ratio the reference is not a plausible frustum for the draw, and
@@ -1058,6 +1100,7 @@ enum class CorrectionResult
 
 CorrectionResult BuildProjectionCorrection(const std::array<float, 6>& draw,
                                            const std::array<float, 6>& reference,
+                                           const ViewportFold& viewport,
                                            ProjectionCorrection& out)
 {
   // A reference with no x or y scale is not a frustum at all; there is nothing
@@ -1067,10 +1110,15 @@ CorrectionResult BuildProjectionCorrection(const std::array<float, 6>& draw,
 
   // reference[1] / reference[3] deliberately do not appear: the camera never
   // applied them, so the draw's own off-centre terms fold in whole.
-  out.x_scale = draw[0] / reference[0];
-  out.x_shear = draw[1] / reference[0];
-  out.y_scale = draw[2] / reference[2];
-  out.y_shear = draw[3] / reference[2];
+  //
+  // With an identity viewport fold - scale 1, offset 0 - these are the
+  // projection-only expressions term for term: multiplying by 1.0f is exact,
+  // and subtracting 0.0f / reference[0] subtracts a zero. That is the same-rect
+  // and knob-off guarantee, and it is a property of these four lines.
+  out.x_scale = viewport.x_scale * (draw[0] / reference[0]);
+  out.x_shear = viewport.x_scale * (draw[1] / reference[0]) - viewport.x_offset / reference[0];
+  out.y_scale = viewport.y_scale * (draw[2] / reference[2]);
+  out.y_shear = viewport.y_scale * (draw[3] / reference[2]) - viewport.y_offset / reference[2];
 
   if (!std::isfinite(out.x_scale) || !std::isfinite(out.x_shear) ||
       !std::isfinite(out.y_scale) || !std::isfinite(out.y_shear))
@@ -1078,6 +1126,14 @@ CorrectionResult BuildProjectionCorrection(const std::array<float, 6>& draw,
     return CorrectionResult::Unrepresentable;
   }
 
+  // Magnitude only, deliberately. A NEGATIVE combined scale means the draw's
+  // viewport has the opposite sign to the reference's - a mirrored placement -
+  // and the algebra above places it correctly, so refusing it would put that
+  // draw back in the middle of the screen, which is the bug this exists to
+  // fix. It is applied and COUNTED instead (FrameStats::viewport_mirrored),
+  // because no game is known to mix viewport signs mid-frame and the shading of
+  // a mirrored instance transform is unvalidated here. If one turns up, the
+  // counter says so and flipping this case to refuse is a two-line change.
   if (std::abs(out.x_scale) > MAX_PROJECTION_SCALE ||
       std::abs(out.y_scale) > MAX_PROJECTION_SCALE ||
       std::abs(out.x_scale) < 1.0f / MAX_PROJECTION_SCALE ||
@@ -1748,16 +1804,61 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   if (!is_ortho && g_remix_api->ProjectionFixEnabled() && g_remix_api->HasReferenceProjection())
   {
+    // And this draw's viewport onto the frame's reference viewport, in the same
+    // correction. A draw the game gave its own screen rect - a
+    // picture-in-picture panel, a position ladder - is otherwise rendered
+    // through the reference rect and lands in the middle of the world.
+    //
+    // The placement this produces survives camera recovery untouched: the
+    // correction rides C in V^-1*(C*MV), and the camera re-applies V
+    // (RemixApi.cpp:2040-2049), so the rendered position is P*C*MV whichever
+    // slot the camera came from.
+    ViewportFold viewport_fold;
+    bool viewport_folded = false;
+    if (draw_viewport != nullptr && g_remix_api->ViewportFixEnabled() &&
+        !draw_viewport->SameRect(g_remix_api->ReferenceViewport()))
+    {
+      if (g_remix_api->HasReferenceViewport())
+      {
+        const DrawViewport& reference_viewport = g_remix_api->ReferenceViewport();
+        viewport_fold.x_scale = draw_viewport->wd() / reference_viewport.wd();
+        viewport_fold.y_scale = draw_viewport->ht() / reference_viewport.ht();
+        viewport_fold.x_offset =
+            (draw_viewport->cx - reference_viewport.cx) / reference_viewport.wd();
+        viewport_fold.y_offset =
+            (draw_viewport->cy - reference_viewport.cy) / reference_viewport.ht();
+        viewport_folded = true;
+      }
+      else
+      {
+        // The rect moved and there is no reference rect to move it against, so
+        // this draw is knowingly rendered where the reference was.
+        ++stats.viewport_uncorrectable;
+      }
+    }
+
     ProjectionCorrection correction;
     switch (BuildProjectionCorrection(xfmem.projection.rawProjection,
-                                      g_remix_api->ReferenceProjection(), correction))
+                                      g_remix_api->ReferenceProjection(), viewport_fold,
+                                      correction))
     {
     case CorrectionResult::Apply:
       ApplyProjectionCorrection(correction, transform);
       ++stats.projection_corrected;
+      if (viewport_folded)
+      {
+        ++stats.viewport_corrected;
+        // A sign flip between the two rects. Placed per the algebra; counted
+        // because nothing has validated how a mirrored instance transform
+        // shades. See BuildProjectionCorrection's scale band.
+        if (correction.x_scale < 0.0f || correction.y_scale < 0.0f)
+          ++stats.viewport_mirrored;
+      }
       break;
     case CorrectionResult::Unrepresentable:
       ++stats.projection_uncorrectable;
+      if (viewport_folded)
+        ++stats.viewport_uncorrectable;
       break;
     case CorrectionResult::NotNeeded:
       break;

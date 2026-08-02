@@ -579,6 +579,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
 
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
   m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
+  m_viewport_fix = Config::Get(Config::GFX_REMIX_VIEWPORT_FIX);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_trace_modelviews = Config::Get(Config::GFX_REMIX_TRACE_MODELVIEWS);
   m_camera_from_modelview = Config::Get(Config::GFX_REMIX_CAMERA_FROM_MODELVIEW);
@@ -1085,11 +1086,11 @@ void RemixApi::LogProjectionVariants()
 
   INFO_LOG_FMT(VIDEO,
                "Remix frame {} viewports: {} variant(s), reference #0 | changes {} (corrected {}, "
-               "REFUSED {}, mirrored {}, depth-only {}) | table overflow {}",
+               "REFUSED {}, mirrored {}, depth-only {}) | table overflow {} | fix {}",
                m_frame_index, m_viewport_variant_count, m_stats.viewport_changed,
                m_stats.viewport_corrected, m_stats.viewport_uncorrectable,
                m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
-               m_stats.viewport_overflow);
+               m_stats.viewport_overflow, m_viewport_fix ? "on" : "off");
 
   for (u32 i = 0; i < m_viewport_variant_count; ++i)
   {
@@ -3444,7 +3445,8 @@ void RemixApi::OnAfterFrame()
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
                  "unplaceable, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} dstalpha + {} "
                  "efbcopytex, raster {} us, upload {} us) | "
-                 "efb copies {} ({} non-xfb+clear) | viewport changes {} | sky auto: candidates {}, "
+                 "efb copies {} ({} non-xfb+clear) | viewport changes {} (corrected {}, refused {}, "
+                 "mirrored {}, depth-only {}) | sky auto: candidates {}, "
                  "classified {}, tagged {} ({} ignored) (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
@@ -3466,6 +3468,8 @@ void RemixApi::OnAfterFrame()
                  m_stats.ui_raster_us,
                  m_stats.ui_upload_us,
                  m_stats.efb_copies, m_stats.efb_copies_scratch, m_stats.viewport_changed,
+                 m_stats.viewport_corrected, m_stats.viewport_uncorrectable,
+                 m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
                  m_stats.sky_auto_candidates,
                  m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
                  m_sky_auto_detect);

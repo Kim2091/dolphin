@@ -590,6 +590,15 @@ public:
   // the reference projection.
   bool ProjectionFixEnabled() const { return m_projection_fix; }
 
+  // False restores the pre-fix behaviour for the VIEWPORT half of the same
+  // fold: sub-screen draws - picture-in-picture panels, position ladders - are
+  // rendered through the reference draw's screen rect and so land in the middle
+  // of the world. On, the difference between the two rects is folded into the
+  // instance transform alongside the projection difference. Independent of
+  // ProjectionFixEnabled only in name: the viewport terms ride the projection
+  // correction, so this knob does nothing while that one is off.
+  bool ViewportFixEnabled() const { return m_viewport_fix; }
+
   // False submits the raw vertex colour and no texture-stage state at all, which
   // is the pre-fix behaviour: the runtime's defaults never read a vertex colour
   // and have no way to hear about xfmem.matColor.
@@ -921,6 +930,7 @@ private:
   std::array<ViewportVariant, MAX_VIEWPORT_VARIANTS> m_viewport_variants = {};
   u32 m_viewport_variant_count = 0;
   bool m_projection_fix = true;
+  bool m_viewport_fix = true;
   bool m_trace_projections = false;
   bool m_gx_color = true;
   bool m_gx_texgen = true;

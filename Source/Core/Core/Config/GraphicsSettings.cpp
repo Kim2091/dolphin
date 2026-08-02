@@ -162,6 +162,23 @@ const Info<std::string> GFX_REMIX_SKY_TEXTURES{{System::GFX, "Settings", "RemixS
 // Off is the pre-fix behaviour: first perspective projection of the frame wins
 // and every other draw is rendered through it.
 const Info<bool> GFX_REMIX_PROJECTION_FIX{{System::GFX, "Settings", "RemixProjectionFix"}, true};
+// The same problem one step further out. GX maps clip space to the EFB per draw
+// through xfmem.viewport - screen.x = (clip.x/clip.w)*wd + xOrig
+// (Clipper.cpp:553-554) - so a game that renders a picture-in-picture panel or a
+// position ladder gives those draws their own small screen rect. Remix's one
+// camera renders the reference draw's rect, so folding the difference between
+// the two rects into the instance transform is what puts such a draw in its own
+// corner of the screen instead of in the middle of the world. It rides the same
+// affine correction as the projection fold and reduces to it exactly when the
+// rects match, so a game that never moves its viewport is bit-identical either
+// way.
+//
+// Off is the pre-fix behaviour: the world path reads xfmem.viewport for the
+// face-winding sign and nothing else, and every sub-screen draw is rendered
+// full-screen. Split screens stay wrong with it either way - a second view
+// carries a second view matrix, which one camera cannot express no matter where
+// the geometry is folded.
+const Info<bool> GFX_REMIX_VIEWPORT_FIX{{System::GFX, "Settings", "RemixViewportFix"}, true};
 // Log every distinct projection seen per frame, every frame. The per-frame
 // summary already reports variants whenever there is more than one (or any
 // off-centre term), so this is only needed to watch a projection change live.
