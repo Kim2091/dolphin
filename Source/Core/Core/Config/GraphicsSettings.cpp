@@ -490,6 +490,24 @@ const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES{
 //
 // False = scale by the EFB constants, the pre-fix mapping.
 const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiScaleToXfb"}, true};
+// Take the rasterized colour channel from the TEV stage that actually consumes
+// it, rather than from stage 0.
+//
+// GX names the rasterized channel PER STAGE - bpmem.tevorders[stage>>1]
+// .getColorChan(stage&1) (Tev.cpp:489, PixelShaderGen.cpp:257) - and the stage
+// that reads RasColor/RasAlpha is routinely not stage 0. Reading stage 0's
+// channel therefore answers a different question than the one being asked: on a
+// chain whose stage 0 is a plain texture fetch that rasterizes nothing, the old
+// code resolved "no tint" no matter how strongly a later stage tinted the draw,
+// and on a chain whose stages name different channels it read the wrong one.
+//
+// The colour half and the alpha half are resolved separately, because they are
+// separate LitChannels with their own material sources; when they end up on
+// different vertex attributes the colour half wins and the frame line's
+// "colour ... split" counter says so.
+//
+// False = stage 0's channel for both halves, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

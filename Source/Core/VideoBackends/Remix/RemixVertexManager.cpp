@@ -168,10 +168,86 @@ struct RasterColor
   u8 alpha_arg2 = REMIX_TEX_ARG_NONE;
   u32 tfactor = 0xFFFFFFFFu;
   bool baked_lighting = false;
+  // The colour half and the alpha half wanted different vertex attributes. One
+  // u32 of vertex colour cannot carry two channels' bytes, so the colour half
+  // wins; recorded so the compromise is countable rather than invisible.
+  bool channel_split = false;
 };
 
+// The first TEV stage whose COLOR combiner references the rasterized colour or
+// alpha, and the first whose ALPHA combiner references the rasterized alpha.
+// -1 for "no stage consumes it".
+//
+// The rasterized channel is named PER STAGE by
+// bpmem.tevorders[stage>>1].getColorChan(stage&1) (Tev.cpp:489,
+// PixelShaderGen.cpp:257), and the stage that consumes ras is routinely not
+// stage 0 - so reading stage 0's channel and calling it the draw's channel
+// answers a different question than the one being asked.
+struct RasStages
+{
+  int color = -1;
+  int alpha = -1;
+};
+
+RasStages FindRasStages()
+{
+  RasStages out;
+  const u32 stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+  const auto reads_ras_color = [](TevColorArg arg) {
+    // TevColorArg::RasColor = 10, RasAlpha = 11 (BPMemory.h:179-180).
+    return arg == TevColorArg::RasColor || arg == TevColorArg::RasAlpha;
+  };
+  const auto reads_ras_alpha = [](TevAlphaArg arg) {
+    // TevAlphaArg::RasAlpha = 5 (BPMemory.h:204).
+    return arg == TevAlphaArg::RasAlpha;
+  };
+  for (u32 stage = 0; stage < stages; ++stage)
+  {
+    const auto& cc = bpmem.combiners[stage].colorC;
+    const auto& ac = bpmem.combiners[stage].alphaC;
+    if (out.color < 0 && (reads_ras_color(cc.a) || reads_ras_color(cc.b) ||
+                          reads_ras_color(cc.c) || reads_ras_color(cc.d)))
+    {
+      out.color = static_cast<int>(stage);
+    }
+    if (out.alpha < 0 && (reads_ras_alpha(ac.a) || reads_ras_alpha(ac.b) ||
+                          reads_ras_alpha(ac.c) || reads_ras_alpha(ac.d)))
+    {
+      out.alpha = static_cast<int>(stage);
+    }
+    if (out.color >= 0 && out.alpha >= 0)
+      break;
+  }
+  return out;
+}
+
+// The XF colour channel a given TEV stage rasterizes, or -1 when that is not a
+// lit colour channel this can name: an alpha bump, a hardwired zero, or an index
+// past xfmem.numChan.numColorChans, which reads as zero in the real pipeline
+// (VertexShaderGen.cpp:910-916). Passing that on as black would be faithful to a
+// TEV we are not emulating, so it resolves to "no tint" instead.
+int ChannelForStage(int stage)
+{
+  if (stage < 0)
+    return -1;
+  const u32 index = static_cast<u32>(stage);
+  u32 channel;
+  switch (bpmem.tevorders[index >> 1].getColorChan(index & 1))
+  {
+  case RasColorChan::Color0:
+    channel = 0;
+    break;
+  case RasColorChan::Color1:
+    channel = 1;
+    break;
+  default:
+    return -1;
+  }
+  return channel < xfmem.numChan.numColorChans ? static_cast<int>(channel) : -1;
+}
+
 RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_semantics,
-                               bool resolve_alpha)
+                               bool resolve_alpha, bool gx_ras_channel)
 {
   RasterColor out;
 
@@ -184,55 +260,80 @@ RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_se
     return out;
   }
 
-  u32 channel;
-  switch (bpmem.tevorders[0].getColorChan(0))
+  int color_channel;
+  int alpha_channel;
+  if (gx_ras_channel)
   {
-  case RasColorChan::Color0:
-    channel = 0;
-    break;
-  case RasColorChan::Color1:
-    channel = 1;
-    break;
-  default:
-    // Alpha bump or a hardwired zero: not a lit colour channel at all.
-    return out;
+    // Each half takes the channel named by the stage that actually consumes it.
+    // A draw whose stage 0 rasterizes nothing at all - very common once the
+    // chain starts with a plain texture fetch - used to resolve to "no tint"
+    // however strongly a later stage tinted it.
+    const RasStages ras = FindRasStages();
+    color_channel = ChannelForStage(ras.color);
+    alpha_channel = ChannelForStage(ras.alpha);
+  }
+  else
+  {
+    color_channel = ChannelForStage(0);
+    alpha_channel = color_channel;
   }
 
-  if (channel >= xfmem.numChan.numColorChans)
+  if (color_channel < 0 && alpha_channel < 0)
     return out;
 
-  out.tfactor = MatColorToRemix(xfmem.matColor[channel]);
-  const int vertex_slot = VertexSlotForChannel(decl, channel);
-
-  const LitChannel& color_channel = xfmem.color[channel];
-  if (color_channel.matsource == MatSource::MatColorRegister)
+  // The register tint, assembled per half: RGB belongs to the colour channel and
+  // A to the alpha channel, and the two are independent LitChannels that a draw
+  // is free to point at different XF channels.
+  u32 tfactor = 0xFFFFFFFFu;
+  if (color_channel >= 0)
   {
-    out.color_arg2 = REMIX_TEX_ARG_TFACTOR;
+    tfactor = (tfactor & 0xFF000000u) |
+              (MatColorToRemix(xfmem.matColor[color_channel]) & 0x00FFFFFFu);
   }
-  else if (vertex_slot >= 0)
+  if (alpha_channel >= 0)
   {
-    out.color_arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
-    out.vertex_slot = vertex_slot;
-    // With lighting off the channel colour IS the vertex colour, which on GC is
-    // overwhelmingly baked lighting - that is why the games use it. With
-    // lighting on, the vertex colour is the material term the hardware
-    // multiplies the lights into, so it is a real material colour and must not
-    // be normalized.
-    out.baked_lighting = !color_channel.enablelighting;
+    tfactor = (tfactor & 0x00FFFFFFu) |
+              (MatColorToRemix(xfmem.matColor[alpha_channel]) & 0xFF000000u);
+  }
+  out.tfactor = tfactor;
+
+  if (color_channel >= 0)
+  {
+    const int color_slot = VertexSlotForChannel(decl, static_cast<u32>(color_channel));
+    const LitChannel& channel = xfmem.color[color_channel];
+    if (channel.matsource == MatSource::MatColorRegister)
+    {
+      out.color_arg2 = REMIX_TEX_ARG_TFACTOR;
+    }
+    else if (color_slot >= 0)
+    {
+      out.color_arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
+      out.vertex_slot = color_slot;
+      // With lighting off the channel colour IS the vertex colour, which on GC is
+      // overwhelmingly baked lighting - that is why the games use it. With
+      // lighting on, the vertex colour is the material term the hardware
+      // multiplies the lights into, so it is a real material colour and must not
+      // be normalized.
+      out.baked_lighting = !channel.enablelighting;
+    }
   }
 
-  if (!resolve_alpha)
+  if (!resolve_alpha || alpha_channel < 0)
     return out;
 
-  const LitChannel& alpha_channel = xfmem.alpha[channel];
-  if (alpha_channel.matsource == MatSource::MatColorRegister)
+  const int alpha_slot = VertexSlotForChannel(decl, static_cast<u32>(alpha_channel));
+  const LitChannel& channel = xfmem.alpha[alpha_channel];
+  if (channel.matsource == MatSource::MatColorRegister)
   {
     out.alpha_arg2 = REMIX_TEX_ARG_TFACTOR;
   }
-  else if (vertex_slot >= 0)
+  else if (alpha_slot >= 0)
   {
     out.alpha_arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
-    out.vertex_slot = vertex_slot;
+    if (out.vertex_slot < 0)
+      out.vertex_slot = alpha_slot;
+    else if (out.vertex_slot != alpha_slot)
+      out.channel_split = true;
   }
   return out;
 }
@@ -1299,9 +1400,11 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const bool gx_blend = g_remix_api->GxBlendEnabled();
-  const RasterColor raster_color =
-      ResolveRasterColor(decl, g_remix_api->GxColorEnabled(), gx_blend);
+  const RasterColor raster_color = ResolveRasterColor(decl, g_remix_api->GxColorEnabled(), gx_blend,
+                                                      g_remix_api->GxRasChannelEnabled());
   const int color_slot = raster_color.vertex_slot;
+  if (raster_color.channel_split)
+    ++stats.ras_channel_split;
   switch (raster_color.color_arg2)
   {
   case REMIX_TEX_ARG_VERTEX_COLOR0:

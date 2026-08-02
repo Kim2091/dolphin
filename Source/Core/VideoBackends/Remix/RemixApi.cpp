@@ -598,6 +598,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
+  m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
   m_light_range = std::max(1.0f, Config::Get(Config::GFX_REMIX_LIGHT_RANGE));
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
@@ -3353,7 +3354,8 @@ void RemixApi::OnAfterFrame()
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
-                 "register, {} none | texgen {} ({} non-trivial) | blended {} tested {} logicop {} "
+                 "register, {} none, {} split | texgen {} ({} non-trivial) | blended {} tested {} "
+                 "logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
@@ -3365,7 +3367,8 @@ void RemixApi::OnAfterFrame()
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
                  m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
-                 m_stats.color_register, m_stats.color_none, m_stats.texgen_generated,
+                 m_stats.color_register, m_stats.color_none, m_stats.ras_channel_split,
+                 m_stats.texgen_generated,
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,

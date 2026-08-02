@@ -103,6 +103,11 @@ struct FrameStats
   u32 color_vertex = 0;
   u32 color_register = 0;
   u32 color_none = 0;
+  // Draws whose ras-consuming COLOUR stage and ras-consuming ALPHA stage named
+  // different XF channels, and those channels different vertex attributes. One
+  // u32 of vertex colour cannot carry both, so the colour half wins - this
+  // counts how often that compromise was made.
+  u32 ras_channel_split = 0;
 
   // Draws whose stage-0 texture coordinate went through GX texgen, and how many
   // of those produced something a raw read of attribute 0 would not have. A game
@@ -520,6 +525,11 @@ public:
   // per-instance blend state below becomes the thing the runtime reads.
   bool GxBlendEnabled() const { return m_gx_blend; }
 
+  // False resolves the rasterized colour channel from TEV stage 0 whether or not
+  // stage 0 consumes it, which is the pre-fix behaviour. On, each half takes the
+  // channel named by the stage that actually reads ras.
+  bool GxRasChannelEnabled() const { return m_gx_ras_channel; }
+
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
   // alpha_test_type / alpha_reference come from the draw's GX alpha test and
@@ -817,6 +827,7 @@ private:
   bool m_gx_texgen = true;
   bool m_gx_blend = true;
   bool m_gx_light_fix = true;
+  bool m_gx_ras_channel = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is
