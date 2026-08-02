@@ -506,6 +506,15 @@ const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiSca
 // different vertex attributes the colour half wins and the frame line's
 // "colour ... split" counter says so.
 //
+// WORLD DRAWS ONLY. Orthographic draws are deliberately left on the stage-0
+// resolution: the UI overlay's software rasterizer takes its rasterized-alpha
+// input from the submitted vertex colour, so a UI draw promoted from "no
+// channel, write opaque white" to "channel 0, write the vertex colour" gets a
+// vertex alpha of 0 and resolves to fully transparent. Applying this to ortho
+// draws emptied Wind Waker's title-screen overlay completely - title art
+// included. What a UI draw's rasterized alpha SHOULD be is the question the
+// UI-side alpha rework exists to answer, and that work is not in yet.
+//
 // False = stage 0's channel for both halves, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
 // Skip world draws whose scissor rectangle is empty.
