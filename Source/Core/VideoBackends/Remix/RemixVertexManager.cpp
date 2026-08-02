@@ -1117,6 +1117,33 @@ VertexManager::VertexManager() = default;
 
 VertexManager::~VertexManager() = default;
 
+bool VertexManager::ScissorIsEmpty()
+{
+  if (m_scissor_key_valid && m_scissor_key_tl == bpmem.scissorTL.hex &&
+      m_scissor_key_br == bpmem.scissorBR.hex && m_scissor_key_off == bpmem.scissorOffset.hex)
+  {
+    return m_scissor_empty;
+  }
+
+  // The viewport argument only decides which of several rectangles is "best"
+  // (ScissorResult::IsWorse); it cannot make the list empty, so it is safe to
+  // pass the live one while keying the cache on the scissor registers alone.
+  const BPFunctions::ScissorResult scissor = BPFunctions::ComputeScissorRects(
+      bpmem.scissorTL, bpmem.scissorBR, bpmem.scissorOffset, xfmem.viewport);
+  // An empty rectangle list is the console saying "this draw covers no pixels":
+  // the constructor bails immediately on left > right or top > bottom, and
+  // otherwise produces nothing when every wrapped range clamps outside the EFB
+  // (BPFunctions.cpp:100-150). Best() would hand back a fabricated out-of-bounds
+  // rect in that case, so testing the returned rect instead of the list would
+  // never see it.
+  m_scissor_empty = scissor.rectangles.empty();
+  m_scissor_key_tl = bpmem.scissorTL.hex;
+  m_scissor_key_br = bpmem.scissorBR.hex;
+  m_scissor_key_off = bpmem.scissorOffset.hex;
+  m_scissor_key_valid = true;
+  return m_scissor_empty;
+}
+
 void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_vertex)
 {
   if (!g_remix_api || !g_remix_api->IsValid())
@@ -1222,6 +1249,22 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       bpmem.alpha_test.TestResult() == AlphaTestResult::Fail)
   {
     ++stats.skipped_invisible;
+    return;
+  }
+
+  // Scissored away entirely. Every reference clips every draw - the software
+  // rasterizer rejects pixels outside the scissor rect (Rasterizer.cpp:364-365)
+  // and the hardware backends set the scissor per draw (BPFunctions.cpp:103-104)
+  // - while this path read scissor state nowhere, so a draw the game hid by
+  // scissoring to an empty rect was fully visible AND cast shadows.
+  //
+  // Only the all-or-nothing case is expressible here: a path tracer has no
+  // screen-space clip, so a draw the scissor merely trims is submitted whole,
+  // deliberately. The UI path, which rasterizes into a 2D buffer, does honour
+  // partial scissors.
+  if (!is_ortho && g_remix_api->WorldScissorSkipEnabled() && ScissorIsEmpty())
+  {
+    ++stats.skipped_scissor;
     return;
   }
 

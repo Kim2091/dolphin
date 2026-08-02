@@ -226,6 +226,12 @@ struct FrameStats
   u32 tev_bail_konst = 0;
   u32 tev_bail_compare = 0;
   u32 tev_bail_rasterized = 0;
+  // World draws the console would have rasterized nothing of, because the game
+  // scissored them down to an empty rect. Without the skip these are fully
+  // visible geometry that also casts shadows; a non-zero count while something
+  // vanishes is what says the rule is over-reaching.
+  u32 skipped_scissor = 0;
+
   // A lit draw whose channel ambient register was bright enough to matter. GX
   // ambient has no Remix analogue at all - the path tracer's GI has to stand in
   // for it - so this quantifies how much of the frame's light was ambient before
@@ -530,6 +536,10 @@ public:
   // channel named by the stage that actually reads ras.
   bool GxRasChannelEnabled() const { return m_gx_ras_channel; }
 
+  // False submits world draws the console scissored down to nothing, which is
+  // the pre-fix behaviour: the world path read scissor state nowhere.
+  bool WorldScissorSkipEnabled() const { return m_world_scissor_skip; }
+
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
   // alpha_test_type / alpha_reference come from the draw's GX alpha test and
@@ -828,6 +838,7 @@ private:
   bool m_gx_blend = true;
   bool m_gx_light_fix = true;
   bool m_gx_ras_channel = true;
+  bool m_world_scissor_skip = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is

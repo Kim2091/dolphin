@@ -508,6 +508,29 @@ const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiSca
 //
 // False = stage 0's channel for both halves, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
+// Skip world draws whose scissor rectangle is empty.
+//
+// Every reference implementation clips every draw: the software rasterizer
+// builds scissor rects from bpmem.scissorTL/BR and rejects pixels outside them
+// (Rasterizer.cpp:117-119, 364-365), and the hardware backends set the scissor
+// per draw (BPFunctions.cpp:103-104). The Remix UI path already honours it, but
+// the world path read scissor state nowhere - so geometry the game hid by
+// scissoring it away was drawn in full, and in a path tracer it also lit and
+// shadowed the scene.
+//
+// Only the empty case is acted on, and deliberately: Remix has no screen-space
+// clip, so a draw the scissor merely trims cannot be expressed and is submitted
+// whole. Empty is the one case where the console's answer - "no pixels" - is
+// exactly representable.
+//
+// Emptiness is read off ScissorResult::rectangles, not off Best(): Best()
+// fabricates an out-of-bounds rectangle when the list is empty
+// (BPFunctions.cpp:166-171), so a caller testing the returned rect would never
+// see the condition at all.
+//
+// False = submit them, which is the pre-fix behaviour.
+const Info<bool> GFX_REMIX_WORLD_SCISSOR_SKIP{{System::GFX, "Settings", "RemixWorldScissorSkip"},
+                                              true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

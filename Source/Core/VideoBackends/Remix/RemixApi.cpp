@@ -599,6 +599,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
+  m_world_scissor_skip = Config::Get(Config::GFX_REMIX_WORLD_SCISSOR_SKIP);
   m_light_range = std::max(1.0f, Config::Get(Config::GFX_REMIX_LIGHT_RANGE));
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
@@ -3353,6 +3354,7 @@ void RemixApi::OnAfterFrame()
   {
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
+                 "scissor {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
                  "register, {} none, {} split | texgen {} ({} non-trivial) | blended {} tested {} "
                  "logicop {} "
@@ -3365,7 +3367,8 @@ void RemixApi::OnAfterFrame()
                  "classified {}, tagged {} ({} ignored) (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
-                 m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.meshes_created,
+                 m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.skipped_scissor,
+                 m_stats.meshes_created,
                  m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
                  m_stats.color_register, m_stats.color_none, m_stats.ras_channel_split,
                  m_stats.texgen_generated,

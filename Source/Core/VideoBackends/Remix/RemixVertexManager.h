@@ -28,6 +28,20 @@ protected:
   void DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_vertex) override;
 
 private:
+  // Whether the console's scissor for the current register values rasterizes
+  // nothing at all. Cached because BPFunctions::ComputeScissorRects allocates a
+  // vector, and a frame has hundreds of world draws against a handful of scissor
+  // changes. Keyed on the three registers emptiness actually depends on: the
+  // viewport only ORDERS the resulting rectangles (ScissorResult::IsWorse), it
+  // can never empty the list, so leaving it out of the key is exact rather than
+  // approximate.
+  bool ScissorIsEmpty();
+  u32 m_scissor_key_tl = 0;
+  u32 m_scissor_key_br = 0;
+  u32 m_scissor_key_off = 0;
+  bool m_scissor_key_valid = false;
+  bool m_scissor_empty = false;
+
   // Reused across draws so a 60 Hz translation path does not allocate.
   std::vector<remixapi_HardcodedVertex> m_vertices;
   std::vector<u32> m_indices;
