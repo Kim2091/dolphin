@@ -115,6 +115,15 @@ The three that are not optional in practice:
 | `RemixCameraRecovery` | `True` | Defaults off. GC/Wii have no separate view matrix — `xfmem.posMatrices` hold a combined modelview — so without recovery the camera sits at the origin and the world swings around it instead of the camera moving through it. |
 | `RemixSkyAutoDetect` | `2` | Detect *and tag* the skybox; the default `1` only logs. Detection works from the transform (a skybox translates with the camera while its rotation holds still), so it also catches untextured domes no texture-hash list can reach. |
 
+Correctness knobs added by the 2026-08-02 GX audit, all defaulting on, all
+reverting to exactly the pre-fix behaviour when set to `False`:
+
+| Key | Default | What it fixes |
+|---|---|---|
+| `RemixUiScaleToXfb` | `True` | Maps the UI overlay onto the region the console *presents* — the XFB copy's source rect — instead of onto the EFB's full 640×528. Wind Waker presents 480 rows, so the old mapping put every HUD element ~9% too high and left the bottom of the window dead. |
+| `RemixGxRasChannel` | `True` | Takes the rasterized colour channel from the TEV stage that actually reads `RasColor`/`RasAlpha`, not from stage 0. GX names that channel per stage, and the consuming stage is routinely not stage 0. |
+| `RemixWorldScissorSkip` | `True` | Skips world draws whose scissor result is empty. The world path read scissor state nowhere, so a draw the game hid by scissoring it away was drawn in full — and cast shadows. Only the all-or-nothing case is acted on; a path tracer has no screen-space clip. |
+
 **Performance:** the main lever is `RemixUiOverlayScale` (default `1.0`). The UI
 overlay is rasterized on the CPU and is fill-rate bound, so `0.5` quarters its
 cost. GC UI is authored for a 640×528 framebuffer, so there is little real detail
