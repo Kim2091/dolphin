@@ -1144,6 +1144,40 @@ bool VertexManager::ScissorIsEmpty()
   return m_scissor_empty;
 }
 
+const DrawViewport& VertexManager::CurrentDrawViewport()
+{
+  const std::array<float, 4> rect = {xfmem.viewport.xOrig, xfmem.viewport.yOrig, xfmem.viewport.wd,
+                                     xfmem.viewport.ht};
+  if (m_viewport_key_valid && m_viewport_key_rect == rect &&
+      m_viewport_key_tl == bpmem.scissorTL.hex && m_viewport_key_br == bpmem.scissorBR.hex &&
+      m_viewport_key_off == bpmem.scissorOffset.hex)
+  {
+    return m_viewport_cached;
+  }
+
+  // The same derivation the UI path uses (see the screen-overlay block below),
+  // which is in turn the one BPFunctions hands every other backend: same
+  // ComputeScissorRects, same Best() rectangle, same xOrig - x_off. One
+  // derivation in the tree, so the world and UI placements cannot disagree
+  // about where the game asked for the draw.
+  const BPFunctions::ScissorResult scissor = BPFunctions::ComputeScissorRects(
+      bpmem.scissorTL, bpmem.scissorBR, bpmem.scissorOffset, xfmem.viewport);
+  const BPFunctions::ScissorRect native_rc = scissor.Best();
+
+  m_viewport_cached.rect = rect;
+  m_viewport_cached.cx = xfmem.viewport.xOrig - static_cast<float>(native_rc.x_off);
+  m_viewport_cached.cy = xfmem.viewport.yOrig - static_cast<float>(native_rc.y_off);
+  m_viewport_cached.zrange = xfmem.viewport.zRange;
+  m_viewport_cached.farz = xfmem.viewport.farZ;
+
+  m_viewport_key_rect = rect;
+  m_viewport_key_tl = bpmem.scissorTL.hex;
+  m_viewport_key_br = bpmem.scissorBR.hex;
+  m_viewport_key_off = bpmem.scissorOffset.hex;
+  m_viewport_key_valid = true;
+  return m_viewport_cached;
+}
+
 void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_vertex)
 {
   if (!g_remix_api || !g_remix_api->IsValid())
@@ -1173,32 +1207,16 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     return;
   }
 
-  // First perspective draw of the frame defines the camera; every distinct
-  // projection after it is tracked so the frame log can say whether the
-  // reference is the one actually carrying the scene.
+  // First perspective draw of the frame defines the camera AND the screen rect
+  // that camera is implicitly rendering into; every distinct projection and
+  // viewport after it is tracked so the frame log can say whether the reference
+  // is the one actually carrying the scene. Ortho draws take neither: their
+  // projection is not a frustum and their viewport is the UI's, and letting
+  // either latch a reference would aim every world fold at the HUD.
+  const DrawViewport* draw_viewport = is_ortho ? nullptr : &CurrentDrawViewport();
   const int projection_slot =
-      is_ortho ? -1 : g_remix_api->ObserveProjection(xfmem.projection.rawProjection);
-
-  // Instrument only: does this game move its viewport mid-frame? The world path
-  // uses xfmem.viewport for the winding sign and nothing else, while every
-  // hardware backend positions the draw by it (BPFunctions.cpp:192-193), so a
-  // split-screen or picture-in-picture draw would land in the wrong place here.
-  // A frame reporting zero changes cannot have that defect; one reporting many
-  // is where to start looking. No behaviour attached - see FrameStats.
-  if (!is_ortho)
-  {
-    const std::array<float, 4> rect = {xfmem.viewport.xOrig, xfmem.viewport.yOrig,
-                                       xfmem.viewport.wd, xfmem.viewport.ht};
-    if (!stats.viewport_seen)
-    {
-      stats.viewport_seen = true;
-      stats.viewport_first = rect;
-    }
-    else if (rect != stats.viewport_first)
-    {
-      ++stats.viewport_changed;
-    }
-  }
+      is_ortho ? -1 :
+                 g_remix_api->ObserveProjection(xfmem.projection.rawProjection, *draw_viewport);
 
   // bSupportsPrimitiveRestart is false for this backend, so every quad/strip/fan
   // has already been expanded into a plain triangle list by the index generator

@@ -238,19 +238,37 @@ struct FrameStats
   // anyone reaches for RemixLightScale.
   bool ambient_bright = false;
 
-  // Sub-screen viewports, instrument only. The world path reads xfmem.viewport
-  // for the winding sign alone (RemixVertexManager.cpp:319), while every
-  // hardware backend POSITIONS the draw by it (BPFunctions.cpp:192-193). A game
-  // that renders split screens or picture-in-picture switches the viewport
-  // mid-frame and would be misplaced here; one that never does cannot have a
-  // viewport bug. `viewport_changed` counts world draws whose viewport rect
-  // differs from the frame's first-seen one.
+  // Sub-screen viewports. GX POSITIONS every draw by xfmem.viewport
+  // (Clipper.cpp:553-554, BPFunctions.cpp:192-193), and a game that renders
+  // picture-in-picture or split screens moves it mid-frame - while Remix takes
+  // one camera per frame, so the difference has to be folded into the instance
+  // transform exactly the way a projection difference is. `viewport_changed`
+  // counts world draws whose raw rect differs from the frame's REFERENCE rect,
+  // which is latched by the same draw that latches the reference projection so
+  // the fold and the camera can never be defined against different views.
   //
-  // Deliberately no knob and no behaviour: geometric handling waits for a game
-  // that demonstrates the symptom.
+  // Of those, `viewport_corrected` reached the transform and was folded, and
+  // `viewport_uncorrectable` was refused - a non-zero refusal is the
+  // log-readable tell that a draw is knowingly being rendered mid-screen.
+  // `viewport_mirrored` is a subset of corrected whose combined scale came out
+  // negative: the placement follows the algebra, but no game is known to mix
+  // viewport signs mid-frame, so the shading of one is unvalidated and the
+  // counter is the tripwire.
+  //
+  // `viewport_depth_changed` counts draws whose zRange/farZ pair differs from
+  // the reference's. Nothing folds that pair - it remaps NDC z into the EFB
+  // depth ramp and this backend has no depth buffer for it to bias - but a
+  // FULL-screen rect with a compressed zRange is the classic viewmodel tell, so
+  // the count is the evidence a VIEW_MODEL follow-up would be built on.
   u32 viewport_changed = 0;
-  bool viewport_seen = false;
-  std::array<float, 4> viewport_first = {};
+  u32 viewport_corrected = 0;
+  u32 viewport_uncorrectable = 0;
+  u32 viewport_mirrored = 0;
+  u32 viewport_depth_changed = 0;
+  // Draws arriving after the per-frame viewport variant table filled up.
+  // Non-zero means the viewport log is incomplete, not that anything rendered
+  // wrong: neither the reference nor the fold reads the table.
+  u32 viewport_overflow = 0;
 };
 
 // One EFB copy the game triggered, stamped WHERE IT HAPPENED. Recorded rather
@@ -319,6 +337,43 @@ struct DrawDiagnostics
   // and the slot is known here and nowhere downstream.
   static constexpr u32 NO_POSITION_MATRIX = 0xFFFFFFFFu;
   u32 position_matrix = NO_POSITION_MATRIX;
+};
+
+// One draw's viewport, as a screen mapping rather than as registers. GX maps
+// clip space to the EFB per draw as
+//   screen.x = (clip.x / clip.w) * wd + xOrig
+//   screen.y = (clip.y / clip.w) * ht + yOrig
+// (Clipper.cpp:553-554 - the plain-math reference), so wd/ht are HALF extents
+// and xOrig/yOrig the centre. That is the whole mapping the fold has to
+// reproduce through one camera.
+struct DrawViewport
+{
+  // xOrig, yOrig, wd, ht, exactly as the game wrote them into xfmem.viewport.
+  // Compared bit-exactly: "did the game move the viewport" is a question about
+  // register writes, and an epsilon here would only invent variants that differ
+  // by nothing.
+  std::array<float, 4> rect = {};
+  // The scissor-adjusted centre - xOrig - x_off, yOrig - y_off - which is what
+  // every hardware backend positions by (BPFunctions.cpp:192-193). The
+  // subtraction is what turns a viewport written in the scissor's coordinate
+  // space into an EFB position, so it is the centre the fold must use and not
+  // the raw origin.
+  float cx = 0.0f;
+  float cy = 0.0f;
+  // The depth remap (Clipper.cpp:555). Recorded, never folded: it biases
+  // depth-test comparisons on a buffer this backend does not have, and
+  // compressing view-space z instead would physically pull geometry into the
+  // camera. See FrameStats::viewport_depth_changed.
+  float zrange = 0.0f;
+  float farz = 0.0f;
+
+  float wd() const { return rect[2]; }
+  float ht() const { return rect[3]; }
+  bool SameRect(const DrawViewport& other) const { return rect == other.rect; }
+  bool SameDepth(const DrawViewport& other) const
+  {
+    return zrange == other.zrange && farz == other.farz;
+  }
 };
 
 // One distinct modelview VALUE seen during a frame, and everything that used it.
@@ -490,12 +545,18 @@ public:
 
   // --- Called from RemixVertexManager ---
 
-  // Accounts for one perspective draw's projection and returns its slot in the
-  // frame's variant table, or -1 if the table is full. The first perspective
-  // draw of a frame also latches the reference projection that SetupCamera
-  // turns into the camera; a frame with only orthographic draws keeps the
-  // previous camera.
-  int ObserveProjection(const std::array<float, 6>& raw_projection);
+  // Accounts for one perspective draw's projection and viewport and returns the
+  // projection's slot in the frame's variant table, or -1 if the table is full.
+  // The first perspective draw of a frame also latches the reference projection
+  // that SetupCamera turns into the camera; a frame with only orthographic draws
+  // keeps the previous camera.
+  //
+  // The reference VIEWPORT is latched by the same draw, in the same call, on
+  // purpose: the correction is defined relative to what SetupCamera shows, and
+  // SetupCamera is built from the reference projection. Letting the two
+  // references come from different draws would be this backend's fifth
+  // per-frame-state-collapse bug wearing a new hat.
+  int ObserveProjection(const std::array<float, 6>& raw_projection, const DrawViewport& viewport);
 
   // Records that a draw which actually reached SubmitMesh used variant `slot`.
   // The reference is "first perspective draw of the frame", and these counts
@@ -510,6 +571,19 @@ public:
   // folding draws onto them would aim at a camera that is not there.
   bool HasReferenceProjection() const { return m_projection_latched && m_reference_usable; }
   const std::array<float, 6>& ReferenceProjection() const { return m_raw_projection; }
+
+  // The frame's reference viewport - the screen rect the reference projection's
+  // draw mapped into, and therefore the rect the single camera is implicitly
+  // rendering. False until a perspective draw has been seen this frame, and
+  // also false when that draw's rect has no extent to divide by: a zero-width
+  // or zero-height viewport is not a screen mapping, and folding onto it would
+  // be a division by nothing.
+  //
+  // The rect itself is readable either way, because "did this draw's viewport
+  // move" is answerable even when the reference is unusable - that is exactly
+  // the case FrameStats::viewport_uncorrectable exists to report.
+  bool HasReferenceViewport() const { return m_projection_latched && m_reference_viewport_usable; }
+  const DrawViewport& ReferenceViewport() const { return m_reference_viewport; }
 
   // False restores the pre-fix behaviour: submit each draw's modelview as-is
   // and let the frame's single camera misframe everything that does not share
@@ -711,6 +785,16 @@ private:
     u32 vertices = 0;
   };
   static constexpr size_t MAX_PROJECTION_VARIANTS = 8;
+  // One distinct viewport RECT seen during a frame, and how many draws used it.
+  // Keyed on the raw rect alone so the table reads as "where on screen did this
+  // frame draw", with the depth pair carried along for the viewmodel question
+  // rather than splitting the table by it.
+  struct ViewportVariant
+  {
+    DrawViewport viewport = {};
+    u32 draws = 0;
+  };
+  static constexpr size_t MAX_VIEWPORT_VARIANTS = 8;
   // Ceilings on the frame's audit event logs. A frame legitimately triggers a
   // handful of EFB copies and up to a couple of hundred UI draws; these exist
   // only so a runaway game cannot grow either vector without bound. Overflow is
@@ -832,6 +916,10 @@ private:
   bool m_camera_valid = false;
   std::array<ProjectionVariant, MAX_PROJECTION_VARIANTS> m_projection_variants = {};
   u32 m_projection_variant_count = 0;
+  DrawViewport m_reference_viewport = {};
+  bool m_reference_viewport_usable = false;
+  std::array<ViewportVariant, MAX_VIEWPORT_VARIANTS> m_viewport_variants = {};
+  u32 m_viewport_variant_count = 0;
   bool m_projection_fix = true;
   bool m_trace_projections = false;
   bool m_gx_color = true;

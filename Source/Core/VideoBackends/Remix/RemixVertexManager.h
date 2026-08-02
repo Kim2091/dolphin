@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <vector>
 
 #include "VideoBackends/Remix/RemixApi.h"
@@ -41,6 +42,21 @@ private:
   u32 m_scissor_key_off = 0;
   bool m_scissor_key_valid = false;
   bool m_scissor_empty = false;
+
+  // The current draw's viewport as a screen mapping - the raw rect plus the
+  // scissor-adjusted centre every hardware backend positions by. Cached for the
+  // same reason ScissorIsEmpty is: deriving the centre needs
+  // BPFunctions::ComputeScissorRects, which allocates, and a well-behaved game
+  // holds one viewport for the whole frame. Keyed on every register the
+  // derivation reads - the four viewport floats AND the three scissor registers
+  // - so the cache is exact rather than approximate.
+  const DrawViewport& CurrentDrawViewport();
+  DrawViewport m_viewport_cached = {};
+  std::array<float, 4> m_viewport_key_rect = {};
+  u32 m_viewport_key_tl = 0;
+  u32 m_viewport_key_br = 0;
+  u32 m_viewport_key_off = 0;
+  bool m_viewport_key_valid = false;
 
   // Reused across draws so a 60 Hz translation path does not allocate.
   std::vector<remixapi_HardcodedVertex> m_vertices;

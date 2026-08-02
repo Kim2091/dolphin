@@ -958,7 +958,8 @@ bool RecoverFovAspect(const std::array<float, 6>& raw, float& fov_y_deg, float& 
 }
 }  // namespace
 
-int RemixApi::ObserveProjection(const std::array<float, 6>& raw_projection)
+int RemixApi::ObserveProjection(const std::array<float, 6>& raw_projection,
+                                const DrawViewport& viewport)
 {
   if (!m_projection_latched)
   {
@@ -967,6 +968,47 @@ int RemixApi::ObserveProjection(const std::array<float, 6>& raw_projection)
     float fov_y_deg = 0.0f;
     float aspect = 0.0f;
     m_reference_usable = RecoverFovAspect(raw_projection, fov_y_deg, aspect);
+    // Latched together with the projection, by the same draw, for the reason
+    // spelled out on ObserveProjection's declaration.
+    m_reference_viewport = viewport;
+    // A rect with no extent cannot be divided by, so it is not a reference even
+    // though it was latched. 1e-3 rather than 1e-6: viewport extents are HALF
+    // widths in EFB pixels, where anything under a thousandth of a pixel is a
+    // degenerate write and not a small screen.
+    m_reference_viewport_usable =
+        std::abs(viewport.wd()) > 1e-3f && std::abs(viewport.ht()) > 1e-3f;
+  }
+
+  // Against the REFERENCE, not against the previously seen viewport: the fold
+  // is defined relative to the reference, so this counter has to count the same
+  // population the fold acts on.
+  if (!viewport.SameRect(m_reference_viewport))
+    ++m_stats.viewport_changed;
+  if (!viewport.SameDepth(m_reference_viewport))
+    ++m_stats.viewport_depth_changed;
+
+  bool viewport_known = false;
+  for (u32 i = 0; i < m_viewport_variant_count; ++i)
+  {
+    if (m_viewport_variants[i].viewport.SameRect(viewport))
+    {
+      ++m_viewport_variants[i].draws;
+      viewport_known = true;
+      break;
+    }
+  }
+  if (!viewport_known)
+  {
+    if (m_viewport_variant_count >= MAX_VIEWPORT_VARIANTS)
+    {
+      ++m_stats.viewport_overflow;
+    }
+    else
+    {
+      const u32 slot = m_viewport_variant_count++;
+      m_viewport_variants[slot].viewport = viewport;
+      m_viewport_variants[slot].draws = 1;
+    }
   }
 
   for (u32 i = 0; i < m_projection_variant_count; ++i)
@@ -1003,8 +1045,15 @@ void RemixApi::LogProjectionVariants()
   // frame has nothing to report, and this runs at 60 Hz. Anything else - a
   // mid-frame switch, or an off-centre frustum - is exactly the condition the
   // single-camera design cannot represent, so say so.
+  //
+  // A frame that moved its viewport is interesting for the same reason and on
+  // the same terms: one camera cannot express two screen rects either, and the
+  // table below is the only place the rect geometry is readable.
+  const bool viewport_interesting =
+      m_viewport_variant_count > 1 || m_stats.viewport_overflow > 0;
   const bool interesting = m_projection_variant_count > 1 || m_stats.projection_oblique > 0 ||
-                           m_stats.projection_overflow > 0 || m_stats.projection_uncorrectable > 0;
+                           m_stats.projection_overflow > 0 ||
+                           m_stats.projection_uncorrectable > 0 || viewport_interesting;
   if (!m_trace_projections && (!interesting || (m_frame_index % 60) != 0))
     return;
 
@@ -1026,6 +1075,37 @@ void RemixApi::LogProjectionVariants()
                  i == 0 ? " (ref)" : "     ", variant.raw[0], variant.raw[1], variant.raw[2],
                  variant.raw[3], variant.raw[4], variant.raw[5], variant.draws, variant.vertices,
                  (variant.raw[1] != 0.0f || variant.raw[3] != 0.0f) ? "  <-- off-centre" : "");
+  }
+
+  // Only when the frame actually used more than one rect. A game that keeps one
+  // viewport all frame - the overwhelmingly common case - has nothing to say
+  // here, and saying it anyway would bury the projection table it sits under.
+  if (!viewport_interesting)
+    return;
+
+  INFO_LOG_FMT(VIDEO,
+               "Remix frame {} viewports: {} variant(s), reference #0 | changes {} (corrected {}, "
+               "REFUSED {}, mirrored {}, depth-only {}) | table overflow {}",
+               m_frame_index, m_viewport_variant_count, m_stats.viewport_changed,
+               m_stats.viewport_corrected, m_stats.viewport_uncorrectable,
+               m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
+               m_stats.viewport_overflow);
+
+  for (u32 i = 0; i < m_viewport_variant_count; ++i)
+  {
+    const ViewportVariant& variant = m_viewport_variants[i];
+    // Raw rect AND scissor-adjusted centre, because they differ by exactly the
+    // scissor offset and a disagreement between them is the one derivation this
+    // change could get wrong. zRange/farZ ride along as the viewmodel evidence:
+    // a full-screen rect with a compressed zRange is the shape to look for.
+    const bool is_reference = variant.viewport.SameRect(m_reference_viewport);
+    INFO_LOG_FMT(VIDEO,
+                 "  #{}{} rect xOrig {:.1f} yOrig {:.1f} wd {:.1f} ht {:.1f} | centre {:.1f} {:.1f} "
+                 "| zRange {:.1f} farZ {:.1f} | draws {}",
+                 i, is_reference ? " (ref)" : "     ", variant.viewport.rect[0],
+                 variant.viewport.rect[1], variant.viewport.rect[2], variant.viewport.rect[3],
+                 variant.viewport.cx, variant.viewport.cy, variant.viewport.zrange,
+                 variant.viewport.farz, variant.draws);
   }
 }
 
@@ -3407,6 +3487,10 @@ void RemixApi::OnAfterFrame()
   m_reference_usable = false;
   m_projection_variants = {};
   m_projection_variant_count = 0;
+  m_reference_viewport = {};
+  m_reference_viewport_usable = false;
+  m_viewport_variants = {};
+  m_viewport_variant_count = 0;
   // This frame's samples become next frame's history; reuse the old map's
   // storage rather than reallocating a few hundred entries every frame.
   m_view_samples.swap(m_view_samples_previous);
