@@ -121,7 +121,8 @@ reverting to exactly the pre-fix behaviour when set to `False`:
 | Key | Default | What it fixes |
 |---|---|---|
 | `RemixUiScaleToXfb` | `True` | Maps the UI overlay onto the region the console *presents* — the XFB copy's source rect — instead of onto the EFB's full 640×528. Wind Waker presents 480 rows, so the old mapping put every HUD element ~9% too high and left the bottom of the window dead. |
-| `RemixGxRasChannel` | `True` | Takes the rasterized colour channel from the TEV stage that actually reads `RasColor`/`RasAlpha`, not from stage 0. GX names that channel per stage, and the consuming stage is routinely not stage 0. World draws only — see the knob's comment for why the UI overlay is excluded. |
+| `RemixGxRasChannel` | `True` | Takes the rasterized colour channel from the TEV stage that actually reads `RasColor`/`RasAlpha`, not from stage 0. GX names that channel per stage, and the consuming stage is routinely not stage 0. World draws only; `RemixUiRasChannel` governs the UI overlay. |
+| `RemixUiRasChannel` | `True` | The same rule for orthographic (UI overlay) draws. **This is the knob that removes Wind Waker's leaked title-screen HUD** — hearts, D-pad, item icons, the R counter. Not settled: the same build was also missing PRESS START and produced an empty overlay on one frame, so it may over-suppress. `False` reinstates the leak. Judge it on a frame that contains PRESS START, never on one without. |
 | `RemixWorldScissorSkip` | `True` | Skips world draws whose scissor result is empty. The world path read scissor state nowhere, so a draw the game hid by scissoring it away was drawn in full — and cast shadows. Only the all-or-nothing case is acted on; a path tracer has no screen-space clip. |
 
 **Performance:** the main lever is `RemixUiOverlayScale` (default `1.0`). The UI

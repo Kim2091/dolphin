@@ -535,6 +535,7 @@ public:
   // stage 0 consumes it, which is the pre-fix behaviour. On, each half takes the
   // channel named by the stage that actually reads ras.
   bool GxRasChannelEnabled() const { return m_gx_ras_channel; }
+  bool UiRasChannelEnabled() const { return m_ui_ras_channel; }
 
   // False submits world draws the console scissored down to nothing, which is
   // the pre-fix behaviour: the world path read scissor state nowhere.
@@ -838,6 +839,7 @@ private:
   bool m_gx_blend = true;
   bool m_gx_light_fix = true;
   bool m_gx_ras_channel = true;
+  bool m_ui_ras_channel = true;
   bool m_world_scissor_skip = true;
 
   // Camera recovery state. m_view maps world -> view and is built by

@@ -1444,23 +1444,24 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const bool gx_blend = g_remix_api->GxBlendEnabled();
   //
-  // WORLD PATH ONLY, and measured rather than cautious. The per-stage channel is
-  // just as true of an orthographic draw, but the UI overlay consumes the result
-  // differently: the rasterizer reads its `r` input out of the submitted vertex
-  // colour, so promoting a draw from "no channel, write opaque white" to "channel
-  // 0, write the vertex colour" hands it a vertex alpha of 0 and the whole
-  // element resolves to alpha 0. On Wind Waker's title screen that is EVERY UI
-  // draw: with the knob applied to ortho draws the overlay came out completely
-  // empty (HasContent false, ui_upload_us 0), title art and all.
+  // The two paths take the rule from separate knobs, because they fail in
+  // opposite directions and have to be A/B-able apart.
   //
-  // Whether console agrees that those draws are invisible is exactly the question
-  // the UI-side alpha rework was meant to answer, and that work is gated off - the
-  // heart-vs-logo measurement it depended on came back with no discriminator. So
-  // the UI path keeps the pre-fix stage-0 resolution until something has measured
-  // what it should be instead.
+  // Ortho draws are where this MATTERS: the overlay's software rasterizer reads
+  // its `r` input out of the submitted vertex colour, so promoting a draw from
+  // "no channel, write opaque white" to "channel 0, write the vertex colour"
+  // hands it Wind Waker's actual UI vertex alpha of 0 and the element resolves
+  // away. That is what removes the leaked gameplay HUD from the title screen -
+  // observed by eye, and the only change known to do it.
+  //
+  // The same promotion also emptied frame 600 completely (HasContent false), and
+  // the screenshot that showed the HUD gone was also missing PRESS START. So it
+  // over-suppresses somewhere. On by default anyway - a leaked HUD is the worse
+  // failure - but see RemixUiRasChannel's comment for what is still unsettled.
+  const bool ras_channel =
+      is_ortho ? g_remix_api->UiRasChannelEnabled() : g_remix_api->GxRasChannelEnabled();
   const RasterColor raster_color =
-      ResolveRasterColor(decl, g_remix_api->GxColorEnabled(), gx_blend,
-                         g_remix_api->GxRasChannelEnabled() && !is_ortho);
+      ResolveRasterColor(decl, g_remix_api->GxColorEnabled(), gx_blend, ras_channel);
   const int color_slot = raster_color.vertex_slot;
   if (raster_color.channel_split)
     ++stats.ras_channel_split;

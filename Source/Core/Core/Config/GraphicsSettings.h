@@ -150,6 +150,7 @@ extern const Info<bool> GFX_REMIX_UI_DROP_DST_ALPHA;
 extern const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES;
 extern const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB;
 extern const Info<bool> GFX_REMIX_GX_RAS_CHANNEL;
+extern const Info<bool> GFX_REMIX_UI_RAS_CHANNEL;
 extern const Info<bool> GFX_REMIX_WORLD_SCISSOR_SKIP;
 
 // Graphics.Enhancements

@@ -599,6 +599,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
+  m_ui_ras_channel = Config::Get(Config::GFX_REMIX_UI_RAS_CHANNEL);
   m_world_scissor_skip = Config::Get(Config::GFX_REMIX_WORLD_SCISSOR_SKIP);
   m_light_range = std::max(1.0f, Config::Get(Config::GFX_REMIX_LIGHT_RANGE));
   // World space starts as view space and drifts away from it as the estimator

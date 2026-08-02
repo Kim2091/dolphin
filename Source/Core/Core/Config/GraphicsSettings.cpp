@@ -506,17 +506,35 @@ const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiSca
 // different vertex attributes the colour half wins and the frame line's
 // "colour ... split" counter says so.
 //
-// WORLD DRAWS ONLY. Orthographic draws are deliberately left on the stage-0
-// resolution: the UI overlay's software rasterizer takes its rasterized-alpha
-// input from the submitted vertex colour, so a UI draw promoted from "no
-// channel, write opaque white" to "channel 0, write the vertex colour" gets a
-// vertex alpha of 0 and resolves to fully transparent. Applying this to ortho
-// draws emptied Wind Waker's title-screen overlay completely - title art
-// included. What a UI draw's rasterized alpha SHOULD be is the question the
-// UI-side alpha rework exists to answer, and that work is not in yet.
+// WORLD DRAWS ONLY - orthographic draws are governed by RemixUiRasChannel below.
 //
 // False = stage 0's channel for both halves, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
+// The same per-stage rasterized-channel rule, applied to orthographic (UI
+// overlay) draws.
+//
+// This is separated from RemixGxRasChannel because it is the one knob known to
+// change Wind Waker's title-screen HUD leak, and it needs to be A/B-able on its
+// own. With it ON the leaked gameplay HUD - hearts, D-pad, item icons, the R
+// counter - is GONE from the overlay, observed by eye on the build at commit
+// 495ea26957. The mechanism is direct: the overlay's software rasterizer reads
+// its rasterized-alpha input out of the submitted vertex colour, so a draw
+// promoted from "no channel, write opaque white" to "channel 0, write the vertex
+// colour" gets Wind Waker's actual UI vertex alpha of 0 and resolves away.
+//
+// It is ON by default because a leaked HUD is the worse of the two failures, but
+// this is NOT settled and the caveat is concrete: the same screenshot is also
+// missing PRESS START and the Japanese subtitle, and frame 600 of that run
+// produced no overlay at all (HasContent false). So it plausibly over-suppresses
+// legitimate UI along with the leak. The frame it was first judged on is not
+// enough - always confirm against a frame that contains PRESS START, and read
+// ui_upload_us in the frame line, not one dump.
+//
+// What a UI draw's rasterized alpha SHOULD be is still the open question; this
+// knob is the best answer measured so far, not the right one derived.
+//
+// False = stage 0's channel, which reinstates the HUD leak.
+const Info<bool> GFX_REMIX_UI_RAS_CHANNEL{{System::GFX, "Settings", "RemixUiRasChannel"}, true};
 // Skip world draws whose scissor rectangle is empty.
 //
 // Every reference implementation clips every draw: the software rasterizer
