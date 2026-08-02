@@ -285,6 +285,17 @@ public:
                               MathUtil::Rectangle<int>* display_rect);
 
   virtual void BindTextures(BitSet32 used_textures, const std::array<SamplerState, 8>& samplers);
+
+  // The cache entry currently bound to `stage`, or a null reference. Read-only,
+  // and additive: nothing in VideoCommon uses it.
+  //
+  // BindTextures hands backends an AbstractTexture and nothing else, which is
+  // enough for every backend that actually performs EFB copies. A backend that
+  // does not perform them needs to know WHERE in GC memory a bound texture came
+  // from, because a texture decoded out of an EFB copy's untouched destination
+  // looks completely ordinary - it has pixels, it hashes, it just decodes stale
+  // bytes - and the address is the only thing that gives it away.
+  const RcTcacheEntry& GetBoundEntry(u32 stage) const { return m_bound_textures[stage]; }
   void CopyRenderTargetToTexture(u32 dstAddr, EFBCopyFormat dstFormat, u32 width, u32 height,
                                  u32 dstStride, bool is_depth_copy,
                                  const MathUtil::Rectangle<int>& srcRect, bool isIntensity,

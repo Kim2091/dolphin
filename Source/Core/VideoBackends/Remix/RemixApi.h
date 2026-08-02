@@ -11,6 +11,8 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/HookableEvent.h"
+// For MathUtil::Rectangle, the type VideoCommon hands EFB copy source rects in.
+#include "Common/MathUtil.h"
 
 #include "VideoBackends/Remix/RemixUiRaster.h"
 
@@ -185,6 +187,25 @@ struct FrameStats
   // classification one.
   u32 ui_placed = 0;
   u32 ui_unplaceable = 0;
+  // UI draws refused, and why. Both are removals of content that WOULD have been
+  // painted, so they belong in the frame line next to ui_placed rather than in a
+  // trace-only log: a menu that vanishes in some other game is diagnosed by
+  // reading these, and by nothing else.
+  //
+  // `ui_skipped_dst_alpha`  - blend factors that read EFB alpha, which the
+  //   overlay does not have. Expect at most about one per frame; more than that
+  //   and the rule is eating legitimate UI.
+  // `ui_skipped_efb_copy_tex` - textured from an EFB copy's destination, which
+  //   this backend never writes, so the texels are stale memory.
+  u32 ui_skipped_dst_alpha = 0;
+  u32 ui_skipped_efb_copy_tex = 0;
+  // EFB copies the game triggered this frame, and the subset that could hide a
+  // UI draw: not the XFB copy, and carrying the clear bit, so the region it
+  // took is wiped off the EFB before anything reaches the screen. A frame whose
+  // `efb_copies_scratch` is zero cannot be composing anything off-screen, which
+  // is the whole hypothesis in one number.
+  u32 efb_copies = 0;
+  u32 efb_copies_scratch = 0;
   // Microseconds spent rasterizing the overlay, and handing it to the runtime.
   // Split because they have different fixes: the first is this backend's inner
   // loop, the second is a per-frame staging-buffer create plus a multi-megabyte
@@ -205,6 +226,51 @@ struct FrameStats
   // for it - so this quantifies how much of the frame's light was ambient before
   // anyone reaches for RemixLightScale.
   bool ambient_bright = false;
+};
+
+// One EFB copy the game triggered, stamped WHERE IT HAPPENED. Recorded rather
+// than re-read at frame end for the usual reason: every field here is per-copy
+// BP state, and a frame-end read of bpmem sees only the last copy's.
+//
+// This backend executes no copies (RemixTextureCache::CopyEFB writes nothing),
+// but the console-side consequence of one still decides what is on screen: a
+// copy that takes a region and sets the clear bit wipes that region off the EFB
+// (BPStructs.cpp:377-393), so anything drawn into it beforehand never reaches
+// the XFB.
+struct EfbCopyEvent
+{
+  // FrameStats::draws_seen at the moment the copy fired. Every draw increments
+  // that counter (RemixVertexManager.cpp:1016), so `copy.seq >= draw.seq`
+  // orders the two events exactly, with no extra clock.
+  u32 seq = 0;
+  // EFB-native source rect, right/bottom exclusive - BPStructs.cpp:249-256.
+  MathUtil::Rectangle<int> rect = {};
+  u32 dst_addr = 0;
+  u8 copy_format = 0;
+  // EFBCopyFormat::XFB, i.e. the copy that ends the frame rather than one that
+  // builds an off-screen image.
+  bool xfb = false;
+  bool clear = false;
+  // A box-filtered 2:1 downsample (UPE_Copy::half_scale). Bloom and glow chains
+  // use it; a pixel-exact compose of the same region cannot.
+  bool half_scale = false;
+};
+
+// One UI draw's EFB-space footprint, recorded in the draw path so it can be
+// compared against the frame's copies. In the SAME space and convention as
+// EfbCopyEvent::rect - EFB units, right/bottom exclusive - because the whole
+// point is the containment test between them.
+struct UiDrawFootprint
+{
+  u32 seq = 0;
+  int left = 0;
+  int top = 0;
+  int right = 0;
+  int bottom = 0;
+  u64 texture_hash = 0;
+  bool tev_alpha_known = false;
+  bool depth_test = false;
+  bool depth_write = false;
 };
 
 // Per-draw facts the sky classifier RECORDS but never classifies on. They exist
@@ -354,6 +420,23 @@ struct DrawBlendState
   u8 dst_alpha_factor = 0;
   u8 alpha_blend_op = 0;
   u8 write_mask = 0xF;  // R | G | B | A
+
+  // bpmem.zmode, carried purely so the UI footprint audit can report it. The
+  // overlay rasterizer has no depth buffer by design (RemixUiRaster.h:34-37), so
+  // a UI draw that the console's Z test would have rejected is drawn here
+  // regardless - these two say whether that is even possible for a given draw.
+  // Nothing reads them to make a decision.
+  bool depth_test = false;
+  bool depth_write = false;
+
+  // Where stage 0's texture came from in GC memory, and whether the cache calls
+  // it a copy. Stamped from the bound TCacheEntry, which is the only thing that
+  // knows: RemixTexture cannot tell a texture decoded out of an EFB copy's
+  // destination apart from any other texture, because on this backend nothing
+  // ever wrote that destination and the decode of the stale bytes succeeds.
+  u32 texture_addr = 0;
+  bool texture_is_efb_copy = false;
+  bool texture_is_xfb_copy = false;
 };
 
 // Owner of everything that talks to the Remix runtime. Created by
@@ -500,6 +583,23 @@ public:
   //
   void NoteDrawLights(const DrawLightState& state);
 
+  // --- Called from RemixTextureCache ---
+
+  // Records one EFB copy. Called synchronously from
+  // Remix::TextureCache::CopyEFB, which VideoCommon invokes from
+  // TextureCacheBase::CopyRenderTargetToTexture (:2399) while the triggering BP
+  // state is still live - that is what makes reading bpmem.triggerEFBCopy at the
+  // call site correct rather than a frame-end guess.
+  //
+  // Recording is on whenever the audit or the filter is, and off otherwise, so
+  // an untraced run pays nothing.
+  void NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_addr, u8 copy_format, bool xfb,
+                   bool clear, bool half_scale);
+
+  // True when NoteEfbCopy should record. Read by the texture cache before it
+  // touches bpmem at all.
+  bool RecordEfbCopies() const { return m_trace_efb_copies; }
+
   FrameStats& Stats() { return m_stats; }
 
   // Cached at Initialize rather than read per draw - the classifier runs on
@@ -576,6 +676,18 @@ private:
     u32 vertices = 0;
   };
   static constexpr size_t MAX_PROJECTION_VARIANTS = 8;
+  // Ceilings on the frame's audit event logs. A frame legitimately triggers a
+  // handful of EFB copies and up to a couple of hundred UI draws; these exist
+  // only so a runaway game cannot grow either vector without bound. Overflow is
+  // conservative in both directions - an unrecorded copy hides nothing and an
+  // unrecorded footprint is never suppressed.
+  static constexpr size_t MAX_EFB_COPY_EVENTS = 256;
+  static constexpr size_t MAX_UI_FOOTPRINTS = 1024;
+  // Ceiling on the session-long set of EFB copy DESTINATIONS. Games reuse a
+  // small pool of render-target addresses - Wind Waker's whole run uses three -
+  // so this is generous, and overflow is conservative: an unrecorded destination
+  // means a garbage-textured draw is drawn rather than a good one refused.
+  static constexpr size_t MAX_EFB_COPY_DESTINATIONS = 64;
   // Ceiling on distinct modelviews tracked per frame, so a game that gives every
   // draw its own matrix cannot grow the map without bound. Overflowing draws are
   // counted and dropped - the histogram is then incomplete, which is itself the
@@ -775,6 +887,25 @@ private:
   // Non-zero dumps the composited overlay at that frame index to
   // Logs/remix-ui-overlay.bmp, once. Diagnostic only; nothing reads it back.
   int m_ui_dump_frame = 0;
+  // Frame-scoped event logs for the EFB-copy audit. Both are appended to where
+  // the event happens - copies in the texture cache, footprints in the UI draw
+  // path - and consumed together at frame end. Cleared in OnAfterFrame.
+  //
+  // The frame's own XFB copy IS in here by the time they are read:
+  // after_frame_event is triggered from inside the XFB copy handler
+  // (BPStructs.cpp:353), after CopyRenderTargetToTexture has already run.
+  std::vector<EfbCopyEvent> m_efb_copies;
+  std::vector<UiDrawFootprint> m_ui_footprints;
+  // NOT cleared in OnAfterFrame, unlike the two above - see NoteEfbCopy for why
+  // this one is session-long. Small enough that a linear scan is the right
+  // lookup: Wind Waker's entire run puts three addresses in it.
+  std::vector<u32> m_efb_copy_destinations;
+  bool m_trace_efb_copies = true;
+  // Read once in Initialize, never in the draw path. OFF for either is exactly
+  // the pre-change behaviour: the draw is classified and submitted as before.
+  bool m_ui_drop_dst_alpha = true;
+  bool m_ui_drop_efb_copy_textures = false;
+  void AuditUiFootprints();
   void SubmitScreenOverlay();
   // The frustum SetupCamera actually submitted, published so the UI plane fills
   // the same one. Defaults match SetupCamera's own fallback, which is what a

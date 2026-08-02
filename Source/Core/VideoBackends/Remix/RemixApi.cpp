@@ -12,6 +12,7 @@
 #include <iterator>
 #include <chrono>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -609,6 +610,9 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
       static_cast<u32>(std::max(1, Config::Get(Config::GFX_REMIX_SKY_AUTO_FRAMES)));
   m_sky_auto_min_extent = std::max(0.0f, Config::Get(Config::GFX_REMIX_SKY_AUTO_MIN_EXTENT));
   m_sky_auto_untextured_ignore = Config::Get(Config::GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE);
+  m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
+  m_ui_drop_dst_alpha = Config::Get(Config::GFX_REMIX_UI_DROP_DST_ALPHA);
+  m_ui_drop_efb_copy_textures = Config::Get(Config::GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES);
   m_sky_candidates.clear();
   m_sky_classified.clear();
 
@@ -1363,6 +1367,54 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
   m_pending_instances.push_back(pending);
 }
 
+void RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_addr, u8 copy_format,
+                           bool xfb, bool clear, bool half_scale)
+{
+  ++m_stats.efb_copies;
+  if (!xfb && clear)
+    ++m_stats.efb_copies_scratch;
+
+  // The set of GC addresses this session has ever aimed an EFB copy at. Kept
+  // ACROSS frames, not per frame, because the property it records is permanent:
+  // this backend writes no EFB copy, ever, so that memory holds whatever was
+  // there before for the whole run. A per-frame set would only catch a game that
+  // copies and samples in the same frame, and would miss one that composes once
+  // at load and samples the result for the next ten minutes.
+  //
+  // The XFB copy is excluded. It is the frame's presentation copy rather than an
+  // off-screen surface a UI element samples, and its destination is a buffer
+  // VideoCommon manages on its own terms.
+  //
+  // Address 0 is never recorded: DrawBlendState::texture_addr is 0 for an
+  // untextured draw, so admitting it would refuse every untextured UI draw in
+  // the game.
+  if (!xfb && dst_addr != 0 && m_efb_copy_destinations.size() < MAX_EFB_COPY_DESTINATIONS &&
+      std::find(m_efb_copy_destinations.begin(), m_efb_copy_destinations.end(), dst_addr) ==
+          m_efb_copy_destinations.end())
+  {
+    m_efb_copy_destinations.push_back(dst_addr);
+  }
+
+  if (!m_trace_efb_copies)
+    return;
+
+  // A frame cannot legitimately need more than a handful of these; the cap only
+  // exists so a runaway game cannot grow the vector without bound. Overflowing
+  // copies are still counted above, so the summary stays honest about them.
+  if (m_efb_copies.size() >= MAX_EFB_COPY_EVENTS)
+    return;
+
+  EfbCopyEvent event;
+  event.seq = m_stats.draws_seen;
+  event.rect = src_rect;
+  event.dst_addr = dst_addr;
+  event.copy_format = copy_format;
+  event.xfb = xfb;
+  event.clear = clear;
+  event.half_scale = half_scale;
+  m_efb_copies.push_back(event);
+}
+
 void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                             const std::vector<u32>& indices, const float* modelview,
                             const std::array<float, 6>& ortho_projection,
@@ -1374,6 +1426,55 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     return;
   if (m_interface.DrawScreenOverlay == nullptr)
     return;
+
+  // Draws this compositing model cannot represent, refused before anything else
+  // happens - ahead of Begin(), so a frame whose ONLY UI draws are these still
+  // counts as a frame with no UI and sends no overlay at all.
+  //
+  // Destination-alpha blending. The factors arrive already translated into
+  // Vulkan's numbering by ToVkSrcFactor / ToVkDstFactor
+  // (RemixVertexManager.cpp:343-355), where DST_ALPHA = 8 and
+  // ONE_MINUS_DST_ALPHA = 9 for both the source and the destination table - and
+  // where RemoveDstAlphaUsage has ALREADY rewritten them to One/Zero if the EFB
+  // format has no alpha channel, so anything still reading 8 or 9 here is a draw
+  // whose result genuinely depends on EFB alpha. The overlay has no EFB alpha to
+  // offer and its own accumulated alpha is not a stand-in: these draws are
+  // post-process passes over the 3D scene, so the value they want is what the 3D
+  // pass wrote.
+  //
+  // Colour factors only. The alpha equation's factors decide the destination
+  // ALPHA, which on the overlay is coverage rather than a colour anyone sees, and
+  // widening the rule to them would refuse draws whose visible output is fine.
+  if (m_ui_drop_dst_alpha && blend.blend_enabled &&
+      (blend.src_color_factor == 8 || blend.src_color_factor == 9 ||
+       blend.dst_color_factor == 8 || blend.dst_color_factor == 9))
+  {
+    ++m_stats.ui_skipped_dst_alpha;
+    return;
+  }
+
+  // Textured from an EFB copy's destination. Nothing writes that memory on this
+  // backend, so the entry decodes stale bytes; RemixTexture::HasData() is true
+  // for it and the skipped_efb_texture guard, which tests exactly that, does not
+  // fire.
+  //
+  // Matched on the ADDRESS, not on TCacheEntry::is_efb_copy, and that is a
+  // measured choice rather than a preference. The flag is false on every one of
+  // these draws: bSupportsCopyToVram is false on this backend, so
+  // CopyRenderTargetToTexture takes the copy-to-RAM arm and never creates an
+  // EFB-copy cache entry at all. What the game binds afterwards is an ORDINARY
+  // texture entry that happens to be decoded out of the copy's destination, and
+  // the entry's `addr` is the only thing that still says so. Wind Waker's speckle
+  // quad reads src 0x0065ff20, which is exactly the destination the copy
+  // recorder saw one draw earlier, and no other draw in the frame is anywhere
+  // near it.
+  if (m_ui_drop_efb_copy_textures && texture != nullptr && blend.texture_addr != 0 &&
+      std::find(m_efb_copy_destinations.begin(), m_efb_copy_destinations.end(),
+                blend.texture_addr) != m_efb_copy_destinations.end())
+  {
+    ++m_stats.ui_skipped_efb_copy_tex;
+    return;
+  }
 
   // The overlay is sized to the swapchain. Cleared here, at the frame's first UI
   // draw, rather than in OnAfterFrame: a frame that draws no UI must leave the
@@ -1449,6 +1550,16 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   call.clip_right = static_cast<int>(std::ceil(clip[2] * scale_x)) - 1;
   call.clip_bottom = static_cast<int>(std::ceil(clip[3] * scale_y)) - 1;
 
+  // The draw's footprint back in EFB space, for the copy audit. The rasterizer
+  // works in overlay pixels; EFB copy rects are in EFB units, so the comparison
+  // has to happen in the latter - which is the space the incoming viewport and
+  // clip are already in, before the scale above is applied.
+  const bool record_footprint = m_trace_efb_copies;
+  float footprint_left = std::numeric_limits<float>::max();
+  float footprint_top = std::numeric_limits<float>::max();
+  float footprint_right = std::numeric_limits<float>::lowest();
+  float footprint_bottom = std::numeric_limits<float>::lowest();
+
   m_ui_vertices.clear();
   m_ui_vertices.reserve(vertices.size());
   for (const remixapi_HardcodedVertex& source : vertices)
@@ -1480,16 +1591,155 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
                     static_cast<float>(source.color & 0xFF) / 255.0f,
                     static_cast<float>((source.color >> 24) & 0xFF) / 255.0f};
     m_ui_vertices.push_back(vertex);
+
+    if (record_footprint)
+    {
+      // NDC -> EFB, the pre-scale analogue of UiRasterizer's to_screen_x/y. y is
+      // flipped for the same reason: GX ndc y points up and EFB row 0 is the top.
+      const float efb_x = viewport[0] + (vertex.x * 0.5f + 0.5f) * viewport[2];
+      const float efb_y = viewport[1] + (0.5f - vertex.y * 0.5f) * viewport[3];
+      footprint_left = std::min(footprint_left, efb_x);
+      footprint_right = std::max(footprint_right, efb_x);
+      footprint_top = std::min(footprint_top, efb_y);
+      footprint_bottom = std::max(footprint_bottom, efb_y);
+    }
   }
 
   m_ui_raster.Draw(call, m_ui_vertices, indices);
   ++m_stats.ui_placed;
+
+  // Recorded after the rasterizer has taken the draw and keyed by the same
+  // counter the per-draw GX dump uses (RemixVertexManager.cpp:1670 keys on
+  // stats.ui_placed), so audit line i, dump line i and overlay draw i are the
+  // same draw.
+  if (record_footprint && m_ui_footprints.size() < MAX_UI_FOOTPRINTS)
+  {
+    UiDrawFootprint footprint;
+    footprint.seq = m_stats.draws_seen;
+    // Right/bottom exclusive, matching the EFB copy rect convention
+    // (BPStructs.cpp:255-256) that this is compared against.
+    footprint.left = static_cast<int>(std::floor(footprint_left));
+    footprint.top = static_cast<int>(std::floor(footprint_top));
+    footprint.right = static_cast<int>(std::ceil(footprint_right));
+    footprint.bottom = static_cast<int>(std::ceil(footprint_bottom));
+    // Clipped by the draw's own scissor: a quad the scissor cuts down only ever
+    // touched the intersection, and the copy that contains THAT is the copy that
+    // could have hidden it.
+    footprint.left = std::max(footprint.left, static_cast<int>(clip[0]));
+    footprint.top = std::max(footprint.top, static_cast<int>(clip[1]));
+    footprint.right = std::min(footprint.right, static_cast<int>(clip[2]));
+    footprint.bottom = std::min(footprint.bottom, static_cast<int>(clip[3]));
+    footprint.texture_hash = texture != nullptr ? texture->GetContentHash() : 0;
+    footprint.tev_alpha_known = blend.tev_alpha_known;
+    footprint.depth_test = blend.depth_test;
+    footprint.depth_write = blend.depth_write;
+    m_ui_footprints.push_back(footprint);
+  }
+}
+
+namespace
+{
+// Which recorded copy, if any, swallowed this UI draw. The rule, entirely from
+// console behaviour:
+//   - not the XFB copy: that one ENDS the frame, everything before it is on
+//     screen by definition;
+//   - the clear bit is set: without it the copy reads the region and leaves it
+//     alone, so the draw is still there when the XFB copy runs
+//     (BPStructs.cpp:377-393 is the clear);
+//   - the copy fired at or after the draw was submitted - a copy earlier in the
+//     frame cannot have taken pixels that did not exist yet;
+//   - the copy's rect fully CONTAINS the draw's, not merely overlaps it. A
+//     partial overlap means part of the draw survived onto the screen, and the
+//     console drew it.
+// Returns SIZE_MAX for a live draw.
+size_t FindScratchCopy(const UiDrawFootprint& draw, const std::vector<EfbCopyEvent>& copies)
+{
+  // A degenerate footprint is contained by everything, which would make every
+  // zero-area draw a false positive.
+  if (draw.right <= draw.left || draw.bottom <= draw.top)
+    return SIZE_MAX;
+
+  for (size_t i = 0; i < copies.size(); ++i)
+  {
+    const EfbCopyEvent& copy = copies[i];
+    if (copy.xfb || !copy.clear)
+      continue;
+    if (copy.seq < draw.seq)
+      continue;
+    if (copy.rect.left <= draw.left && copy.rect.top <= draw.top &&
+        copy.rect.right >= draw.right && copy.rect.bottom >= draw.bottom)
+    {
+      return i;
+    }
+  }
+  return SIZE_MAX;
+}
+}  // namespace
+
+void RemixApi::AuditUiFootprints()
+{
+  // Log-only. Every copy of the frame is already recorded by the time this runs:
+  // OnAfterFrame is triggered from inside the XFB-copy handler
+  // (BPStructs.cpp:353), after CopyRenderTargetToTexture, and SubmitScreenOverlay
+  // is called from OnAfterFrame.
+  if (!m_trace_efb_copies || !ShouldTraceDraws())
+    return;
+  if (m_efb_copies.empty() && m_ui_footprints.empty())
+    return;
+
+  u32 tex_copies = 0;
+  u32 tex_clear_copies = 0;
+  u32 xfb_copies = 0;
+  for (size_t i = 0; i < m_efb_copies.size(); ++i)
+  {
+    const EfbCopyEvent& copy = m_efb_copies[i];
+    if (copy.xfb)
+      ++xfb_copies;
+    else if (copy.clear)
+      ++tex_clear_copies;
+    else
+      ++tex_copies;
+    INFO_LOG_FMT(VIDEO,
+                 "Remix EFB copy {}: seq {} rect [{},{} -> {},{}] dst {:#010x} fmt {} xfb {} "
+                 "clear {} half {}",
+                 i, copy.seq, copy.rect.left, copy.rect.top, copy.rect.right, copy.rect.bottom,
+                 copy.dst_addr, copy.copy_format, copy.xfb ? 1 : 0, copy.clear ? 1 : 0,
+                 copy.half_scale ? 1 : 0);
+  }
+
+  u32 scratch = 0;
+  for (size_t i = 0; i < m_ui_footprints.size(); ++i)
+  {
+    const UiDrawFootprint& draw = m_ui_footprints[i];
+    const size_t copy_index = FindScratchCopy(draw, m_efb_copies);
+    if (copy_index != SIZE_MAX)
+      ++scratch;
+    // Capped so a screen full of 2D cannot flood the log; the summary below
+    // still counts every draw.
+    if (i >= 160)
+      continue;
+    INFO_LOG_FMT(VIDEO,
+                 "Remix UI audit {}: seq {} rect [{},{} -> {},{}] tex {:#018x} tevA {} ztest {} "
+                 "zwrite {} -> {}",
+                 i, draw.seq, draw.left, draw.top, draw.right, draw.bottom, draw.texture_hash,
+                 draw.tev_alpha_known ? 1 : 0, draw.depth_test ? 1 : 0, draw.depth_write ? 1 : 0,
+                 copy_index == SIZE_MAX ? std::string("LIVE") :
+                                          fmt::format("SCRATCH(copy {})", copy_index));
+  }
+
+  INFO_LOG_FMT(VIDEO,
+               "Remix UI audit: {} UI draws, {} scratch, {} live | copies {} ({} tex, {} tex+clear,"
+               " {} xfb)",
+               m_ui_footprints.size(), scratch, m_ui_footprints.size() - scratch,
+               m_efb_copies.size(), tex_copies, tex_clear_copies, xfb_copies);
 }
 
 void RemixApi::SubmitScreenOverlay()
 {
   if (m_ui_mode != 1 || m_interface.DrawScreenOverlay == nullptr)
     return;
+
+  AuditUiFootprints();
 
   // Replay the frame's recorded draws across the worker bands. This is where the
   // rasterization actually happens, so it is what the raster timing measures.
@@ -3071,7 +3321,9 @@ void RemixApi::OnAfterFrame()
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
-                 "unplaceable, {} tev-alpha, bail s{}/k{}/c{}/r{}, raster {} us, upload {} us) | sky auto: candidates {}, "
+                 "unplaceable, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} dstalpha + {} "
+                 "efbcopytex, raster {} us, upload {} us) | "
+                 "efb copies {} ({} non-xfb+clear) | sky auto: candidates {}, "
                  "classified {}, tagged {} ({} ignored) (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
@@ -3087,8 +3339,10 @@ void RemixApi::OnAfterFrame()
                  m_stats.ambient_bright ? "bright" : "dim", m_stats.ui_placed,
                  m_stats.ui_unplaceable, m_stats.ui_tev_alpha, m_stats.tev_bail_stages,
                  m_stats.tev_bail_konst, m_stats.tev_bail_compare, m_stats.tev_bail_rasterized,
+                 m_stats.ui_skipped_dst_alpha, m_stats.ui_skipped_efb_copy_tex,
                  m_stats.ui_raster_us,
                  m_stats.ui_upload_us,
+                 m_stats.efb_copies, m_stats.efb_copies_scratch,
                  m_stats.sky_auto_candidates,
                  m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
                  m_sky_auto_detect);
@@ -3116,6 +3370,10 @@ void RemixApi::OnAfterFrame()
   m_view_samples.clear();
   m_view_duplicate_hashes.clear();
   m_ui_frame_begun = false;
+  // Frame-scoped audit logs. Cleared here, at the same point the overlay's own
+  // frame flag is, so the next frame's copies and footprints start empty.
+  m_efb_copies.clear();
+  m_ui_footprints.clear();
   ++m_frame_index;
 }
 

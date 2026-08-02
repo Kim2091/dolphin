@@ -389,6 +389,83 @@ const Info<std::string> GFX_REMIX_SKY_VETO_HASHES{
 // False = tag every auto-classified draw SKY, the pre-flag behaviour.
 const Info<bool> GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE{
     {System::GFX, "Settings", "RemixSkyAutoUntexturedIgnore"}, true};
+// Record every EFB copy the game triggers - rect, destination, XFB-or-not, the
+// clear bit - and, on trace frames, print each UI draw's EFB-space footprint
+// next to a verdict on whether a non-XFB copy+clear later in the same frame
+// swallowed it.
+//
+// It exists to answer one question with console truth rather than with more
+// heuristics. A UI draw is invisible on hardware if the region it drew into is
+// copied off-screen and then cleared before the frame reaches the XFB - whatever
+// that draw's own blend, alpha and scissor state says about it. This backend
+// executes no EFB copies at all (RemixTextureCache), so such a draw survives to
+// the overlay and appears on screen. Four alpha/blend/scissor discriminators
+// were already tried on Wind Waker's title screen and none of them separated the
+// spurious HUD from the real title art; what happens to the EFB pixels
+// AFTERWARDS is the remaining console-side difference between the two.
+//
+// Log-only, and the heavy per-draw lines are gated to ShouldTraceDraws()
+// frames, so it defaults on the same way RemixTraceModelviews does.
+const Info<bool> GFX_REMIX_TRACE_EFB_COPIES{{System::GFX, "Settings", "RemixTraceEfbCopies"}, true};
+// Skip UI overlay draws whose blend factors read the DESTINATION ALPHA.
+//
+// The overlay is composited over a finished path-traced image at present time.
+// There is no EFB alpha for a destination-alpha factor to read, so a draw that
+// blends against it is not representable in this compositing model at all - and
+// it is not merely an approximation problem, because the value it wants is what
+// the 3D pass wrote, not what the overlay accumulated. Emulating it against the
+// overlay's own alpha would look right on a UI-only screen and be silently wrong
+// on a post-process pass, which is exactly where these draws come from.
+//
+// Today such a draw matches neither arm of SubmitUiDraw's classifier and falls
+// through to Over at full weight, which is the worst available answer: Wind
+// Waker's glare/scatter pass is a full-screen untextured quad with
+// DstAlpha/One, so it lands as an opaque wash over the entire title screen.
+// Skipping it is strictly better, and for a glare pass specifically it is
+// correct - Remix does its own bloom and glare.
+//
+// Narrow on purpose. It does not touch SrcAlpha/InvSrcAlpha, so a fade to black
+// survives by construction, and it says nothing about full-screen ortho draws in
+// general. Wind Waker's whole title screen contains exactly one such draw per
+// frame; a count much above one per frame is the sign it is over-reaching.
+//
+// False = classify as before, i.e. fall through to Over.
+const Info<bool> GFX_REMIX_UI_DROP_DST_ALPHA{{System::GFX, "Settings", "RemixUiDropDstAlpha"}, true};
+// Skip UI overlay draws textured from the destination of an EFB copy.
+//
+// This backend executes no EFB copies (RemixTextureCache::CopyEFB copies
+// nothing), so the GC memory an EFB copy targets keeps whatever was there
+// before. A cache entry decoded out of that memory is not empty - it decodes
+// successfully, from stale bytes - so RemixTexture::HasData() is true and the
+// existing skipped_efb_texture guard, which tests exactly that, lets it through.
+// The result is a quad painted with garbage: Wind Waker's white-noise speckle,
+// whose texture hash is byte-identical across 27 trace frames of moving camera
+// because no one is writing the source.
+//
+// There is no correct content available for such a draw, and inventing some
+// would be worse than omitting it, so it is omitted. The counter in the frame
+// line is the diagnostic for the real risk here: a game that legitimately
+// composes its menu through an EFB copy loses that menu, and the count is what
+// makes that recognisable instead of mysterious.
+//
+// DEFAULT OFF, and measured rather than cautious. On Wind Waker's title screen
+// this fires on exactly the draw it was designed for - one per frame, the
+// full-screen compose quad whose texture sits at 0x0065ff20, the address the
+// copy recorder saw one draw earlier - and removing it changes ZERO pixels of
+// the overlay dump. That draw's alpha test is "alpha > 0" and the stale bytes it
+// decodes are transparent, so it paints nothing to begin with. The white-noise
+// speckle it was blamed for is a different thing entirely: the item-box texture
+// 0x745553491ccc0dba at 0x00ea1580, an ordinary heap address that no EFB copy
+// has ever targeted, and the white field behind it was the destination-alpha
+// wash above.
+//
+// So the rule is principled but has no demonstrated benefit, while its risk - a
+// game that legitimately composes a menu through an EFB copy losing that menu -
+// is real. It stays off until some game shows a symptom it actually fixes.
+//
+// False = draw it, garbage and all.
+const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES{
+    {System::GFX, "Settings", "RemixUiDropEfbCopyTextures"}, false};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

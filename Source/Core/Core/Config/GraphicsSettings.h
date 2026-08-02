@@ -145,6 +145,9 @@ extern const Info<int> GFX_REMIX_SKY_AUTO_FRAMES;
 extern const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT;
 extern const Info<std::string> GFX_REMIX_SKY_VETO_HASHES;
 extern const Info<bool> GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE;
+extern const Info<bool> GFX_REMIX_TRACE_EFB_COPIES;
+extern const Info<bool> GFX_REMIX_UI_DROP_DST_ALPHA;
+extern const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES;
 
 // Graphics.Enhancements
 

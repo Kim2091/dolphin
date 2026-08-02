@@ -25,6 +25,9 @@
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/NativeVertexFormat.h"
 #include "VideoCommon/RenderState.h"
+// For the bound cache entry's GC address and copy flags - the only place that
+// knows a texture was decoded out of an EFB copy's destination.
+#include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/XFMemory.h"
 
@@ -37,6 +40,12 @@ namespace
 // lot of it will look darker after translation no matter how well the lights
 // themselves are converted, and the log should be able to say that.
 constexpr u8 AMBIENT_BRIGHT_THRESHOLD = 63;
+
+// How many UI draws the per-draw GX dump prints on a trace frame. Wind Waker's
+// title screen is 104 draws and its busiest attract scene 170, so this is sized
+// to cover a whole screen rather than the first handful - a window that stops at
+// 12 records the title art and misses every HUD sprite behind it.
+constexpr u32 UI_DRAW_DUMP_LIMIT = 160;
 
 // Dolphin's vertex loader writes vertex colors as a u32 whose memory order is
 // R, G, B, A. Remix reads remixapi_HardcodedVertex::color as
@@ -1125,10 +1134,24 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   u8 filter_mode = 1;   // MDL Filter::Linear
   u8 wrap_mode_u = 1;   // MDL WrapMode::Repeat
   u8 wrap_mode_v = 1;
+  // Provenance of stage 0's texture, taken from the cache entry rather than from
+  // the texture, because the texture cannot tell: on this backend an EFB copy
+  // writes nothing, so an entry over that memory decodes stale bytes perfectly
+  // happily and is indistinguishable from a real texture by content alone.
+  u32 texture_addr = 0;
+  bool texture_is_efb_copy = false;
+  bool texture_is_xfb_copy = false;
 
   if (stage0_textured)
   {
     albedo = g_remix_api->GetBoundTexture(stage0_texmap);
+    const RcTcacheEntry& entry = g_texture_cache->GetBoundEntry(stage0_texmap);
+    if (entry)
+    {
+      texture_addr = entry->addr;
+      texture_is_efb_copy = entry->is_efb_copy;
+      texture_is_xfb_copy = entry->is_xfb_copy;
+    }
     // Our texture cache does not execute EFB/XFB copies, so an entry produced
     // by one never receives pixels through Load(). That is exactly the set of
     // draws we cannot translate (dynamic shadow maps, heat haze, water
@@ -1277,6 +1300,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   blend.color_operation = REMIX_TEX_OP_MODULATE;
   blend.tfactor = raster_color.tfactor;
   blend.vertex_color_is_baked_lighting = raster_color.baked_lighting;
+  blend.texture_addr = texture_addr;
+  blend.texture_is_efb_copy = texture_is_efb_copy;
+  blend.texture_is_xfb_copy = texture_is_xfb_copy;
 
   if (gx_blend)
   {
@@ -1633,6 +1659,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   diagnostics.draw_index = stats.draws_seen;
   diagnostics.position_matrix = position_matrix_slot;
 
+  // The UI path submits a DrawBlendState rather than a DrawDiagnostics, so the
+  // depth state rides along there too. Reported by the EFB-copy audit, read by
+  // nothing.
+  blend.depth_test = bpmem.zmode.test_enable;
+  blend.depth_write = bpmem.zmode.update_enable;
+
   if (!is_ortho)
     g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
 
@@ -1667,26 +1699,40 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // out by a TEV register or konst alpha is invisible on hardware and fully
     // opaque here. This log is what says whether that is actually happening,
     // rather than assuming it.
-    if (g_remix_api->ShouldTraceDraws() && stats.ui_placed < 12)
+    // Cap raised from 12 to 160 because the symptom lives past the old cap: Wind
+    // Waker's title screen submits 104 UI draws and the unexplained HUD sprites
+    // are draws 2-103, so a 12-draw window recorded the title art and nothing
+    // else. 160 covers every draw seen on any screen measured so far, and the
+    // whole block is behind ShouldTraceDraws() (one frame in 120) so the cost off
+    // a trace frame is unchanged.
+    if (g_remix_api->ShouldTraceDraws() && stats.ui_placed < UI_DRAW_DUMP_LIMIT)
     {
       const u32 stages = bpmem.genMode.numtevstages + 1;
       std::string alpha_chain;
       for (u32 stage = 0; stage < stages && stage < 16; ++stage)
       {
+        // r{} is the stage's OWN rasterized colour channel. It is per stage -
+        // bpmem.tevorders[stage >> 1].getColorChan(stage & 1), same indexing as
+        // PixelShaderGen.cpp:257 - and the stage that reads RASA is very often
+        // not stage 0, so reading stage 0's channel and calling it "the draw's
+        // channel" answers a different question than the one being asked.
         alpha_chain += fmt::format(
-            "{}[a{} b{} c{} d{} k{} ->{}]", stage == 0 ? "" : " ",
+            "{}[a{} b{} c{} d{} k{} r{} ->{}]", stage == 0 ? "" : " ",
             static_cast<u32>(bpmem.combiners[stage].alphaC.a.Value()),
             static_cast<u32>(bpmem.combiners[stage].alphaC.b.Value()),
             static_cast<u32>(bpmem.combiners[stage].alphaC.c.Value()),
             static_cast<u32>(bpmem.combiners[stage].alphaC.d.Value()),
             static_cast<u32>(bpmem.tevksel.GetKonstAlpha(stage)),
+            static_cast<u32>(bpmem.tevorders[stage >> 1].getColorChan(stage & 1)),
             static_cast<u32>(bpmem.combiners[stage].alphaC.dest.Value()));
       }
       INFO_LOG_FMT(VIDEO,
-                   "Remix UI draw {}: tex {:#018x} | blend en {} src {} dst {} sub {} logic {} op "
+                   "Remix UI draw {}: tex {:#018x} src {:#010x} efbcopy {} xfbcopy {} | blend en {} "
+                   "src {} dst {} sub {} logic {} op "
                    "{} | colorupd {} alphaupd {} pixfmt {} | atest {:#010x} | dstalpha {:#x} | "
                    "verts {} | tev stages {} alpha {}",
-                   stats.ui_placed, albedo != nullptr ? albedo->GetContentHash() : 0,
+                   stats.ui_placed, albedo != nullptr ? albedo->GetContentHash() : 0, texture_addr,
+                   texture_is_efb_copy ? 1 : 0, texture_is_xfb_copy ? 1 : 0,
                    bpmem.blendmode.blend_enable ? 1 : 0,
                    static_cast<u32>(bpmem.blendmode.src_factor.Value()),
                    static_cast<u32>(bpmem.blendmode.dst_factor.Value()),
@@ -1695,6 +1741,94 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                    bpmem.blendmode.color_update ? 1 : 0, bpmem.blendmode.alpha_update ? 1 : 0,
                    static_cast<u32>(bpmem.zcontrol.pixel_format.Value()), bpmem.alpha_test.hex,
                    bpmem.dstalpha.hex, out_vertices->size(), stages, alpha_chain);
+
+      // Everything that decides the draw's FINAL alpha, in one line, so a HUD
+      // sprite that should be invisible can be told apart from title art that
+      // should not. Three groups, each discriminating a different mechanism:
+      //
+      //   resolved/corners - what the rasterizer will actually apply. If these
+      //     are ~0 and the sprite is still on screen, the bug is downstream in
+      //     the rasterizer, not in the state read.
+      //   creg/konst       - the TEV register and konst alphas as read AT THIS
+      //     DRAW. GXSetTevColor writes land in PixelShaderManager::constants via
+      //     BPWritten, which calls FlushPipeline() before it updates bpmem, so a
+      //     value read here belongs to this draw and not to a later one. Printing
+      //     them is what turns that argument into a measurement.
+      //   chN                - the alpha each XF colour channel would rasterize.
+      //     BOTH channels, because the stage that reads RASA names its own
+      //     channel and it is routinely not the one stage 0 names. The UI path
+      //     writes opaque white into the vertex colour whenever
+      //     ResolveRasterColor cannot name a vertex slot, so a channel whose
+      //     alpha comes from the material register (or from a channel index the
+      //     draw does not rasterize at all) is silently promoted to 255.
+      //   vtxA / rawA        - what was WRITTEN into the submitted vertices
+      //     versus what the vertex stream actually carried. They disagree exactly
+      //     when a real per-vertex alpha was dropped.
+      const auto& psm_constants = Core::System::GetInstance().GetPixelShaderManager().constants;
+      std::string channels;
+      for (u32 ch = 0; ch < 2; ++ch)
+      {
+        // MatColorToRemix's note applies: matColor's bytes are R,G,B,A from the
+        // high end down, so alpha is the LOW byte.
+        channels += fmt::format("{}ch{}[msC{} msA{} litA{} matA{} ambA{} vslot{}]",
+                                ch == 0 ? "" : " ", ch,
+                                static_cast<u32>(xfmem.color[ch].matsource.Value()),
+                                static_cast<u32>(xfmem.alpha[ch].matsource.Value()),
+                                xfmem.alpha[ch].enablelighting ? 1 : 0,
+                                xfmem.matColor[ch] & 0xFFu, xfmem.ambColor[ch] & 0xFFu,
+                                VertexSlotForChannel(decl, ch));
+      }
+      u32 vertex_alpha_min = 256;
+      u32 vertex_alpha_max = 0;
+      for (const remixapi_HardcodedVertex& vertex : *out_vertices)
+      {
+        const u32 alpha = (vertex.color >> 24) & 0xFFu;
+        vertex_alpha_min = std::min(vertex_alpha_min, alpha);
+        vertex_alpha_max = std::max(vertex_alpha_max, alpha);
+      }
+      // Straight off the decoded stream, bypassing ResolveRasterColor's choice,
+      // so "the game supplied no alpha" and "we threw the alpha away" are
+      // distinguishable. Dolphin's vertex loader writes colours R,G,B,A in memory
+      // order, so alpha is the HIGH byte of the little-endian u32 - the same byte
+      // ToRemixVertexColor leaves in place.
+      std::string raw_alpha;
+      for (u32 slot = 0; slot < 2; ++slot)
+      {
+        if (!decl.colors[slot].enable)
+        {
+          raw_alpha += fmt::format("{}s{}[-]", slot == 0 ? "" : " ", slot);
+          continue;
+        }
+        u32 low = 256;
+        u32 high = 0;
+        for (u32 i = 0; i < vertex_count; ++i)
+        {
+          u32 packed = 0;
+          std::memcpy(&packed, m_base_buffer_pointer + static_cast<size_t>(i) * stride +
+                                   decl.colors[slot].offset,
+                      sizeof(u32));
+          const u32 alpha = (packed >> 24) & 0xFFu;
+          low = std::min(low, alpha);
+          high = std::max(high, alpha);
+        }
+        u32 first = 0;
+        std::memcpy(&first, m_base_buffer_pointer + decl.colors[slot].offset, sizeof(u32));
+        raw_alpha += fmt::format("{}s{}[a {} {} v0 {:#010x} off {} comp {} type {}]",
+                                 slot == 0 ? "" : " ", slot, low > 255 ? 0 : low, high, first,
+                                 decl.colors[slot].offset, decl.colors[slot].components,
+                                 static_cast<u32>(decl.colors[slot].type));
+      }
+      INFO_LOG_FMT(
+          VIDEO,
+          "Remix UI alpha {}: resolved {} corners [{:.3f} {:.3f} {:.3f} {:.3f}] | creg a [{} {} {} "
+          "{}] konst a [{} {} {} {}] | nchan {} | {} | vslot {} vtxA [{} {}] rawA {}",
+          stats.ui_placed, blend.tev_alpha_known ? 1 : 0, blend.tev_alpha_corners[0],
+          blend.tev_alpha_corners[1], blend.tev_alpha_corners[2], blend.tev_alpha_corners[3],
+          psm_constants.colors[0][3], psm_constants.colors[1][3], psm_constants.colors[2][3],
+          psm_constants.colors[3][3], psm_constants.kcolors[0][3], psm_constants.kcolors[1][3],
+          psm_constants.kcolors[2][3], psm_constants.kcolors[3][3],
+          static_cast<u32>(xfmem.numChan.numColorChans), channels, color_slot,
+          vertex_alpha_min > 255 ? 0 : vertex_alpha_min, vertex_alpha_max, raw_alpha);
     }
 
     std::array<float, 6> ortho_raw = xfmem.projection.rawProjection;

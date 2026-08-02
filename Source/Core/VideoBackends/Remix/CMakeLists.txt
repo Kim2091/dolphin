@@ -7,6 +7,7 @@ add_library(videoremix
   RemixGfx.h
   RemixTexture.cpp
   RemixTexture.h
+  RemixTextureCache.cpp
   RemixTextureCache.h
   RemixUiRaster.cpp
   RemixUiRaster.h
