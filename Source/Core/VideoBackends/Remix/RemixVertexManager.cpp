@@ -1051,6 +1051,27 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   const int projection_slot =
       is_ortho ? -1 : g_remix_api->ObserveProjection(xfmem.projection.rawProjection);
 
+  // Instrument only: does this game move its viewport mid-frame? The world path
+  // uses xfmem.viewport for the winding sign and nothing else, while every
+  // hardware backend positions the draw by it (BPFunctions.cpp:192-193), so a
+  // split-screen or picture-in-picture draw would land in the wrong place here.
+  // A frame reporting zero changes cannot have that defect; one reporting many
+  // is where to start looking. No behaviour attached - see FrameStats.
+  if (!is_ortho)
+  {
+    const std::array<float, 4> rect = {xfmem.viewport.xOrig, xfmem.viewport.yOrig,
+                                       xfmem.viewport.wd, xfmem.viewport.ht};
+    if (!stats.viewport_seen)
+    {
+      stats.viewport_seen = true;
+      stats.viewport_first = rect;
+    }
+    else if (rect != stats.viewport_first)
+    {
+      ++stats.viewport_changed;
+    }
+  }
+
   // bSupportsPrimitiveRestart is false for this backend, so every quad/strip/fan
   // has already been expanded into a plain triangle list by the index generator
   // and there are no restart tokens to parse. Anything that is still not
@@ -1716,21 +1737,48 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
         // PixelShaderGen.cpp:257 - and the stage that reads RASA is very often
         // not stage 0, so reading stage 0's channel and calling it "the draw's
         // channel" answers a different question than the one being asked.
+        //
+        // rs/ts are the stage's swap-table SELECTORS (BPMemory.h:466-467, the
+        // low four bits of the alpha combiner). They are what turns "texture
+        // alpha" into texel[swap[Alpha]] and "rasterized alpha" into
+        // channel[swap[Alpha]] on console (Tev.cpp:473-477 and 34-56). Nothing
+        // in this backend reads them yet, and they are the only per-stage alpha
+        // state the previous measurement did not print - which is exactly why
+        // two draws could come out bit-identical in every printed field and
+        // still differ on hardware.
+        const auto& ac = bpmem.combiners[stage].alphaC;
         alpha_chain += fmt::format(
-            "{}[a{} b{} c{} d{} k{} r{} ->{}]", stage == 0 ? "" : " ",
-            static_cast<u32>(bpmem.combiners[stage].alphaC.a.Value()),
-            static_cast<u32>(bpmem.combiners[stage].alphaC.b.Value()),
-            static_cast<u32>(bpmem.combiners[stage].alphaC.c.Value()),
-            static_cast<u32>(bpmem.combiners[stage].alphaC.d.Value()),
+            "{}[a{} b{} c{} d{} k{} r{} rs{} ts{} ->{}]", stage == 0 ? "" : " ",
+            static_cast<u32>(ac.a.Value()), static_cast<u32>(ac.b.Value()),
+            static_cast<u32>(ac.c.Value()), static_cast<u32>(ac.d.Value()),
             static_cast<u32>(bpmem.tevksel.GetKonstAlpha(stage)),
             static_cast<u32>(bpmem.tevorders[stage >> 1].getColorChan(stage & 1)),
-            static_cast<u32>(bpmem.combiners[stage].alphaC.dest.Value()));
+            static_cast<u32>(ac.rswap.Value()), static_cast<u32>(ac.tswap.Value()),
+            static_cast<u32>(ac.dest.Value()));
       }
+
+      // The four swap tables themselves, as the channel index each of R, G, B, A
+      // is taken from (BPMemory.h:2006). A selector is meaningless without them:
+      // rs1 says "table 1", and only the table says whether that maps Alpha to
+      // Alpha or to Red. All four are printed rather than the referenced ones
+      // because they are eight BP registers in total and a wrong guess about
+      // which is referenced is the mistake this line exists to rule out.
+      std::string swap_tables;
+      for (u32 table = 0; table < 4; ++table)
+      {
+        const auto& swap = bpmem.tevksel.GetSwapTable(table);
+        swap_tables += fmt::format("{}t{}[{} {} {} {}]", table == 0 ? "" : " ", table,
+                                   static_cast<u32>(swap[ColorChannel::Red]),
+                                   static_cast<u32>(swap[ColorChannel::Green]),
+                                   static_cast<u32>(swap[ColorChannel::Blue]),
+                                   static_cast<u32>(swap[ColorChannel::Alpha]));
+      }
+
       INFO_LOG_FMT(VIDEO,
                    "Remix UI draw {}: tex {:#018x} src {:#010x} efbcopy {} xfbcopy {} | blend en {} "
                    "src {} dst {} sub {} logic {} op "
                    "{} | colorupd {} alphaupd {} pixfmt {} | atest {:#010x} | dstalpha {:#x} | "
-                   "verts {} | tev stages {} alpha {}",
+                   "verts {} | ind stages {} ind0 {:#07x} | swap {} | tev stages {} alpha {}",
                    stats.ui_placed, albedo != nullptr ? albedo->GetContentHash() : 0, texture_addr,
                    texture_is_efb_copy ? 1 : 0, texture_is_xfb_copy ? 1 : 0,
                    bpmem.blendmode.blend_enable ? 1 : 0,
@@ -1740,7 +1788,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                    static_cast<u32>(bpmem.blendmode.logic_mode.Value()),
                    bpmem.blendmode.color_update ? 1 : 0, bpmem.blendmode.alpha_update ? 1 : 0,
                    static_cast<u32>(bpmem.zcontrol.pixel_format.Value()), bpmem.alpha_test.hex,
-                   bpmem.dstalpha.hex, out_vertices->size(), stages, alpha_chain);
+                   bpmem.dstalpha.hex, out_vertices->size(),
+                   static_cast<u32>(bpmem.genMode.numindstages), bpmem.tevind[0].hex, swap_tables,
+                   stages, alpha_chain);
 
       // Everything that decides the draw's FINAL alpha, in one line, so a HUD
       // sprite that should be invisible can be told apart from title art that

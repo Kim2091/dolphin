@@ -226,6 +226,20 @@ struct FrameStats
   // for it - so this quantifies how much of the frame's light was ambient before
   // anyone reaches for RemixLightScale.
   bool ambient_bright = false;
+
+  // Sub-screen viewports, instrument only. The world path reads xfmem.viewport
+  // for the winding sign alone (RemixVertexManager.cpp:319), while every
+  // hardware backend POSITIONS the draw by it (BPFunctions.cpp:192-193). A game
+  // that renders split screens or picture-in-picture switches the viewport
+  // mid-frame and would be misplaced here; one that never does cannot have a
+  // viewport bug. `viewport_changed` counts world draws whose viewport rect
+  // differs from the frame's first-seen one.
+  //
+  // Deliberately no knob and no behaviour: geometric handling waits for a game
+  // that demonstrates the symptom.
+  u32 viewport_changed = 0;
+  bool viewport_seen = false;
+  std::array<float, 4> viewport_first = {};
 };
 
 // One EFB copy the game triggered, stamped WHERE IT HAPPENED. Recorded rather
