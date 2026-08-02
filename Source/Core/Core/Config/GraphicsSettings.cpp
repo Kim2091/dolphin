@@ -466,6 +466,30 @@ const Info<bool> GFX_REMIX_UI_DROP_DST_ALPHA{{System::GFX, "Settings", "RemixUiD
 // False = draw it, garbage and all.
 const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES{
     {System::GFX, "Settings", "RemixUiDropEfbCopyTextures"}, false};
+// Map the UI overlay onto the region the console PRESENTS rather than onto the
+// whole EFB.
+//
+// UI draw coordinates arrive in EFB units and the overlay is the swapchain, so
+// something has to say how large the EFB region is that fills the window. The
+// backend used EFB_WIDTH x EFB_HEIGHT, 640x528 (VideoCommon.h:15-16) - but that
+// is the EFB's maximum size, not the part of it that reaches the screen. What
+// reaches the screen is the source rect of the frame's XFB copy, and Wind Waker
+// copies 480 rows, not 528. Scaling by 528 therefore squeezed the whole HUD into
+// the top 91% of the window and left the bottom ~9% permanently empty.
+//
+// The rect is taken from the XFB copies the texture cache already reports
+// (RemixApi::NoteEfbCopy), unioned over the frame - an interlaced or two-field
+// game presents more than one - and promoted at frame end, so a UI draw uses the
+// region the PREVIOUS frame presented. That one-frame lag is deliberate: this
+// frame's XFB copy is the event that ends the frame, long after its UI has been
+// submitted, and a game changing its presented size mid-run is the only case it
+// could ever be visible in.
+//
+// Until a first XFB copy is seen the EFB constants stand, so a game that somehow
+// presents without one behaves exactly as before.
+//
+// False = scale by the EFB constants, the pre-fix mapping.
+const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiScaleToXfb"}, true};
 
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 

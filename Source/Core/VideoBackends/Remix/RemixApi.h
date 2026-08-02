@@ -919,6 +919,21 @@ private:
   // the pre-change behaviour: the draw is classified and submitted as before.
   bool m_ui_drop_dst_alpha = true;
   bool m_ui_drop_efb_copy_textures = false;
+  // The EFB region the console actually presents, in EFB units. UI draw
+  // coordinates are in EFB units and the overlay is the swapchain, so this is
+  // the denominator that maps one onto the other; using EFB_WIDTH/EFB_HEIGHT
+  // instead assumes the game presents all 640x528, which Wind Waker (480 rows)
+  // does not. See GFX_REMIX_UI_SCALE_TO_XFB.
+  //
+  // `m_xfb_frame_rect` accumulates this frame's XFB copy source rects and is
+  // promoted into the two sizes at frame end; zero sizes mean "no XFB copy seen
+  // yet", in which case SubmitUiDraw falls back to the EFB constants.
+  MathUtil::Rectangle<int> m_xfb_frame_rect = {};
+  bool m_xfb_frame_valid = false;
+  u32 m_presented_width = 0;
+  u32 m_presented_height = 0;
+  bool m_presented_logged = false;
+  bool m_ui_scale_to_xfb = true;
   void AuditUiFootprints();
   void SubmitScreenOverlay();
   // The frustum SetupCamera actually submitted, published so the UI plane fills

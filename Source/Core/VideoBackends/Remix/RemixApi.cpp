@@ -613,6 +613,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
   m_ui_drop_dst_alpha = Config::Get(Config::GFX_REMIX_UI_DROP_DST_ALPHA);
   m_ui_drop_efb_copy_textures = Config::Get(Config::GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES);
+  m_ui_scale_to_xfb = Config::Get(Config::GFX_REMIX_UI_SCALE_TO_XFB);
   m_sky_candidates.clear();
   m_sky_classified.clear();
 
@@ -1374,6 +1375,30 @@ void RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_add
   if (!xfb && clear)
     ++m_stats.efb_copies_scratch;
 
+  // The XFB copy's SOURCE rect is the part of the EFB that reaches the screen,
+  // and therefore the region the UI overlay has to be mapped onto - see
+  // GFX_REMIX_UI_SCALE_TO_XFB. Unioned rather than latched from one copy: a game
+  // that presents two fields, or splits the frame into bands, contributes each
+  // of them and the presented region is their extent.
+  //
+  // Recorded unconditionally, like the destination set below and for the same
+  // reason: the mapping must not quietly change when the trace log is turned off.
+  if (xfb)
+  {
+    if (!m_xfb_frame_valid)
+    {
+      m_xfb_frame_rect = src_rect;
+      m_xfb_frame_valid = true;
+    }
+    else
+    {
+      m_xfb_frame_rect.left = std::min(m_xfb_frame_rect.left, src_rect.left);
+      m_xfb_frame_rect.top = std::min(m_xfb_frame_rect.top, src_rect.top);
+      m_xfb_frame_rect.right = std::max(m_xfb_frame_rect.right, src_rect.right);
+      m_xfb_frame_rect.bottom = std::max(m_xfb_frame_rect.bottom, src_rect.bottom);
+    }
+  }
+
   // The set of GC addresses this session has ever aimed an EFB copy at. Kept
   // ACROSS frames, not per frame, because the property it records is permanent:
   // this backend writes no EFB copy, ever, so that memory holds whatever was
@@ -1536,9 +1561,20 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     ++m_stats.ui_tev_alpha;
 
   // EFB space -> overlay pixels. The overlay is the swapchain, the viewport is
-  // in EFB units, and the two differ by the internal resolution scale.
-  const float scale_x = static_cast<float>(m_surface_width) / static_cast<float>(EFB_WIDTH);
-  const float scale_y = static_cast<float>(m_surface_height) / static_cast<float>(EFB_HEIGHT);
+  // in EFB units, and the two differ by however much of the EFB the console
+  // actually presents. That is the XFB copy's source rect, NOT the EFB's own
+  // 640x528 - Wind Waker copies 480 rows, so the EFB constants stretched every
+  // UI element over a region 10% taller than the one on screen and left the
+  // bottom of the window dead. Falls back to the constants until an XFB copy has
+  // been seen, which is also what the knob's off position restores.
+  const float region_width = (m_ui_scale_to_xfb && m_presented_width != 0) ?
+                                 static_cast<float>(m_presented_width) :
+                                 static_cast<float>(EFB_WIDTH);
+  const float region_height = (m_ui_scale_to_xfb && m_presented_height != 0) ?
+                                  static_cast<float>(m_presented_height) :
+                                  static_cast<float>(EFB_HEIGHT);
+  const float scale_x = static_cast<float>(m_surface_width) / region_width;
+  const float scale_y = static_cast<float>(m_surface_height) / region_height;
   call.viewport_x = viewport[0] * scale_x;
   call.viewport_y = viewport[1] * scale_y;
   call.viewport_width = viewport[2] * scale_x;
@@ -3370,6 +3406,33 @@ void RemixApi::OnAfterFrame()
   m_view_samples.clear();
   m_view_duplicate_hashes.clear();
   m_ui_frame_begun = false;
+  // Promote this frame's XFB copy extent to "the region the console presents",
+  // which the next frame's UI draws are mapped onto. It has to happen here and
+  // not in the draw path: the XFB copy is the event that ENDS a frame
+  // (after_frame_event is triggered from inside its handler, BPStructs.cpp:353),
+  // so during a frame the only rect available is the previous one's - and using
+  // it is correct, because a game changes its presented size at a mode switch,
+  // not between two draws.
+  if (m_xfb_frame_valid)
+  {
+    const u32 width = static_cast<u32>(std::max(1, m_xfb_frame_rect.GetWidth()));
+    const u32 height = static_cast<u32>(std::max(1, m_xfb_frame_rect.GetHeight()));
+    // Once, and only when it actually differs from what the pre-fix mapping
+    // assumed - that is the case where this changes where anything lands.
+    if (!m_presented_logged && (width != EFB_WIDTH || height != EFB_HEIGHT))
+    {
+      INFO_LOG_FMT(VIDEO,
+                   "Remix: presented region is [{},{} -> {},{}] ({}x{}), not the EFB's {}x{}; "
+                   "UI overlay scaled to it (RemixUiScaleToXfb {})",
+                   m_xfb_frame_rect.left, m_xfb_frame_rect.top, m_xfb_frame_rect.right,
+                   m_xfb_frame_rect.bottom, width, height, EFB_WIDTH, EFB_HEIGHT,
+                   m_ui_scale_to_xfb ? "on" : "off");
+      m_presented_logged = true;
+    }
+    m_presented_width = width;
+    m_presented_height = height;
+    m_xfb_frame_valid = false;
+  }
   // Frame-scoped audit logs. Cleared here, at the same point the overlay's own
   // frame flag is, so the next frame's copies and footprints start empty.
   m_efb_copies.clear();

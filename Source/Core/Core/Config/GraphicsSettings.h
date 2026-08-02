@@ -148,6 +148,7 @@ extern const Info<bool> GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE;
 extern const Info<bool> GFX_REMIX_TRACE_EFB_COPIES;
 extern const Info<bool> GFX_REMIX_UI_DROP_DST_ALPHA;
 extern const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES;
+extern const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB;
 
 // Graphics.Enhancements
 
