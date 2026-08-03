@@ -1771,11 +1771,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   u8 alpha_reference = 0;
   ResolveAlphaTest(bpmem.alpha_test, alpha_test_type, alpha_reference);
 
-  const MaterialRef material = g_remix_api->EnsureMaterial(albedo, filter_mode, wrap_mode_u,
-                                                           wrap_mode_v, alpha_test_type,
-                                                           alpha_reference);
-  if (material.handle == nullptr)
-    return;
+  // NOTE: the material itself is resolved at the BOTTOM of this function, once
+  // the geometry exists - a classified sky mesh needs an emissive material, and
+  // that decision is keyed on the geometry hash. Only the alpha-test state is
+  // computed here, where the BP state it reads is in scope.
 
   // ---- Decode the vertex stream ------------------------------------------
 
@@ -2801,8 +2800,28 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     world_ui_projection = &ortho_raw;
     raw_modelview = nullptr;
   }
-  g_remix_api->SubmitMesh(material, *out_vertices, *out_indices, transform, category_flags, blend,
-                          raw_modelview, diagnostics, world_ui_projection);
+  // Material resolution happens HERE, not at the top of the function, because it
+  // depends on the decoded geometry. A classified sky mesh takes an unlit
+  // (emissive) material, the classifier is keyed on the geometry hash, and the
+  // geometry hash needs the final vertex and index buffers - which only exist at
+  // this point. The material then folds into the mesh hash as it always has.
+  //
+  // The untextured sky's colour is the folded TEV constant, which is already
+  // sitting in blend.tfactor as 0x00RRGGBB; a textured sky ignores it and uses
+  // its own albedo as the emissive texture instead.
+  const u64 geometry_hash = RemixApi::GeometryHash(*out_vertices, *out_indices);
+  const bool sky_emissive =
+      !is_ortho && g_remix_api->SkyEmissiveEnabled() && g_remix_api->IsSkyGeometry(geometry_hash);
+  const MaterialRef material =
+      g_remix_api->EnsureMaterial(albedo, filter_mode, wrap_mode_u, wrap_mode_v, alpha_test_type,
+                                  alpha_reference, sky_emissive, blend.tfactor & 0x00FFFFFFu);
+  if (material.handle == nullptr)
+    return;
+  if (sky_emissive)
+    ++stats.sky_emissive;
+
+  g_remix_api->SubmitMesh(material, geometry_hash, *out_vertices, *out_indices, transform,
+                          category_flags, blend, raw_modelview, diagnostics, world_ui_projection);
 }
 
 }  // namespace Remix

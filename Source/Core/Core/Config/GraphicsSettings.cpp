@@ -406,6 +406,63 @@ const Info<std::string> GFX_REMIX_SKY_VETO_HASHES{
 // False = tag every auto-classified draw SKY, the pre-flag behaviour.
 const Info<bool> GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE{
     {System::GFX, "Settings", "RemixSkyAutoUntexturedIgnore"}, true};
+// Render the game's OWN sky instead of deleting it, by pushing classified sky
+// geometry behind the world rather than tagging it away.
+//
+// Every classified draw logs `ztest 1 zwrite 0`: the console draws its sky
+// first and never lets it write depth, which is a hard guarantee it cannot
+// occlude anything drawn afterwards. A path tracer has no draw order, so the
+// same dome - 15k-25k units out against a 160k far plane in Wind Waker - is
+// simply solid geometry parked in front of the island, and it hides it.
+//
+// Scaling the instance about the CAMERA POSITION is the exact translation of
+// that guarantee into geometry. Every vertex keeps its direction from the eye,
+// so the image is unchanged angle for angle, while the surface moves beyond all
+// world geometry. It also removes the residual parallax that makes a dome drawn
+// close to the camera read as fake.
+//
+// Note this is what makes RemixSkyAutoDetect = 1 no longer purely log-only:
+// classification still does not TAG anything, but it does now move geometry.
+const Info<bool> GFX_REMIX_SKY_AT_INFINITY{
+    {System::GFX, "Settings", "RemixSkyAtInfinity"}, true};
+// How far out RemixSkyAtInfinity pushes. Needs to exceed far_plane / dome_extent
+// to clear the world - about 10.5 on Wind Waker's smallest classified dome - and
+// wants margin without going so far that float precision at the resulting
+// coordinates, or a ray tmax, becomes the next problem.
+const Info<float> GFX_REMIX_SKY_INFINITY_SCALE{
+    {System::GFX, "Settings", "RemixSkyInfinityScale"}, 16.0f};
+// Route falloff-free GX Spot lights to Remix's DISTANT light instead of a sphere.
+//
+// GX has no directional light type. A light whose distance attenuation is
+// GX_DA_OFF - distatt = (1,0,0), so the polynomial is the constant 1 - and whose
+// angular attenuation is likewise constant has no falloff of any kind, which is
+// how a GC title builds a sun: an ordinary light parked far enough away that its
+// direction hardly varies over the scene. Wind Waker's is at |dpos| 24873 with
+// distatt (1,0,0) and cosatt (1,0,0).
+//
+// Submitting that as a sphere applies a real 1/r^2 the console never applied, so
+// the sun contributes essentially nothing - and because it still counts as "a
+// light was drawn", it also suppresses rtx.fallbackLightMode's rescue. The scene
+// renders black with a light in it. False reproduces the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_LIGHT_NO_FALLOFF_DISTANT{
+    {System::GFX, "Settings", "RemixGxLightNoFalloffDistant"}, true};
+// Give classified sky geometry an UNLIT (emissive) material.
+//
+// GX draws a skybox with lighting off, and Wind Waker's dome goes further: its
+// TEV chain is `K0` alone, a constant with no rasterized-colour input at all, so
+// the authored value [80 120 255] IS the final pixel on console. Submitting that
+// as diffuse albedo asks a light to reveal it, which shades a surface that was
+// never meant to be shaded - it goes dark on the side facing away from the sun
+// and can never match the original. An emissive material reproduces "this
+// colour regardless of lighting" exactly, and lets the sky light the scene.
+//
+// Textured sky uses its own albedo as the emissive texture, the same patch the
+// runtime applies to WorldUI; untextured sky uses the folded TEV constant.
+const Info<bool> GFX_REMIX_SKY_EMISSIVE{{System::GFX, "Settings", "RemixSkyEmissive"}, true};
+// Emissive radiance multiplier for the sky. 1.0 reproduces the console's colour
+// at face value; higher makes the sky a stronger light source for the scene.
+const Info<float> GFX_REMIX_SKY_EMISSIVE_INTENSITY{
+    {System::GFX, "Settings", "RemixSkyEmissiveIntensity"}, 1.0f};
 // Record every EFB copy the game triggers - rect, destination, XFB-or-not, the
 // clear bit - and, on trace frames, print each UI draw's EFB-space footprint
 // next to a verdict on whether a non-XFB copy+clear later in the same frame

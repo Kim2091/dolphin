@@ -618,6 +618,11 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
       static_cast<u32>(std::max(1, Config::Get(Config::GFX_REMIX_SKY_AUTO_FRAMES)));
   m_sky_auto_min_extent = std::max(0.0f, Config::Get(Config::GFX_REMIX_SKY_AUTO_MIN_EXTENT));
   m_sky_auto_untextured_ignore = Config::Get(Config::GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE);
+  m_sky_at_infinity = Config::Get(Config::GFX_REMIX_SKY_AT_INFINITY);
+  m_sky_infinity_scale = std::max(1.0f, Config::Get(Config::GFX_REMIX_SKY_INFINITY_SCALE));
+  m_gx_light_no_falloff_distant = Config::Get(Config::GFX_REMIX_GX_LIGHT_NO_FALLOFF_DISTANT);
+  m_sky_emissive = Config::Get(Config::GFX_REMIX_SKY_EMISSIVE);
+  m_sky_emissive_intensity = std::max(0.0f, Config::Get(Config::GFX_REMIX_SKY_EMISSIVE_INTENSITY));
   m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
   m_ui_drop_dst_alpha = Config::Get(Config::GFX_REMIX_UI_DROP_DST_ALPHA);
   m_ui_drop_efb_copy_textures = Config::Get(Config::GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES);
@@ -1153,8 +1158,18 @@ bool RemixApi::UploadTexture(const RemixTexture& texture)
   return true;
 }
 
+u64 RemixApi::GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
+                           const std::vector<u32>& indices)
+{
+  u64 hash = XXH64(vertices.data(), vertices.size() * sizeof(remixapi_HardcodedVertex), 0);
+  hash ^= XXH64(indices.data(), indices.size() * sizeof(u32),
+                static_cast<u64>(sizeof(remixapi_HardcodedVertex)));
+  return hash;
+}
+
 MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                                     u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference)
+                                     u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
+                                     bool emissive, u32 emissive_rgb)
 {
   MaterialRef result;
   if (!m_valid)
@@ -1182,6 +1197,10 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   {
     material_hash = FoldHash(FALLBACK_MATERIAL_HASH, state_key);
   }
+  // Folded only when emissive, so every existing material keeps the hash it had
+  // and the knob's off position is byte-identical to the pre-feature build.
+  if (emissive)
+    material_hash = FoldHash(material_hash, 0x5B10C0DEull ^ (emissive_rgb & 0x00FFFFFFu));
   material_hash = NonZeroHash(material_hash);
 
   if (const auto it = m_materials.find(material_hash); it != m_materials.end())
@@ -1216,6 +1235,26 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
       texture_hash != 0 ?
           remixapi_Float3D{1.0f, 1.0f, 1.0f} :
           remixapi_Float3D{untextured_albedo, untextured_albedo, untextured_albedo};
+  // An emissive sky must have NO diffuse albedo, or it is emissive AND lit -
+  // which is neither. On console the sky carries no lighting term at all: the
+  // TEV constant IS the pixel. Leaving the albedo in place means the sun and the
+  // sky still shade it, so its brightness keeps tracking the scene's lighting
+  // and the emissive intensity only shifts the mix instead of controlling it.
+  // Zeroing albedo makes emission the surface's entire output, which is both the
+  // faithful translation and what makes emissiveIntensity a real exposure
+  // control over the sky rather than a blend slider.
+  //
+  // ⚠ This only fully applies to UNTEXTURED sky. An albedo texture REPLACES the
+  // constant rather than modulating it (opaque_surface_material_interaction
+  // .slangh:656-658 `if (albedoOpacityLoaded) albedo = albedoOpacitySample.rgb`),
+  // so a textured sky keeps its diffuse response and stays emissive-plus-lit.
+  // Dropping its albedo texture would fix that and is tempting, but the same
+  // texture carries the OPACITY a cutout cloud sheet needs, so it would turn
+  // alpha-tested clouds into solid rectangles. Left alone deliberately: Wind
+  // Waker's sky is four untextured domes (draws 1, 2, 8, 9) and three small
+  // 32-vertex textured pieces, so this covers the part that actually matters.
+  if (emissive)
+    opaque_ext.albedoConstant = {0.0f, 0.0f, 0.0f};
   opaque_ext.opacityConstant = 1.0f;
   opaque_ext.roughnessConstant = 0.8f;
   opaque_ext.metallicConstant = 0.0f;
@@ -1240,9 +1279,32 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   info.albedoTexture = texture_hash != 0 ? albedo_path.c_str() : nullptr;
   info.normalTexture = nullptr;
   info.tangentTexture = nullptr;
+  // Unlit sky. The runtime derives `enableEmission` from `emissiveIntensity > 0`
+  // (rtx_remix_api.cpp:504), so a positive intensity is the whole switch.
+  //
+  // Textured sky takes its own albedo as the emissive texture - the same patch
+  // the runtime applies to WorldUI - so a cloud sheet keeps its art. Untextured
+  // sky has no texture to point at and its colour lives in the folded TEV
+  // constant, which arrives here as emissive_rgb (0x00RRGGBB, matching the
+  // tFactor byte order: 0xff5078ff traced alongside `fold tfactor [80 120 255]`).
   info.emissiveTexture = nullptr;
   info.emissiveIntensity = 0.0f;
   info.emissiveColorConstant = {0.0f, 0.0f, 0.0f};
+  if (emissive)
+  {
+    info.emissiveIntensity = m_sky_emissive_intensity;
+    if (texture_hash != 0)
+    {
+      info.emissiveTexture = albedo_path.c_str();
+      info.emissiveColorConstant = {1.0f, 1.0f, 1.0f};
+    }
+    else
+    {
+      info.emissiveColorConstant = {static_cast<float>((emissive_rgb >> 16) & 0xFFu) / 255.0f,
+                                    static_cast<float>((emissive_rgb >> 8) & 0xFFu) / 255.0f,
+                                    static_cast<float>(emissive_rgb & 0xFFu) / 255.0f};
+    }
+  }
   info.spriteSheetRow = 1;
   info.spriteSheetCol = 1;
   info.spriteSheetFps = 0;
@@ -1302,7 +1364,7 @@ void RemixApi::NoteDrawLights(const DrawLightState& state)
   m_stats.ambient_bright = m_stats.ambient_bright || state.ambient_bright;
 }
 
-void RemixApi::SubmitMesh(const MaterialRef& material,
+void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
                           const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices, const remixapi_Transform& transform,
                           remixapi_InstanceCategoryFlags category_flags,
@@ -1317,10 +1379,7 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
   // has to participate: Remix handles ARE hashes and a mesh bakes its surface
   // material at create time, so two material variants of the same geometry must
   // not collapse onto one handle (whichever registered first would win).
-  u64 mesh_hash = XXH64(vertices.data(), vertices.size() * sizeof(remixapi_HardcodedVertex), 0);
-  mesh_hash ^= XXH64(indices.data(), indices.size() * sizeof(u32),
-                     static_cast<u64>(sizeof(remixapi_HardcodedVertex)));
-  mesh_hash = NonZeroHash(FoldHash(mesh_hash, material.hash));
+  const u64 mesh_hash = NonZeroHash(FoldHash(geometry_hash, material.hash));
 
   if (m_poisoned_meshes.count(mesh_hash) != 0)
     return;
@@ -1330,6 +1389,7 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
   {
     mesh_handle = it->second.handle;
     it->second.last_used_frame = m_frame_index;
+    it->second.geometry_hash = geometry_hash;
     it->second.diagnostics = diagnostics;
   }
   else
@@ -1387,6 +1447,7 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
     entry.handle = mesh_handle;
     entry.last_used_frame = m_frame_index;
     entry.object_radius = std::sqrt(radius_sq);
+    entry.geometry_hash = geometry_hash;
     entry.diagnostics = diagnostics;
     m_meshes.emplace(mesh_hash, entry);
     ++m_stats.meshes_created;
@@ -1457,7 +1518,7 @@ void RemixApi::SubmitMesh(const MaterialRef& material,
     }
   }
 
-  PendingInstance pending{mesh_handle, transform, category_flags, blend, mesh_hash};
+  PendingInstance pending{mesh_handle, transform, category_flags, blend, mesh_hash, geometry_hash};
   if (world_ui_projection != nullptr)
   {
     pending.world_ui = true;
@@ -2081,7 +2142,7 @@ void RemixApi::FlushPendingInstances()
     // CameraType::Sky -> skipped entirely under rtx.skyMode = 1, which is the
     // mechanism by which Numos replaces the game's sky rather than fighting it.
     remixapi_InstanceCategoryFlags category_flags = pending.category_flags;
-    if (m_sky_auto_detect >= 2 && m_sky_classified.count(pending.mesh_hash) != 0)
+    if (m_sky_auto_detect >= 2 && m_sky_classified.count(pending.geometry_hash) != 0)
     {
       // An untextured classified draw takes IGNORE instead. SKY only promises
       // that the sky PATH stops drawing the geometry; it does not promise the
@@ -2138,11 +2199,43 @@ void RemixApi::FlushPendingInstances()
       // costs temporal quality, never correctness. The one thing that can break
       // the picture is SetupCamera's basis extraction disagreeing with this V,
       // which is why that is the part to suspect if geometry ever moves wrongly.
-      instance.transform =
-          m_camera_recovery ?
-              ToRemixTransform(
-                  AffineMultiply(m_view_inverse, FromRemixTransform(pending.transform))) :
-              pending.transform;
+      Affine world = m_camera_recovery ?
+                         AffineMultiply(m_view_inverse, FromRemixTransform(pending.transform)) :
+                         FromRemixTransform(pending.transform);
+
+      // Sky at infinity. On console every classified sky draw is `ztest 1
+      // zwrite 0`, drawn first - a hard guarantee it can never occlude anything
+      // that follows. A path tracer has no draw order, so the same dome (15k-25k
+      // units out against a 160k far plane in Wind Waker) is just solid geometry
+      // parked in front of the island.
+      //
+      // Scaling the instance about the CAMERA POSITION translates that guarantee
+      // into geometry exactly: for every vertex x the map is
+      //     x -> p + k*(x - p)
+      // which leaves (x - p), the direction from the eye, pointing exactly where
+      // it did. The rendered image is therefore unchanged angle for angle while
+      // the surface moves behind all world geometry. It also kills the residual
+      // parallax that makes a near dome read as fake.
+      //
+      // As an affine, T(p) * S(k) * T(-p) = [ k*I | (1-k)*p ]. The camera
+      // position p is the translation column of V^-1 - and with camera recovery
+      // off that is the identity, i.e. p = 0, which is still correct because
+      // that mode genuinely does put the camera at the origin.
+      if (m_sky_at_infinity && m_sky_auto_detect >= 1 &&
+          m_sky_classified.count(pending.geometry_hash) != 0)
+      {
+        const float k = m_sky_infinity_scale;
+        Affine push = {};
+        push[0] = k;
+        push[5] = k;
+        push[10] = k;
+        push[3] = (1.0f - k) * m_view_inverse[3];
+        push[7] = (1.0f - k) * m_view_inverse[7];
+        push[11] = (1.0f - k) * m_view_inverse[11];
+        world = AffineMultiply(push, world);
+        ++m_stats.sky_pushed;
+      }
+      instance.transform = ToRemixTransform(world);
     }
     // v1 pins double-sided: GC winding under our right-handed identity view is
     // not verified, and a wrong guess would silently cull whole scenes.
@@ -2190,10 +2283,24 @@ void RemixApi::EstimateView()
   // which poisons the translation consensus every time the camera moves. Drop
   // it. Only in tagging mode: mode 1 has to leave the estimate untouched, or its
   // log-only promise is not worth anything.
+  // m_view_samples is keyed by MESH hash while the classified set holds GEOMETRY
+  // hashes, so this has to go through the mesh record to translate rather than
+  // erasing by key directly.
   if (m_sky_auto_detect >= 2)
   {
-    for (const u64 hash : m_sky_classified)
-      m_stats.view_sky_excluded += static_cast<u32>(m_view_samples.erase(hash));
+    for (auto it = m_view_samples.begin(); it != m_view_samples.end();)
+    {
+      const auto mesh = m_meshes.find(it->first);
+      if (mesh != m_meshes.end() && m_sky_classified.count(mesh->second.geometry_hash) != 0)
+      {
+        ++m_stats.view_sky_excluded;
+        it = m_view_samples.erase(it);
+      }
+      else
+      {
+        ++it;
+      }
+    }
   }
 
   // GX gives us no view matrix, only combined modelviews. But for STATIC
@@ -2434,18 +2541,33 @@ void RemixApi::EstimateView()
     if (AffineSimilar(ratio, IDENTITY_AFFINE))
       ++m_stats.w_stable;
     if (m_sky_auto_detect != 0)
-      ClassifySky(mesh_hash, ratio, current, camera_delta, far_plane);
+    {
+      // Classification is stored under the GEOMETRY hash, which the mesh record
+      // is the only place to get it from. A sample whose mesh has already been
+      // reaped simply does not classify this frame.
+      const auto mesh = m_meshes.find(mesh_hash);
+      if (mesh != m_meshes.end())
+      {
+        ClassifySky(mesh->second.geometry_hash, mesh_hash, ratio, current, camera_delta,
+                    far_plane);
+      }
+    }
   }
 
   m_stats.sky_auto_classified = static_cast<u32>(m_sky_classified.size());
 }
 
-void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affine& modelview,
-                           const float camera_delta[3], float far_plane)
+void RemixApi::ClassifySky(u64 geometry_hash, u64 mesh_hash, const Affine& world_ratio,
+                           const Affine& modelview, const float camera_delta[3], float far_plane)
 {
+  // Keyed on GEOMETRY, not on the mesh hash. The mesh hash folds in the material,
+  // and classifying a mesh CHANGES its material (sky becomes emissive) and hence
+  // its mesh hash - so a mesh-hash-keyed set would lose the classification the
+  // instant it made one, and oscillate. See MeshEntry::geometry_hash.
+  //
   // Sky must not flicker, so a classification is sticky for the session. It also
   // means a classified mesh costs nothing to re-test.
-  if (m_sky_classified.count(mesh_hash) != 0)
+  if (m_sky_classified.count(geometry_hash) != 0)
     return;
   if (IsSkyVetoed(mesh_hash))
     return;
@@ -2511,16 +2633,19 @@ void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affin
   {
     // One disagreeing INFORMATIVE frame resets an unclassified candidate. A
     // moving object can match by coincidence; it cannot match persistently.
-    if (const auto it = m_sky_candidates.find(mesh_hash); it != m_sky_candidates.end())
+    if (const auto it = m_sky_candidates.find(geometry_hash); it != m_sky_candidates.end())
       it->second.streak = 0;
     return;
   }
 
   ++m_stats.sky_auto_candidates;
-  if (m_sky_candidates.size() >= MAX_SKY_CANDIDATES && m_sky_candidates.count(mesh_hash) == 0)
+  if (m_sky_candidates.size() >= MAX_SKY_CANDIDATES && m_sky_candidates.count(geometry_hash) == 0)
     return;
 
-  SkyCandidate& candidate = m_sky_candidates[mesh_hash];
+  // Candidates are geometry-keyed too, so that a mesh which legitimately changes
+  // material mid-streak (a different alpha-test variant, say) does not silently
+  // restart its 30-frame count under a fresh mesh hash.
+  SkyCandidate& candidate = m_sky_candidates[geometry_hash];
   ++candidate.streak;
   ++candidate.informative_frames;
   candidate.scaled_extent = scaled_extent;
@@ -2532,7 +2657,7 @@ void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affin
   if (mesh != m_meshes.end() && IsSkyVetoed(mesh->second.diagnostics.texture_hash))
     return;
 
-  m_sky_classified.insert(mesh_hash);
+  m_sky_classified.insert(geometry_hash);
   if (!m_log_stats || s_sky_classify_log_count >= SKY_CLASSIFY_LOG_CAP)
     return;
   ++s_sky_classify_log_count;
@@ -2543,10 +2668,12 @@ void RemixApi::ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affin
   const DrawDiagnostics& diagnostics =
       mesh != m_meshes.end() ? mesh->second.diagnostics : DrawDiagnostics{};
   INFO_LOG_FMT(VIDEO,
-               "Remix SKY AUTO frame {}: mesh {:#018x} tex {:#018x} | extent {:.1f} vs far {:.1f} "
+               "Remix SKY AUTO frame {}: mesh {:#018x} geom {:#018x} tex {:#018x} | extent {:.1f} "
+               "vs far {:.1f} "
                "({:.2f}x) | {} informative frames | ztest {} zfunc {} zwrite {} draw #{} | "
                "classified set now {}",
-               m_frame_index, mesh_hash, diagnostics.texture_hash, scaled_extent, far_plane,
+               m_frame_index, mesh_hash, geometry_hash, diagnostics.texture_hash, scaled_extent,
+               far_plane,
                far_plane > 0.0f ? scaled_extent / far_plane : 0.0f, candidate.informative_frames,
                diagnostics.depth_test ? 1 : 0, diagnostics.depth_func,
                diagnostics.depth_write ? 1 : 0, diagnostics.draw_index, m_sky_classified.size());
@@ -3052,9 +3179,44 @@ void RemixApi::SubmitLights()
     //
     // So only Spot is really a point light. The rest are directional.
     const AttenuationFunc attnfunc = static_cast<AttenuationFunc>(attenuation[i]);
-    const bool is_positional = attnfunc == AttenuationFunc::Spot;
     if (attnfunc == AttenuationFunc::Spec)
       ++m_stats.lights_spec;
+
+    // ...and a fourth case the list above misses, because it is a Spot by
+    // declaration only. GX_DA_OFF leaves distatt = (1,0,0), so the distance
+    // polynomial 1/(c + b*d + a*d^2) is the constant 1; GX_AF_NONE leaves
+    // cosatt = (1,0,0), so the angular polynomial is constant too. A Spot with
+    // both switched off therefore has no falloff of ANY kind - it is a
+    // directional light wearing a positional light's clothes, which is exactly
+    // how a GC title builds a sun. Wind Waker's is at |dpos| 24873 with
+    // distatt (1,0,0) and cosatt (1,0,0), i.e. a 180-degree cone.
+    //
+    // Handing that to a Remix sphere applies a real 1/r^2 the console never
+    // applied, so at 25000 units the sun contributes essentially nothing - and
+    // because it still counts as "a light was drawn" it also suppresses
+    // rtx.fallbackLightMode = NoLightsPresent. The scene renders black with a
+    // light in it, which is the state Wind Waker was actually in.
+    //
+    // Only the fully falloff-free case is rerouted. A Spot that keeps a genuine
+    // cone still has angular shaping worth reproducing, and Remix's distant
+    // light cannot express one, so that stays a sphere.
+    constexpr float ATTENUATION_EPSILON = 1e-6f;
+    const bool has_distance_falloff = std::abs(src.distatt[1]) > ATTENUATION_EPSILON ||
+                                      std::abs(src.distatt[2]) > ATTENUATION_EPSILON;
+    const bool has_angular_falloff = std::abs(src.cosatt[1]) > ATTENUATION_EPSILON ||
+                                     std::abs(src.cosatt[2]) > ATTENUATION_EPSILON;
+    const bool falloff_free_spot =
+        attnfunc == AttenuationFunc::Spot && !has_distance_falloff && !has_angular_falloff;
+    if (falloff_free_spot)
+      ++m_stats.lights_falloff_free;
+
+    // The distant branch below reads `vector` as a DIRECTION (w = 0), which is
+    // what this case needs: dpos is the light's view-space position, the scene
+    // sits at the view origin, so -normalize(R^-1 * dpos) is the direction of
+    // travel from a light that far away. Flipping is_positional therefore does
+    // the whole translation - position handling, radiance convention and all.
+    const bool is_positional =
+        attnfunc == AttenuationFunc::Spot && !(m_gx_light_no_falloff_distant && falloff_free_spot);
 
     // Remix always renders a clamped N.L. GX's other two diffuse functions have
     // no translation at all - None makes the light behave as pure ambient, Sign
@@ -3212,8 +3374,24 @@ void RemixApi::SubmitLights()
                                           (static_cast<u64>(src.color[1]) << 8) |
                                           (static_cast<u64>(src.color[2]) << 16) |
                                           (static_cast<u64>(src.color[3]) << 24));
-      const float quantized[4] = {sphere.shaping_value.coneAngleDegrees,
-                                  sphere.shaping_value.coneSoftness, radiance[0], end_distance};
+      // The world-space AXIS is folded in, quantized to ~0.02, so that a light
+      // whose direction changes materially re-logs. It was deliberately left out
+      // along with the position, on the reasoning that a light which merely
+      // moves should stay quiet - but for a DISTANT light the axis is the whole
+      // translation, and excluding it meant the sun's direction was only ever
+      // logged once, at frame 500, before the camera had warmed up and before
+      // the game reached 3D. That is not a reading of anything.
+      const float axis[3] = {is_positional ? sphere.shaping_value.direction.x : distant.direction.x,
+                             is_positional ? sphere.shaping_value.direction.y : distant.direction.y,
+                             is_positional ? sphere.shaping_value.direction.z :
+                                             distant.direction.z};
+      const float quantized[7] = {sphere.shaping_value.coneAngleDegrees,
+                                  sphere.shaping_value.coneSoftness,
+                                  radiance[0],
+                                  end_distance,
+                                  std::round(axis[0] * 50.0f),
+                                  std::round(axis[1] * 50.0f),
+                                  std::round(axis[2] * 50.0f)};
       trace_key = XXH64(quantized, sizeof(quantized), trace_key);
       if (trace_key != entry.trace_key && s_light_trace_count < LIGHT_TRACE_LOG_CAP)
       {
@@ -3455,14 +3633,15 @@ void RemixApi::OnAfterFrame()
                  "register, {} none, {} split | tev colour {} folded, {} tinted, {} identity, {} bailed, {} "
                  "later-stage tex | texgen {} ({} non-trivial) | blended {} tested {} "
                  "logicop {} "
-                 "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
+                 "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot, {} "
+                 "falloff-free->distant), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
                  "unplaceable, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} dstalpha + {} "
                  "efbcopytex, raster {} us, upload {} us) | "
                  "efb copies {} ({} non-xfb+clear) | viewport changes {} (corrected {}, refused {}, "
                  "mirrored {}, depth-only {}) | sky auto: candidates {}, "
-                 "classified {}, tagged {} ({} ignored) (mode {})",
+                 "classified {}, tagged {} ({} ignored), pushed {} (x{:.0f}), emissive {} (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
                  m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.skipped_scissor,
@@ -3475,7 +3654,7 @@ void RemixApi::OnAfterFrame()
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,
-                 m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
+                 m_stats.lights_falloff_free, m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
                  m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
                  m_stats.ambient_bright ? "bright" : "dim", m_stats.ui_placed,
@@ -3489,7 +3668,8 @@ void RemixApi::OnAfterFrame()
                  m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
                  m_stats.sky_auto_candidates,
                  m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
-                 m_sky_auto_detect);
+                 m_stats.sky_pushed, m_sky_at_infinity ? m_sky_infinity_scale : 0.0f,
+                 m_stats.sky_emissive, m_sky_auto_detect);
   }
 
   LogProjectionVariants();

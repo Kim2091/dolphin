@@ -160,6 +160,13 @@ struct FrameStats
   u32 lights_distant = 0;
   u32 lights_sphere = 0;
   u32 lights_spot = 0;
+  // Spot lights whose distance AND angular attenuation polynomials are both the
+  // constant 1, i.e. a light with no falloff of any kind. GX has no directional
+  // type, so this is how a GC title spells "sun": an ordinary light parked far
+  // enough away that its direction barely varies across the scene. Routing one
+  // to a Remix sphere applies a 1/r^2 the console never applied and the scene
+  // renders black WITH a light in it, which also suppresses the fallback light.
+  u32 lights_falloff_free = 0;
 
   // How per-draw the light REGISTERS turn out to be. `lights_rewritten` counts
   // claims of a slot whose 64 register bytes had changed since the first draw
@@ -197,6 +204,14 @@ struct FrameStats
   // tagged 7 / ignored 4 says the four untextured Wind Waker domes were dropped
   // outright rather than handed to the sky path.
   u32 sky_auto_ignored = 0;
+  // Classified sky instances whose transform was scaled about the camera to push
+  // them behind all world geometry. Non-zero is the whole of RemixSkyAtInfinity
+  // working; zero with a non-zero classified set means the knob is off.
+  u32 sky_pushed = 0;
+  // Instances drawn with the unlit sky material. Should track `pushed` once the
+  // classifier has settled; a gap between the two means a classified mesh is
+  // still being drawn through a shaded material.
+  u32 sky_emissive = 0;
   // Classified sky meshes removed from the camera electorate. A skybox votes for
   // the camera's rotation delta with the translation missing, which is an
   // actively wrong hypothesis rather than merely a useless one.
@@ -668,8 +683,39 @@ public:
   // alpha_test_type / alpha_reference come from the draw's GX alpha test and
   // fold into material identity along with the sampler state, since Remix bakes
   // both into the material.
+  //
+  // `emissive` builds the unlit variant used for the game's own sky. GX draws a
+  // skybox with lighting off - Wind Waker's dome resolves to literally
+  // `K0 = [80 120 255]`, a TEV chain with no rasterized-colour input at all - so
+  // on console that colour IS the final pixel. Handing it to Remix as diffuse
+  // albedo and asking a light to reveal it is the wrong model: it shades, it
+  // goes dark away from the sun, and it can never match. An emissive surface
+  // reproduces "this colour, regardless of lighting" exactly.
+  //
+  // `emissive_rgb` is 0x00RRGGBB, the folded TEV constant, and is consulted only
+  // for untextured draws; a textured sky takes its own albedo as the emissive
+  // texture instead, which is the same patch the runtime applies to WorldUI
+  // (rtx_instance_manager.cpp:1116-1123). Both fold into material identity, so
+  // the emissive variant is a distinct material and a distinct mesh.
   MaterialRef EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                             u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference);
+                             u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
+                             bool emissive = false, u32 emissive_rgb = 0);
+
+  // Identity of the geometry bytes alone. Split out of SubmitMesh so the draw
+  // path can ask "is this mesh classified sky?" BEFORE it picks a material -
+  // which it must, because the answer decides whether the material is emissive,
+  // and the material then feeds the mesh hash.
+  static u64 GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
+                          const std::vector<u32>& indices);
+
+  // Whether a geometry hash has been classified as sky. Keyed on geometry rather
+  // than on the mesh hash precisely so that asking this question cannot be
+  // perturbed by the answer - see MeshEntry::geometry_hash.
+  bool IsSkyGeometry(u64 geometry_hash) const
+  {
+    return m_sky_auto_detect >= 1 && m_sky_classified.count(geometry_hash) != 0;
+  }
+  bool SkyEmissiveEnabled() const { return m_sky_emissive; }
 
   // Creates the mesh on a cache miss and queues one instance of it. The draw is
   // NOT emitted here: the recovered camera is not known until the frame's draws
@@ -690,7 +736,7 @@ public:
   // flush time, when the camera exists. Such a draw must pass raw_modelview as
   // null - an ortho modelview is not a view matrix, and letting one into the
   // histogram would corrupt the very camera the UI is placed against.
-  void SubmitMesh(const MaterialRef& material,
+  void SubmitMesh(const MaterialRef& material, u64 geometry_hash,
                   const std::vector<remixapi_HardcodedVertex>& vertices,
                   const std::vector<u32>& indices, const remixapi_Transform& transform,
                   remixapi_InstanceCategoryFlags category_flags, const DrawBlendState& blend,
@@ -799,6 +845,15 @@ private:
     // decoded vertices. Scaled by the modelview at classification time, this is
     // what separates a sky dome from small camera-welded geometry.
     float object_radius = 0.0f;
+    // Identity of the GEOMETRY alone, without the material folded in. The sky
+    // classifier keys on this rather than on the mesh hash, and the difference
+    // is load-bearing: a Remix mesh bakes its surface material at create time
+    // and the runtime keys meshes by info.hash, so the emissive sky variant MUST
+    // have a different mesh hash from the non-emissive one. If classification
+    // also keyed on the mesh hash, classifying a mesh would change the very hash
+    // its classification is stored under - it would come back unclassified,
+    // render non-emissive, return to the old hash, and oscillate forever.
+    u64 geometry_hash = 0;
     // Last draw of this mesh, for the classification log line only.
     DrawDiagnostics diagnostics;
   };
@@ -882,6 +937,8 @@ private:
     remixapi_InstanceCategoryFlags category_flags = 0;
     DrawBlendState blend;
     u64 mesh_hash = 0;
+    // Material-independent geometry identity - the key every sky decision uses.
+    u64 geometry_hash = 0;
     // An orthographic draw, to be placed on the world-space UI plane at flush
     // time. `transform` then holds only the draw's own modelview - the mapping
     // onto the plane is built from the camera, which is not known while draws
@@ -920,7 +977,8 @@ private:
   void EstimateView();
   // The transform-signature test, run inside EstimateView's W-delta loop where
   // the ratio W(t)*W(t-1)^-1 is already in hand.
-  void ClassifySky(u64 mesh_hash, const Affine& world_ratio, const Affine& modelview,
+  void ClassifySky(u64 geometry_hash, u64 mesh_hash, const Affine& world_ratio,
+                   const Affine& modelview,
                    const float camera_delta[3], float far_plane);
   void FlushPendingInstances();
   void LogCameraRecovery();
@@ -1134,6 +1192,25 @@ private:
   // Untextured classified draws take IGNORE rather than SKY, so a dome that the
   // sky path would have left in the scene cannot occlude the Numos sun.
   bool m_sky_auto_untextured_ignore = true;
+  // Push classified sky geometry out to "infinity" by scaling it about the
+  // camera position, so it sits behind every world draw instead of in front of
+  // the island. Independent of the tagging mode above: tagging DELETES the sky
+  // (SKY resolves to hidden on the API path), this RENDERS it. With this on,
+  // RemixSkyAutoDetect = 1 is no longer strictly "log only" - classification
+  // still does not tag, but it does now move geometry.
+  bool m_sky_at_infinity = true;
+  // Multiplier applied about the camera. Wind Waker's dome sits 15k-25k units
+  // out against a 160k far plane, so anything past ~11 clears the world; 16
+  // leaves margin without pushing so far that float precision or a ray tmax
+  // becomes the next problem.
+  float m_sky_infinity_scale = 16.0f;
+  // Route falloff-free Spot lights to the distant branch. Off reproduces the
+  // pre-fix translation exactly, so it is a clean A/B.
+  bool m_gx_light_no_falloff_distant = true;
+  // Give classified sky geometry an unlit (emissive) material, so it renders at
+  // the colour the console authored instead of being shaded like a wall.
+  bool m_sky_emissive = true;
+  float m_sky_emissive_intensity = 1.0f;
   std::unordered_map<u64, SkyCandidate> m_sky_candidates;
   // Sticky for the session. A classified mesh is never un-classified: sky that
   // flickers in and out is worse than sky that is occasionally wrong, and a
