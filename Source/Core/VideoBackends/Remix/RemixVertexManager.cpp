@@ -47,6 +47,14 @@ constexpr u8 AMBIENT_BRIGHT_THRESHOLD = 63;
 // 12 records the title art and misses every HUD sprite behind it.
 constexpr u32 UI_DRAW_DUMP_LIMIT = 160;
 
+// How far into a frame the colour trace follows world draws. Wind Waker's title
+// scene is ~1860 draws and its SEA - the geometry this instrument exists for -
+// starts past draw 400, so a small cap answers a different question than the one
+// being asked. Draws with no colour attribute and no lit channel are skipped
+// instead, which is what keeps the volume down: they are two thirds of the frame
+// and there is nothing to say about them.
+constexpr u32 COLOR_TRACE_DRAW_LIMIT = 2048;
+
 // Dolphin's vertex loader writes vertex colors as a u32 whose memory order is
 // R, G, B, A. Remix reads remixapi_HardcodedVertex::color as
 // VK_FORMAT_B8G8R8A8_UNORM, i.e. memory order B, G, R, A. Swap the two ends.
@@ -172,6 +180,13 @@ struct RasterColor
   // u32 of vertex colour cannot carry two channels' bytes, so the colour half
   // wins; recorded so the compromise is countable rather than invisible.
   bool channel_split = false;
+  // Everything below is for the trace only - the resolution's own working, kept
+  // so a log line can show WHY a draw came out with no tint rather than only
+  // that it did.
+  int ras_color_stage = -1;
+  int ras_alpha_stage = -1;
+  int color_channel = -1;
+  int alpha_channel = -1;
 };
 
 // The first TEV stage whose COLOR combiner references the rasterized colour or
@@ -271,12 +286,18 @@ RasterColor ResolveRasterColor(const PortableVertexDeclaration& decl, bool gx_se
     const RasStages ras = FindRasStages();
     color_channel = ChannelForStage(ras.color);
     alpha_channel = ChannelForStage(ras.alpha);
+    out.ras_color_stage = ras.color;
+    out.ras_alpha_stage = ras.alpha;
   }
   else
   {
     color_channel = ChannelForStage(0);
     alpha_channel = color_channel;
+    out.ras_color_stage = 0;
+    out.ras_alpha_stage = 0;
   }
+  out.color_channel = color_channel;
+  out.alpha_channel = alpha_channel;
 
   if (color_channel < 0 && alpha_channel < 0)
     return out;
@@ -690,6 +711,279 @@ bool ResolveTevAlpha(std::array<float, 4>& out_corners)
   return true;
 }
 
+// ---- The TEV COLOUR chain -------------------------------------------------
+//
+// The same argument as ResolveTevAlpha, on the colour side, and it turns out to
+// be where Wind Waker keeps its entire palette.
+//
+// The backend's model of a draw's colour is "material albedo, modulated by the
+// rasterized colour". GX's is a chain of up to 16 combiners, and the standard way
+// a GC title colours a surface is
+//
+//   stage 0:  lerp(cReg_a, cReg_b, RasColor)     <- the colour lives in REGISTERS
+//   stage 1:  prev * TexColor                    <- the texture only shades it
+//
+// so the rasterized colour is a per-vertex LERP WEIGHT between two per-draw
+// constants written by GXSetTevColor, not a tint. Measured on Wind Waker's title
+// scene: 3263 of 3865 vertex-coloured draws are exactly `lerp(c0, c1, ras)` and
+// another 546 are `lerp(c0, konst, ras)` - together essentially all of them. The
+// sea is 982 draws of it in one frame, with c0 = (36, 24, 59) deep blue and
+// c1 = (255, 255, 245) near-white. Passing the raw weight through as an albedo
+// tint drops both registers and submits a GREYSCALE material, which is precisely
+// the reported symptom: the ocean renders white.
+//
+// What is resolved here is the chain as a function of the rasterized colour, with
+// the TEXTURE PINNED WHITE. That factorization is the point: Remix applies the
+// real texture itself through textureColorArg1Source, so evaluating with a white
+// texture yields exactly the other factor, and
+//   submitted vertex colour = chain(ras, tex = white)
+//   Remix computes            texture * submitted
+// reproduces the console's product. It is checked rather than assumed - a chain
+// that is not a clean product with the texture is refused.
+//
+// The result is affine in ras, so two endpoint colours describe it:
+//   colour(ras) = at_zero + (at_one - at_zero) * ras / 255
+// which covers lerp(a, b, ras) exactly, with at_zero = a and at_one = b.
+struct TevColorFold
+{
+  bool valid = false;
+  // Whether the chain is the identity in ras (at_zero 0, at_one 255). Folding
+  // that would rewrite every vertex to the value it already had, so it is
+  // detected and skipped: vertex bytes are part of the mesh hash and a no-op
+  // fold must not be allowed to churn it.
+  bool identity = false;
+  std::array<int, 3> at_zero = {0, 0, 0};
+  std::array<int, 3> at_one = {255, 255, 255};
+};
+
+// Why the colour evaluator gave up, when it did - so a low resolve rate is a
+// measurement rather than a guess. Same role as TevAlphaBail.
+enum class TevColorBail
+{
+  None,
+  TooManyStages,
+  Konst,
+  CompareMode,
+  AlphaInput,
+  NotAffine,
+  NotMultiplicative,
+};
+TevColorBail g_tev_color_bail = TevColorBail::None;
+
+// GX konst COLOUR selections, in KonstSel order (Software/Tev.h:158-190). The
+// eight fixed fractions, four unusable slots that read zero on hardware, the four
+// K registers as RGB, then each register's R, G, B and A broadcast to all three
+// channels.
+constexpr std::array<int, 8> s_tev_konst_fractions = {255, 223, 191, 159, 128, 96, 64, 32};
+
+bool ResolveTevColor(bool has_texture, TevColorFold& out)
+{
+  g_tev_color_bail = TevColorBail::None;
+  out = TevColorFold{};
+
+  const auto& constants = Core::System::GetInstance().GetPixelShaderManager().constants;
+  const u32 stages = bpmem.genMode.numtevstages + 1;
+  if (stages > 16)
+  {
+    g_tev_color_bail = TevColorBail::TooManyStages;
+    return false;
+  }
+
+  const auto konst_color = [&](u32 stage, std::array<int, 3>& value) -> bool {
+    const u32 sel = static_cast<u32>(bpmem.tevksel.GetKonstColor(stage));
+    if (sel < 8)
+    {
+      value.fill(s_tev_konst_fractions[sel]);
+      return true;
+    }
+    if (sel < 12)
+      return false;  // reads zero on hardware, but it is a game bug - refuse it
+    if (sel < 16)
+    {
+      const u32 reg = sel - 12;
+      for (u32 c = 0; c < 3; ++c)
+        value[c] = constants.kcolors[reg][c];
+      return true;
+    }
+    if (sel < 32)
+    {
+      const u32 reg = (sel - 16) % 4;
+      const u32 component = (sel - 16) / 4;  // 0 = R, 1 = G, 2 = B, 3 = A
+      value.fill(constants.kcolors[reg][component]);
+      return true;
+    }
+    return false;
+  };
+
+  // One evaluation of the whole chain at a fixed (texture, rasterized) colour.
+  // Per-channel arithmetic copied from Tev::DrawColorRegular
+  // (Software/Tev.cpp:80-97) in the same order and with the same rounding, then
+  // clamped the way Tev.cpp:515-520 clamps.
+  const auto evaluate = [&](int texture, const std::array<int, 3>& ras,
+                            std::array<int, 3>& result) -> bool {
+    std::array<std::array<int, 3>, 4> reg{};
+    for (u32 i = 0; i < 4; ++i)
+      for (u32 c = 0; c < 3; ++c)
+        reg[i][c] = constants.colors[i][c];
+
+    for (u32 stage = 0; stage < stages; ++stage)
+    {
+      const auto& cc = bpmem.combiners[stage].colorC;
+      std::array<int, 3> konst{};
+      const bool konst_ok = konst_color(stage, konst);
+
+      // TevColorArg (BPMemory.h:167-185). The ALPHA-valued inputs are refused
+      // rather than approximated: prev.aaa is written by the alpha chain, which
+      // this evaluator does not run, and ras.aaa is a second free variable that
+      // the affine-in-ras model has no room for. Neither appears in any Wind
+      // Waker combiner measured, so refusing them costs nothing real.
+      const auto input = [&](u32 source, std::array<int, 3>& value) -> bool {
+        switch (source)
+        {
+        case 0:  // prev.rgb
+        case 2:  // c0.rgb
+        case 4:  // c1.rgb
+        case 6:  // c2.rgb
+          value = reg[source / 2];
+          return true;
+        case 8:  // tex.rgb
+        case 9:  // tex.aaa - the texture is pinned opaque, so this is the same
+          value.fill(texture);
+          return true;
+        case 10:  // ras.rgb
+          value = ras;
+          return true;
+        case 12:  // one
+          value.fill(255);
+          return true;
+        case 13:  // half
+          value.fill(128);
+          return true;
+        case 14:  // konst
+          value = konst;
+          return konst_ok;
+        case 15:  // zero
+          value.fill(0);
+          return true;
+        default:  // 1, 3, 5, 7 (register alphas), 11 (ras.aaa)
+          g_tev_color_bail = TevColorBail::AlphaInput;
+          return false;
+        }
+      };
+
+      std::array<int, 3> a{}, b{}, c{}, d{};
+      if (!input(static_cast<u32>(cc.a.Value()), a) ||
+          !input(static_cast<u32>(cc.b.Value()), b) ||
+          !input(static_cast<u32>(cc.c.Value()), c) || !input(static_cast<u32>(cc.d.Value()), d))
+      {
+        if (g_tev_color_bail == TevColorBail::None)
+          g_tev_color_bail = TevColorBail::Konst;
+        return false;
+      }
+      // Comparison mode is a different formula entirely (Tev.cpp:100-135) and is
+      // not affine in anything; bail rather than guess.
+      if (cc.bias == TevBias::Compare)
+      {
+        g_tev_color_bail = TevColorBail::CompareMode;
+        return false;
+      }
+
+      const u32 scale = static_cast<u32>(cc.scale.Value());
+      for (u32 ch = 0; ch < 3; ++ch)
+      {
+        const int cc_weight = c[ch] + (c[ch] >> 7);
+        int temp = a[ch] * (256 - cc_weight) + b[ch] * cc_weight;
+        temp <<= s_tev_scale_left[scale];
+        temp += (cc.scale == TevScale::Divide2) ? 0 : (cc.op == TevOp::Sub) ? 127 : 128;
+        temp >>= 8;
+        temp = cc.op == TevOp::Sub ? -temp : temp;
+        int value =
+            ((d[ch] + s_tev_bias[static_cast<u32>(cc.bias.Value())]) << s_tev_scale_left[scale]) +
+            temp;
+        value >>= s_tev_scale_right[scale];
+        if (cc.clamp)
+          value = std::clamp(value, 0, 255);
+        else
+          value = std::clamp(value, -1024, 1023);
+        reg[static_cast<u32>(cc.dest.Value())][ch] = value;
+      }
+    }
+    result = reg[static_cast<u32>(bpmem.combiners[stages - 1].colorC.dest.Value())];
+    return true;
+  };
+
+  const std::array<int, 3> ras_zero = {0, 0, 0};
+  const std::array<int, 3> ras_one = {255, 255, 255};
+  const std::array<int, 3> ras_half = {128, 128, 128};
+
+  std::array<int, 3> at_zero{}, at_one{}, at_half{};
+  if (!evaluate(255, ras_zero, at_zero) || !evaluate(255, ras_one, at_one) ||
+      !evaluate(255, ras_half, at_half))
+  {
+    return false;
+  }
+
+  // Affine in ras, or refused. Two endpoints describe the chain only if the
+  // midpoint lands where they say it does; a square, a clamp biting mid-range or
+  // a second reference to ras elsewhere in the chain all show up here.
+  for (u32 ch = 0; ch < 3; ++ch)
+  {
+    const int predicted = (at_zero[ch] + at_one[ch]) / 2;
+    if (std::abs(predicted - at_half[ch]) > 2)
+    {
+      g_tev_color_bail = TevColorBail::NotAffine;
+      return false;
+    }
+  }
+
+  // A clean product with the texture, or refused. Remix multiplies the real
+  // texture back in through argument 1, so the factorization is only valid when
+  // the chain vanishes with a black texture. Tested only when a texture is
+  // actually bound: a chain that never samples one is trivially independent of
+  // it, and then the material's own albedo is the identity instead.
+  if (has_texture)
+  {
+    std::array<int, 3> dark_zero{}, dark_one{};
+    if (!evaluate(0, ras_zero, dark_zero) || !evaluate(0, ras_one, dark_one))
+      return false;
+    for (u32 ch = 0; ch < 3; ++ch)
+    {
+      if (dark_zero[ch] > 2 || dark_one[ch] > 2)
+      {
+        g_tev_color_bail = TevColorBail::NotMultiplicative;
+        return false;
+      }
+    }
+  }
+
+  for (u32 ch = 0; ch < 3; ++ch)
+  {
+    out.at_zero[ch] = std::clamp(at_zero[ch], 0, 255);
+    out.at_one[ch] = std::clamp(at_one[ch], 0, 255);
+  }
+  out.valid = true;
+  out.identity = out.at_zero == std::array<int, 3>{0, 0, 0} &&
+                 out.at_one == std::array<int, 3>{255, 255, 255};
+  return true;
+}
+
+// Apply a resolved fold to one vertex colour. `color` is the raw attribute as
+// Dolphin stores it - R, G, B, A in memory order, so the low byte is red - and the
+// result keeps that packing and the original alpha. Alpha is deliberately
+// untouched: it is resolved separately by ResolveTevAlpha, and the overlay
+// rasterizer and the alpha-test fold both read it.
+u32 ApplyTevColorFold(const TevColorFold& fold, u32 color)
+{
+  u32 out = color & 0xFF000000u;
+  for (u32 ch = 0; ch < 3; ++ch)
+  {
+    const int ras = static_cast<int>((color >> (ch * 8)) & 0xFFu);
+    const int value = fold.at_zero[ch] + (fold.at_one[ch] - fold.at_zero[ch]) * ras / 255;
+    out |= static_cast<u32>(std::clamp(value, 0, 255)) << (ch * 8);
+  }
+  return out;
+}
+
 void ResolveBlend(DrawBlendState& out, FrameStats& stats)
 {
   const BlendMode& mode = bpmem.blendmode;
@@ -798,14 +1092,17 @@ struct TexGenState
   bool post_normalize = false;
 };
 
-TexGenState ResolveTexGen(const PortableVertexDeclaration& decl, bool gx_texgen)
+TexGenState ResolveTexGen(const PortableVertexDeclaration& decl, bool gx_texgen, u32 tev_stage)
 {
   TexGenState out;
   if (!gx_texgen)
     return out;
 
-  // Stage 0 names the texgen slot it samples; it is not always slot 0.
-  const u32 coord = bpmem.tevorders[0].getTexCoord(0);
+  // The SAMPLING stage names the texgen slot it samples; it is not always slot 0,
+  // and the sampling stage is not always stage 0 either. Taking the coordinate
+  // from stage 0 while taking the texture from a later stage samples the right
+  // image through the wrong mapping - worse than either mistake alone.
+  const u32 coord = bpmem.tevorders[tev_stage >> 1].getTexCoord(tev_stage & 1);
   if (coord >= xfmem.numTexGen.numTexGens || coord >= 8)
     return out;
 
@@ -1365,10 +1662,44 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   // ---- Resolve the albedo material ---------------------------------------
 
-  // v1 materials are "whatever TEV stage 0 samples". Every other stage - and
-  // therefore every multi-stage combiner effect - is ignored.
+  // v1 materials were "whatever TEV stage 0 samples". Every other stage - and
+  // therefore every multi-stage combiner effect - was ignored, which drops the
+  // texture outright whenever stage 0 does not sample one.
+  //
+  // Wind Waker's sea is exactly that shape: stage 0 is a pure register lerp with
+  // no texture at all and stage 1 samples the water texture. So the sea arrived
+  // untextured AND unregistered - a flat grey card. The first ENABLED stage is
+  // the right one to hand Remix, and taking it only when stage 0 is untextured
+  // makes this a strict extension: a draw that samples on stage 0 resolves
+  // exactly as before.
+  //
+  // Two things deliberately keep reading STAGE 0 regardless, so this cannot
+  // disturb behaviour that is already confirmed in-game: the sky texture-hash
+  // match, and DrawDiagnostics::texture_hash, which the sky auto-detector's
+  // untextured->IGNORE rule keys on. Both are decisions about identity rather
+  // than about shading.
   const bool stage0_textured = bpmem.tevorders[0].getEnable(0) != 0;
   const u32 stage0_texmap = bpmem.tevorders[0].getTexMap(0);
+  u32 albedo_texmap = stage0_texmap;
+  bool albedo_textured = stage0_textured;
+  // Which TEV stage the albedo came from. Load-bearing beyond bookkeeping: the
+  // texture COORDINATE has to come from the same stage, or the right image is
+  // sampled through the wrong mapping.
+  u32 albedo_stage = 0;
+  if (!stage0_textured && g_remix_api->GxTextureStageEnabled())
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_textured = true;
+      albedo_stage = stage;
+      ++stats.texture_later_stage;
+      break;
+    }
+  }
   const RemixTexture* albedo = nullptr;
   u8 filter_mode = 1;   // MDL Filter::Linear
   u8 wrap_mode_u = 1;   // MDL WrapMode::Repeat
@@ -1381,10 +1712,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   bool texture_is_efb_copy = false;
   bool texture_is_xfb_copy = false;
 
-  if (stage0_textured)
+  if (albedo_textured)
   {
-    albedo = g_remix_api->GetBoundTexture(stage0_texmap);
-    const RcTcacheEntry& entry = g_texture_cache->GetBoundEntry(stage0_texmap);
+    albedo = g_remix_api->GetBoundTexture(albedo_texmap);
+    const RcTcacheEntry& entry = g_texture_cache->GetBoundEntry(albedo_texmap);
     if (entry)
     {
       texture_addr = entry->addr;
@@ -1398,11 +1729,28 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // decode in v1.
     if (albedo == nullptr || !albedo->HasData())
     {
-      ++stats.skipped_efb_texture;
-      return;
+      // Only a STAGE 0 texture is load-bearing enough to drop the draw over.
+      // A draw that reached here through a later stage rendered untextured
+      // before this change, so falling back to that is strictly no worse -
+      // whereas skipping it would make geometry disappear that used to be
+      // visible, which is a regression dressed up as a fix.
+      if (stage0_textured)
+      {
+        ++stats.skipped_efb_texture;
+        return;
+      }
+      albedo = nullptr;
+      albedo_textured = false;
+      albedo_stage = 0;
+      texture_addr = 0;
+      texture_is_efb_copy = false;
+      texture_is_xfb_copy = false;
+      --stats.texture_later_stage;
     }
-
-    const TexMode0& mode = bpmem.tex.GetUnit(stage0_texmap).texMode0;
+  }
+  if (albedo_textured)
+  {
+    const TexMode0& mode = bpmem.tex.GetUnit(albedo_texmap).texMode0;
     // GX and Remix (MDL) agree numerically: Near/Linear == 0/1 and
     // Clamp/Repeat/Mirror == 0/1/2. The invalid GX wrap value 3 behaves as
     // clamp on hardware.
@@ -1410,6 +1758,14 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     wrap_mode_u = static_cast<u8>(std::min<u32>(static_cast<u32>(mode.wrap_s.Value()), 2));
     wrap_mode_v = static_cast<u8>(std::min<u32>(static_cast<u32>(mode.wrap_t.Value()), 2));
   }
+
+  // Stage 0's texture hash specifically, which is what every IDENTITY decision
+  // keys on - the sky texture list, the sky auto-detector's untextured test - as
+  // opposed to `albedo`, which is now whichever stage actually shades the draw.
+  // Keeping the two apart is what lets the later-stage lookup above be a pure
+  // shading change.
+  const u64 stage0_texture_hash =
+      stage0_textured && albedo != nullptr ? albedo->GetContentHash() : 0;
 
   u8 alpha_test_type = 7;
   u8 alpha_reference = 0;
@@ -1457,14 +1813,26 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   const int position_components = std::min(decl.position.components, 3);
   const bool has_normals = decl.normals[0].enable;
-  const bool has_texcoord = decl.texcoords[0].enable;
-  const int texcoord_components = has_texcoord ? std::min(decl.texcoords[0].components, 2) : 0;
+  // Which coordinate ATTRIBUTE to fall back on when texgen is off or unresolved.
+  // Attribute 0 was hardcoded, which is only right when the sampling stage happens
+  // to name texgen slot 0 - not a safe assumption now that the albedo can come
+  // from a later stage.
+  u32 texcoord_slot = 0;
+  {
+    const u32 named = bpmem.tevorders[albedo_stage >> 1].getTexCoord(albedo_stage & 1);
+    if (named < 8 && decl.texcoords[named].enable)
+      texcoord_slot = named;
+  }
+  const bool has_texcoord = decl.texcoords[texcoord_slot].enable;
+  const int texcoord_components =
+      has_texcoord ? std::min(decl.texcoords[texcoord_slot].components, 2) : 0;
 
   // Texture coordinates the way the console generates them, rather than "vertex
   // attribute 0, verbatim". Both halves of that shortcut were wrong: stage 0
   // names which texgen slot it samples, and the xfmem texture matrix on that
   // slot is how every scrolling or scaled texture on the machine is animated.
-  const TexGenState texgen = ResolveTexGen(decl, g_remix_api->GxTexGenEnabled());
+  const TexGenState texgen =
+      ResolveTexGen(decl, g_remix_api->GxTexGenEnabled(), albedo_stage);
   if (texgen.enabled)
   {
     ++stats.texgen_generated;
@@ -1552,12 +1920,101 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     break;
   }
 
+  // Resolve the TEV COLOUR chain, and fold it into the vertex colours further
+  // down. Scoped to draws whose colour was already going to come from the vertex
+  // stream: those are the ones where the rasterized colour is the chain's free
+  // variable, and leaving every other route untouched keeps this a clean A/B.
+  //
+  // Ortho draws are excluded. The overlay rasterizer reads its own colour and
+  // rasterized-alpha inputs straight out of the submitted vertex colour, so
+  // rewriting those bytes would change UI compositing rather than material
+  // albedo - a separate question, on a path that is already delicately balanced.
+  TevColorFold tev_color;
+  const bool tev_color_eligible = !is_ortho && g_remix_api->GxTevColorEnabled();
+  const bool tev_color_valid = tev_color_eligible && ResolveTevColor(albedo_textured, tev_color);
+
+  // Route A - the chain's free variable is the rasterized colour, and the draw
+  // takes its colour from the vertex stream. Folded per vertex further down.
+  const bool fold_tev_color = tev_color_valid && !tev_color.identity &&
+                              raster_color.color_arg2 == REMIX_TEX_ARG_VERTEX_COLOR0 &&
+                              color_slot >= 0;
+
+  // Route B - the chain does NOT reference the rasterized colour at all, so it
+  // resolves to a per-draw CONSTANT. That constant is still a colour the console
+  // applies and this backend was dropping: the dominant such chain in Wind Waker
+  // is `TexColor * Reg[Color0]`, a TEV register used as a multiplier, and a draw
+  // taking it resolved to "no tint" here and rendered as the bare texture.
+  //
+  // A constant multiplier is exactly what tFactor is for, so it costs no mesh
+  // identity - two draws differing only in tint keep one mesh handle. Only taken
+  // when there is no vertex-colour route to fold and the constant is not white,
+  // because white is the identity for MODULATE and claiming a tint that does
+  // nothing would only make the counters lie.
+  bool tint_tev_color = false;
+  u32 tev_constant = 0xFFFFFFFFu;
+  if (tev_color_valid && !fold_tev_color && tev_color.at_zero == tev_color.at_one)
+  {
+    tev_constant = (static_cast<u32>(tev_color.at_one[0]) << 16) |
+                   (static_cast<u32>(tev_color.at_one[1]) << 8) |
+                   static_cast<u32>(tev_color.at_one[2]);
+    tint_tev_color = tev_constant != 0x00FFFFFFu;
+  }
+
+  if (tev_color_eligible)
+  {
+    if (fold_tev_color)
+      ++stats.tev_color_folded;
+    else if (tint_tev_color)
+      ++stats.tev_color_tinted;
+    else if (tev_color_valid)
+      ++stats.tev_color_identity;
+    else
+      ++stats.tev_color_bailed;
+  }
+
+  // Route-colouring diagnostic. Packed 0xAARRGGBB, matching the vertex colour
+  // Remix reads, and non-zero only while the knob is on:
+  //   red     - vertex colour, TEV chain folded
+  //   magenta - vertex colour, fold refused or identity
+  //   blue    - register tint through tFactor
+  //   green   - no rasterized colour at all
+  u32 debug_route_color = 0;
+  if (!is_ortho && g_remix_api->DebugColorRoutesEnabled())
+  {
+    if (raster_color.color_arg2 == REMIX_TEX_ARG_VERTEX_COLOR0)
+      debug_route_color = fold_tev_color ? 0xFFFF0000u : 0xFFFF00FFu;
+    else if (raster_color.color_arg2 == REMIX_TEX_ARG_TFACTOR)
+      debug_route_color = 0xFF0000FFu;
+    else
+      debug_route_color = 0xFF00FF00u;
+  }
+
   DrawBlendState blend;
   blend.color_arg1 = REMIX_TEX_ARG_TEXTURE;
   blend.color_arg2 = raster_color.color_arg2;
   blend.color_operation = REMIX_TEX_OP_MODULATE;
+  if (debug_route_color != 0)
+  {
+    // Select the vertex colour outright so the flat route colour is the albedo,
+    // with neither the texture nor the register able to disguise it.
+    blend.color_arg2 = REMIX_TEX_ARG_VERTEX_COLOR0;
+    blend.color_operation = REMIX_TEX_OP_SELECT_ARG2;
+  }
   blend.tfactor = raster_color.tfactor;
-  blend.vertex_color_is_baked_lighting = raster_color.baked_lighting;
+  if (tint_tev_color)
+  {
+    // RGB from the resolved chain constant; the alpha half is left to whatever the
+    // channel resolution decided, because alpha is resolved by ResolveTevAlpha and
+    // the two must not fight over the same field.
+    blend.color_arg2 = REMIX_TEX_ARG_TFACTOR;
+    blend.tfactor = (raster_color.tfactor & 0xFF000000u) | tev_constant;
+  }
+  // A folded colour is the console's own rasterized albedo - a lerp between two
+  // authored register colours - not a lighting term multiplied onto a material.
+  // Letting the runtime "remove the brightness contribution" from it would divide
+  // out the very thing the fold recovered, so the flag comes off whenever the
+  // fold applied.
+  blend.vertex_color_is_baked_lighting = raster_color.baked_lighting && !fold_tev_color;
   blend.texture_addr = texture_addr;
   blend.texture_is_efb_copy = texture_is_efb_copy;
   blend.texture_is_xfb_copy = texture_is_xfb_copy;
@@ -1661,12 +2118,26 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     if (texgen.enabled)
       GenerateTexCoord(texgen, src, decl, position, normal, dst.texcoord);
     else if (texcoord_components > 0)
-      ReadFloats(src + decl.texcoords[0].offset, dst.texcoord, texcoord_components);
+      ReadFloats(src + decl.texcoords[texcoord_slot].offset, dst.texcoord, texcoord_components);
 
-    if (color_slot >= 0)
+    if (debug_route_color != 0)
+    {
+      // Diagnostic mode: every draw is painted a flat colour naming the colour
+      // ROUTE it took, with the texture selected out of the material below. The
+      // frame counters say how many draws took each route but not WHICH pixels
+      // they own, and that is the question when a surface comes out the wrong
+      // colour and the arithmetic says it should not.
+      dst.color = debug_route_color;
+    }
+    else if (color_slot >= 0)
     {
       u32 color = 0;
       std::memcpy(&color, src + decl.colors[color_slot].offset, sizeof(u32));
+      // Run the vertex's rasterized colour through the resolved TEV chain, so
+      // what Remix receives is the colour the console would have rasterized
+      // rather than the chain's input weight. See ResolveTevColor.
+      if (fold_tev_color)
+        color = ApplyTevColorFold(tev_color, color);
       dst.color = ToRemixVertexColor(color);
     }
     else
@@ -1902,7 +2373,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // can ever match.
   const int sky_mode = g_remix_api->SkyMode();
   const bool is_sky = !is_ortho &&
-                      ((albedo != nullptr && g_remix_api->IsSkyTexture(albedo->GetContentHash())) ||
+                      ((stage0_texture_hash != 0 && g_remix_api->IsSkyTexture(stage0_texture_hash)) ||
                        (sky_mode != 0 && IsSkyDraw(bpmem.zmode)));
   if (is_sky)
     ++stats.sky_draws;
@@ -1950,12 +2421,162 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                  blend.write_mask, blend.alpha_test_compare, blend.alpha_test_reference);
   }
 
+  // Where a world draw's colour comes from, per draw, with the resolution's own
+  // working shown. The frame counters say how many draws took each route; they
+  // cannot say whether the ONE draw that matters - an ocean, a vertex-coloured
+  // dome - is among them, or which of the four independent things that can wash
+  // a colour out did it. This is the only instrument that can.
+  //
+  // Deliberately covers a large slice of the frame rather than the first few
+  // draws: the geometry in question is typically hundreds of draws in, and the
+  // existing trace above caps at three.
+  const bool has_vertex_color = decl.colors[0].enable || decl.colors[1].enable;
+  if (!is_ortho && g_remix_api->TraceColorsEnabled() && g_remix_api->ShouldTraceDraws() &&
+      stats.draws_seen < COLOR_TRACE_DRAW_LIMIT &&
+      (has_vertex_color || xfmem.numChan.numColorChans != 0))
+  {
+    // Raw vertex colour, straight out of the attribute, per enabled slot: the
+    // range over the draw plus vertex 0. A washed-out result whose SOURCE bytes
+    // are already pale is a decode bug; one whose source is saturated is a
+    // downstream bug, and those are the two halves this line separates.
+    std::string raw_colors;
+    for (u32 slot = 0; slot < 2; ++slot)
+    {
+      if (!decl.colors[slot].enable)
+        continue;
+      u32 low[4] = {255, 255, 255, 255};
+      u32 high[4] = {0, 0, 0, 0};
+      for (u32 i = 0; i < vertex_count; ++i)
+      {
+        u32 packed = 0;
+        std::memcpy(&packed,
+                    m_base_buffer_pointer + static_cast<size_t>(i) * stride +
+                        decl.colors[slot].offset,
+                    sizeof(u32));
+        for (u32 c = 0; c < 4; ++c)
+        {
+          const u32 byte = (packed >> (c * 8)) & 0xFFu;
+          low[c] = std::min(low[c], byte);
+          high[c] = std::max(high[c], byte);
+        }
+      }
+      u32 first = 0;
+      std::memcpy(&first, m_base_buffer_pointer + decl.colors[slot].offset, sizeof(u32));
+      // Dolphin writes the attribute R,G,B,A in memory order, so the low byte is
+      // red; `v0` is printed as the u32 actually handed to ToRemixVertexColor.
+      raw_colors += fmt::format("{}s{}[r {}-{} g {}-{} b {}-{} a {}-{} v0 {:#010x}]",
+                                slot == 0 ? "" : " ", slot, low[0], high[0], low[1], high[1],
+                                low[2], high[2], low[3], high[3], first);
+    }
+    if (raw_colors.empty())
+      raw_colors = "none";
+
+    // The two LitChannels the resolution reads, printed for both channels rather
+    // than only the referenced one: "which channel did it pick" is exactly what
+    // this line exists to check, so printing only the pick would beg the
+    // question. `lit` is enablelighting - the bit that decides baked-lighting
+    // normalization, and therefore the bit most likely to be wrong here.
+    std::string channels;
+    for (u32 channel = 0; channel < 2; ++channel)
+    {
+      const LitChannel& c = xfmem.color[channel];
+      const LitChannel& a = xfmem.alpha[channel];
+      channels += fmt::format(
+          "{}ch{}[c mat {} lit {} amb {} mask {:#x} / a mat {} lit {} amb {} | matReg {:#010x} "
+          "ambReg {:#010x}]",
+          channel == 0 ? "" : " ", channel, static_cast<u32>(c.matsource.Value()),
+          c.enablelighting ? 1 : 0, static_cast<u32>(c.ambsource.Value()), c.GetFullLightMask(),
+          static_cast<u32>(a.matsource.Value()), a.enablelighting ? 1 : 0,
+          static_cast<u32>(a.ambsource.Value()), xfmem.matColor[channel], xfmem.ambColor[channel]);
+    }
+
+    // The COLOUR combiner chain, and the TEV colour registers it can name. This
+    // is the half that decides whether a draw's colour is reachable at all:
+    // TevColorArg 2/4/6 are registers c0/c1/c2 (per-draw constants written by
+    // GXSetTevColor), 14 is konst, 10 is the rasterized colour. A chain that
+    // tints through a REGISTER carries its colour in state this backend reads
+    // nowhere - and would present exactly as "the surface is white".
+    const u32 stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    std::string color_chain;
+    for (u32 stage = 0; stage < stages; ++stage)
+    {
+      const auto& cc = bpmem.combiners[stage].colorC;
+      color_chain += fmt::format(
+          "{}[a{} b{} c{} d{} k{} r{} bias{} op{} ->{}]", stage == 0 ? "" : " ",
+          static_cast<u32>(cc.a.Value()), static_cast<u32>(cc.b.Value()),
+          static_cast<u32>(cc.c.Value()), static_cast<u32>(cc.d.Value()),
+          static_cast<u32>(bpmem.tevksel.GetKonstColor(stage)),
+          static_cast<u32>(bpmem.tevorders[stage >> 1].getColorChan(stage & 1)),
+          static_cast<u32>(cc.bias.Value()), static_cast<u32>(cc.op.Value()),
+          static_cast<u32>(cc.dest.Value()));
+    }
+
+    // creg/konst RGB. Printed unconditionally because "the colour is in a
+    // register the resolution never reads" is a hypothesis that can only be
+    // checked against the register's actual value.
+    const auto& psm = Core::System::GetInstance().GetPixelShaderManager().constants;
+    std::string registers;
+    for (u32 i = 0; i < 4; ++i)
+    {
+      registers += fmt::format("{}c{}[{} {} {}]k{}[{} {} {}]", i == 0 ? "" : " ", i,
+                               psm.colors[i][0], psm.colors[i][1], psm.colors[i][2], i,
+                               psm.kcolors[i][0], psm.kcolors[i][1], psm.kcolors[i][2]);
+    }
+
+    // The albedo texture's MEAN colour, and which stage it came from. This is the
+    // other half of "where does the surface's colour come from": a chain whose
+    // resolved vertex term is near-white is only correct if the texture it
+    // multiplies carries the hue, and nothing else in the log can say whether it
+    // does. Cheap enough - it runs on one frame in 120, behind a default-off knob.
+    std::string tex_mean = "none";
+    if (albedo != nullptr && albedo->HasData())
+    {
+      const std::vector<u8>& pixels = albedo->GetPixels();
+      const size_t texels = pixels.size() / 4;
+      if (texels != 0)
+      {
+        // Stride the samples: a 1024x1024 texture is a million texels and the mean
+        // does not need all of them.
+        const size_t step = std::max<size_t>(1, texels / 4096);
+        u64 sum[4] = {};
+        size_t taken = 0;
+        for (size_t t = 0; t < texels; t += step, ++taken)
+          for (u32 c = 0; c < 4; ++c)
+            sum[c] += pixels[t * 4 + c];
+        tex_mean = fmt::format("[{} {} {} {}] {} texels", sum[0] / taken, sum[1] / taken,
+                               sum[2] / taken, sum[3] / taken, texels);
+      }
+    }
+
+    INFO_LOG_FMT(VIDEO, "Remix colour f{} draw {}: albedo stage {} mean {}", g_remix_api->FrameIndex(),
+                 stats.draws_seen, albedo_stage, tex_mean);
+
+    INFO_LOG_FMT(VIDEO,
+                 "Remix colour f{} draw {}: tex {:#018x} verts {} | nchan {} | ras stage c{} a{} -> "
+                 "chan c{} a{} | {} | resolved arg1 {} arg2 {} op {} | alpha arg1 {} arg2 {} op {} "
+                 "| tfactor {:#010x} | baked {} | vslot {} | raw {} | fold {} [{} {} {}]->[{} {} "
+                 "{}] bail {} | tev {} | reg {}",
+                 g_remix_api->FrameIndex(), stats.draws_seen,
+                 albedo != nullptr ? albedo->GetContentHash() : 0, vertex_count,
+                 static_cast<u32>(xfmem.numChan.numColorChans), raster_color.ras_color_stage,
+                 raster_color.ras_alpha_stage, raster_color.color_channel,
+                 raster_color.alpha_channel, channels, blend.color_arg1, blend.color_arg2,
+                 blend.color_operation, blend.alpha_arg1, blend.alpha_arg2, blend.alpha_operation,
+                 blend.tfactor, raster_color.baked_lighting ? 1 : 0, color_slot, raw_colors,
+                 fold_tev_color ? "vertex" :
+                     (tint_tev_color ? "tfactor" :
+                          (tev_color_valid ? (tev_color.identity ? "identity" : "white") : "BAILED")),
+                 tev_color.at_zero[0], tev_color.at_zero[1], tev_color.at_zero[2],
+                 tev_color.at_one[0], tev_color.at_one[1], tev_color.at_one[2],
+                 static_cast<u32>(g_tev_color_bail), color_chain, registers);
+  }
+
   // Recorded, never classified on: the sky auto-detector keys on the transform
   // signature alone, and these are what let its verdicts be checked against the
   // weaker signals - and what makes a classification hand-transcribable into
   // rtx.skyBoxGeometries or RemixSkyTextures.
   DrawDiagnostics diagnostics;
-  diagnostics.texture_hash = albedo != nullptr ? albedo->GetContentHash() : 0;
+  diagnostics.texture_hash = stage0_texture_hash;
   diagnostics.depth_test = bpmem.zmode.test_enable;
   diagnostics.depth_func = static_cast<u8>(bpmem.zmode.func.Value());
   diagnostics.depth_write = bpmem.zmode.update_enable;

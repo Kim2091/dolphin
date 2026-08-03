@@ -600,6 +600,10 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
+  m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
+  m_gx_tev_color = Config::Get(Config::GFX_REMIX_GX_TEV_COLOR);
+  m_gx_texture_stage = Config::Get(Config::GFX_REMIX_GX_TEXTURE_STAGE);
+  m_debug_color_routes = Config::Get(Config::GFX_REMIX_DEBUG_COLOR_ROUTES);
   m_ui_ras_channel = Config::Get(Config::GFX_REMIX_UI_RAS_CHANNEL);
   m_world_scissor_skip = Config::Get(Config::GFX_REMIX_WORLD_SCISSOR_SKIP);
   m_light_range = std::max(1.0f, Config::Get(Config::GFX_REMIX_LIGHT_RANGE));
@@ -1198,10 +1202,20 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   opaque_ext.roughnessTexture = nullptr;
   opaque_ext.metallicTexture = nullptr;
   opaque_ext.heightTexture = nullptr;
-  // Untextured draws get a neutral mid-grey so they are visibly present rather
+  // Untextured draws got a neutral mid-grey so they were visibly present rather
   // than black; textured draws leave albedo entirely to the texture.
+  //
+  // With the TEV colour fold on, that placeholder is wrong: an untextured draw's
+  // colour is now fully described by its submitted vertex colour, and argument 1 is
+  // the texture, so anything but white halves it. Wind Waker's sea would arrive
+  // correctly coloured and then be rendered at half brightness. White is the
+  // identity for MODULATE, and a draw with no colour at all already gets opaque
+  // white vertices, so it stays visible either way.
+  const float untextured_albedo = m_gx_tev_color ? 1.0f : 0.5f;
   opaque_ext.albedoConstant =
-      texture_hash != 0 ? remixapi_Float3D{1.0f, 1.0f, 1.0f} : remixapi_Float3D{0.5f, 0.5f, 0.5f};
+      texture_hash != 0 ?
+          remixapi_Float3D{1.0f, 1.0f, 1.0f} :
+          remixapi_Float3D{untextured_albedo, untextured_albedo, untextured_albedo};
   opaque_ext.opacityConstant = 1.0f;
   opaque_ext.roughnessConstant = 0.8f;
   opaque_ext.metallicConstant = 0.0f;
@@ -3438,7 +3452,8 @@ void RemixApi::OnAfterFrame()
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
                  "scissor {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
-                 "register, {} none, {} split | texgen {} ({} non-trivial) | blended {} tested {} "
+                 "register, {} none, {} split | tev colour {} folded, {} tinted, {} identity, {} bailed, {} "
+                 "later-stage tex | texgen {} ({} non-trivial) | blended {} tested {} "
                  "logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
@@ -3454,7 +3469,9 @@ void RemixApi::OnAfterFrame()
                  m_stats.meshes_created,
                  m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
                  m_stats.color_register, m_stats.color_none, m_stats.ras_channel_split,
-                 m_stats.texgen_generated,
+                 m_stats.tev_color_folded, m_stats.tev_color_tinted,
+                 m_stats.tev_color_identity, m_stats.tev_color_bailed,
+                 m_stats.texture_later_stage, m_stats.texgen_generated,
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,

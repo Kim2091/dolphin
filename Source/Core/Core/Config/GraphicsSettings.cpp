@@ -576,6 +576,60 @@ const Info<bool> GFX_REMIX_UI_RAS_CHANNEL{{System::GFX, "Settings", "RemixUiRasC
 const Info<bool> GFX_REMIX_WORLD_SCISSOR_SKIP{{System::GFX, "Settings", "RemixWorldScissorSkip"},
                                               true};
 
+// Per-draw trace of where a WORLD draw's colour comes from: the TEV stage that
+// consumes ras, the XF channel it names, both channels' material/lighting/
+// ambient sources, the resolved texture-stage arguments, and the raw vertex
+// colour bytes.
+//
+// Log-only and gated to ShouldTraceDraws() frames, but it emits a line per draw
+// for the first few hundred draws of such a frame, which is far heavier than the
+// other trace knobs. Off by default; turn it on to answer "why is this
+// vertex-coloured surface white", which the frame counters cannot.
+const Info<bool> GFX_REMIX_TRACE_COLORS{{System::GFX, "Settings", "RemixTraceColors"}, false};
+
+// Resolve the TEV COLOUR chain and fold it into the submitted vertex colours.
+//
+// GC titles keep a surface's palette in TEV colour REGISTERS (GXSetTevColor) and
+// use the per-vertex rasterized colour as the lerp WEIGHT between two of them.
+// Measured on Wind Waker's title scene: 3263 of 3865 vertex-coloured draws are
+// exactly lerp(c0, c1, ras) and another 546 are lerp(c0, konst, ras). Submitting
+// the raw weight as an albedo tint therefore drops the colour and renders a
+// greyscale surface - which is why the ocean and the vertex-coloured skybox came
+// out white.
+//
+// False = submit the raw rasterized colour, which is exactly the pre-fix
+// behaviour, so this is a clean A/B. Chains the evaluator cannot resolve fall back
+// to it per draw; the frame log counts folded/identity/bailed.
+const Info<bool> GFX_REMIX_GX_TEV_COLOR{{System::GFX, "Settings", "RemixGxTevColor"}, true};
+
+// Take the albedo texture from the first ENABLED TEV stage rather than from stage
+// 0 alone.
+//
+// Wind Waker's sea samples nothing on stage 0 (it is a pure register lerp) and
+// samples the water texture on stage 1, so the whole surface arrived untextured.
+// Only consulted when stage 0 samples nothing, which makes it a strict extension:
+// a draw that samples on stage 0 resolves exactly as before. Identity decisions -
+// the sky texture list, the sky auto-detector's untextured test - keep reading
+// stage 0 either way.
+//
+// False = stage 0 only, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_TEXTURE_STAGE{{System::GFX, "Settings", "RemixGxTextureStage"},
+                                            true};
+
+// Diagnostic. Paints every world draw a flat colour naming the colour ROUTE it
+// took, with the texture and the register selected out of the material so the
+// route colour is the whole albedo:
+//   red     - vertex colour, TEV chain folded
+//   magenta - vertex colour, fold refused or identity
+//   blue    - register tint through tFactor
+//   green   - no rasterized colour at all
+//
+// The frame counters say how many draws took each route; they cannot say which
+// PIXELS a route owns, and that is the question when a surface comes out the
+// wrong colour and the arithmetic says it should not. Never on by default.
+const Info<bool> GFX_REMIX_DEBUG_COLOR_ROUTES{
+    {System::GFX, "Settings", "RemixDebugColorRoutes"}, false};
+
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
 const Info<VertexLoaderType> GFX_VERTEX_LOADER_TYPE{{System::GFX, "Settings", "VertexLoaderType"},

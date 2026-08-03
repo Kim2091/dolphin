@@ -109,6 +109,26 @@ struct FrameStats
   // counts how often that compromise was made.
   u32 ras_channel_split = 0;
 
+  // The TEV COLOUR chain fold, counted over the draws it is eligible for (world
+  // draws whose colour comes from the vertex stream). `folded` is the number whose
+  // submitted vertex colour now carries the chain's resolved output instead of its
+  // raw input weight - on Wind Waker that is the ocean. `identity` is the chains
+  // that pass the rasterized colour straight through, where folding would be a
+  // no-op and is skipped so the mesh hash cannot churn. `bailed` is chains the
+  // evaluator refused; a rising number there is the thing to investigate.
+  u32 tev_color_folded = 0;
+  u32 tev_color_identity = 0;
+  // Draws whose chain resolved to a per-draw CONSTANT colour, delivered through
+  // tFactor. The dominant Wind Waker case is `TexColor * Reg[Color0]` - a TEV
+  // register used as a multiplier, which resolved to "no tint" before and
+  // rendered as the bare texture.
+  u32 tev_color_tinted = 0;
+  u32 tev_color_bailed = 0;
+  // Draws whose albedo texture came from a TEV stage after stage 0, because
+  // stage 0 samples nothing. Wind Waker's sea is the case this exists for: a
+  // register lerp on stage 0 and the water texture on stage 1.
+  u32 texture_later_stage = 0;
+
   // Draws whose stage-0 texture coordinate went through GX texgen, and how many
   // of those produced something a raw read of attribute 0 would not have. A game
   // reporting zero non-trivial texgens cannot have a texgen bug.
@@ -624,6 +644,25 @@ public:
   // the pre-fix behaviour: the world path read scissor state nowhere.
   bool WorldScissorSkipEnabled() const { return m_world_scissor_skip; }
 
+  // Per-draw world colour trace. Heavier than the other trace knobs - a line per
+  // draw rather than per frame - so it is off by default.
+  bool TraceColorsEnabled() const { return m_trace_colors; }
+
+  // False submits the raw rasterized colour as the albedo tint, which is the
+  // pre-fix behaviour: the TEV colour registers a GC title keeps its palette in
+  // were dropped entirely. See ResolveTevColor.
+  bool GxTevColorEnabled() const { return m_gx_tev_color; }
+
+  // False takes the albedo texture from TEV stage 0 only, which is the pre-fix
+  // behaviour: a draw whose stage 0 samples nothing arrived untextured even when a
+  // later stage sampled the texture that shades it.
+  bool GxTextureStageEnabled() const { return m_gx_texture_stage; }
+
+  // Diagnostic: paint every world draw a flat colour naming which colour route
+  // it took, texture and register selected out. Answers "which pixels does this
+  // route own", which no counter can. Never on by default.
+  bool DebugColorRoutesEnabled() const { return m_debug_color_routes; }
+
   // Uploads the texture (once per content hash) and returns the material that
   // references it. A null texture yields the untextured fallback material.
   // alpha_test_type / alpha_reference come from the draw's GX alpha test and
@@ -749,6 +788,7 @@ public:
   // heuristic can be checked against what the game actually emits instead of
   // being guessed at. Bounded to one frame in 120, first few draws only.
   bool ShouldTraceDraws() const { return m_log_stats && (m_frame_index % 120) == 0; }
+  u64 FrameIndex() const { return m_frame_index; }
 
 private:
   struct MeshEntry
@@ -939,6 +979,10 @@ private:
   bool m_gx_ras_channel = true;
   bool m_ui_ras_channel = true;
   bool m_world_scissor_skip = true;
+  bool m_trace_colors = false;
+  bool m_gx_tev_color = true;
+  bool m_gx_texture_stage = true;
+  bool m_debug_color_routes = false;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is

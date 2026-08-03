@@ -153,6 +153,10 @@ extern const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB;
 extern const Info<bool> GFX_REMIX_GX_RAS_CHANNEL;
 extern const Info<bool> GFX_REMIX_UI_RAS_CHANNEL;
 extern const Info<bool> GFX_REMIX_WORLD_SCISSOR_SKIP;
+extern const Info<bool> GFX_REMIX_TRACE_COLORS;
+extern const Info<bool> GFX_REMIX_GX_TEV_COLOR;
+extern const Info<bool> GFX_REMIX_GX_TEXTURE_STAGE;
+extern const Info<bool> GFX_REMIX_DEBUG_COLOR_ROUTES;
 
 // Graphics.Enhancements
 
