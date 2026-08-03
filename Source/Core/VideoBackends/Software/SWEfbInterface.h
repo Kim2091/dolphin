@@ -49,6 +49,14 @@ bool ZCompare(u16 x, u16 y, u32 z);
 void SetColor(u16 x, u16 y, u8* color);
 void SetDepth(u16 x, u16 y, u32 depth);
 
+// Reads one pixel back out of the store, unpacked from the CURRENT
+// bpmem.zcontrol.pixel_format. GetColor returns RGBA in that byte order; the
+// peek callers shuffle it to ARGB themselves (SWEfbInterface.cpp:752-765).
+// Exported (they used to be file-static) so the Remix backend's EFB interface
+// can share this store rather than keep a second one.
+u32 GetColor(u16 x, u16 y);
+u32 GetDepth(u16 x, u16 y);
+
 u8* GetPixelPointer(u16 x, u16 y, bool depth);
 
 void EncodeXFB(u8* xfb_in_ram, u32 memory_stride, const MathUtil::Rectangle<int>& source_rect,

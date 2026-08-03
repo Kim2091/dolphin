@@ -63,6 +63,17 @@ public:
   void Unmap() override;
   void Flush() override;
 
+  // Overrides the row stride the encoders and the subsequent ReadTexels use.
+  // Mirrors Software/SWTexture.h:56 and exists for the same reason: the copy
+  // encoders write tightly packed rows at the COPY's stride, while this texture
+  // is 2560 wide (TextureCacheBase.cpp:2812-2823), and ReadTexels must then walk
+  // it back out at that same stride.
+  void SetMapStride(size_t stride) { m_map_stride = stride; }
+
+  // Total bytes behind m_map_pointer. The discard path bounds its zero-fill by
+  // this rather than trusting a stride the caller supplied.
+  size_t GetBufferSize() const { return m_texture_buf.size(); }
+
 private:
   std::vector<u8> m_texture_buf;
 };

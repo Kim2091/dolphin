@@ -103,52 +103,212 @@ must go in `GFX.ini`.
 
 Options live in `%APPDATA%\Dolphin Emulator\Config\GFX.ini` under `[Settings]`.
 Every knob is declared in `Source/Core/Core/Config/GraphicsSettings.cpp` with a
-comment explaining what it is for; most are correctness fixes whose **off
-position is exactly the behaviour before the fix existed**, so any of them can be
-A/B tested cleanly against a bug.
+comment explaining what it is for and why its default is what it is; the tables
+below are a summary, and that file is the authority.
 
-The three that are not optional in practice:
+Two conventions hold throughout:
+
+- **Most of these are correctness fixes whose `False` position is exactly the
+  behaviour before the fix existed.** That is deliberate, so any of them can be
+  A/B tested cleanly against a bug without building anything.
+- **Changes take effect at backend init**, i.e. when emulation starts. Nothing
+  here is live; restart the game after editing.
+
+### Not optional in practice
 
 | Key | Set to | Why |
 |---|---|---|
-| `CPUCull` | `False` | Dolphin's CPU culling drops draws before the backend sees them. |
+| `CPUCull` | `False` | Not a Remix option — stock Dolphin. Its CPU culling drops draws before the backend ever sees them. |
 | `RemixCameraRecovery` | `True` | Defaults off. GC/Wii have no separate view matrix — `xfmem.posMatrices` hold a combined modelview — so without recovery the camera sits at the origin and the world swings around it instead of the camera moving through it. |
-| `RemixSkyAutoDetect` | `2` | Detect *and tag* the skybox; the default `1` only logs. Detection works from the transform (a skybox translates with the camera while its rotation holds still), so it also catches untextured domes no texture-hash list can reach. |
 
-Correctness knobs added by the 2026-08-02 GX audit, all defaulting on, all
-reverting to exactly the pre-fix behaviour when set to `False`:
+### Runtime and scale
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixDllPath` | string | `d3d9.dll` | Passed straight to `LoadLibrary`, so a bare name resolves next to `Dolphin.exe`. |
+| `RemixSceneScale` | float | `1.0` | Pushed to the runtime as `rtx.sceneScale` — centimetres per GC world unit. |
+| `RemixLightScale` | float | `1.0` | Multiplies the radiance derived from XF lights. The lever for "the scene is too dim/bright" once light translation itself is correct. |
+| `RemixLightRange` | float | `5000.0` | Stand-in for D3D9's `Light.Range`, which the ported radiance conversion needs and GX does not have. Consulted only when the distance-attenuation polynomial never falls off. |
+
+### Camera recovery
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixCameraRecovery` | bool | `False` | Master switch. Off means identity view: camera at the origin, world space *is* camera space. |
+| `RemixCameraFromModelview` | bool | `True` | Take the camera from the dominant per-frame modelview slot (`xfmem.posMatrices[0]` on every title measured) instead of from the RANSAC delta estimator. Off restores the estimator exactly. Requires `RemixCameraRecovery`. |
+| `RemixViewElectorateFix` | bool | `True` | Let every persisting draw vote on the camera delta, and drop mesh hashes submitted more than once in a frame (ocean tiles, repeated props) since they have no unique cross-frame correspondence. Off is the old 256-entry submission-order slice. |
+| `RemixViewHoldOnMiss` | bool | `True` | On a consensus miss, hold the pose the frame started with rather than re-anchoring. A reset re-welds world space onto the current pose, which rotates the whole sky in one frame and can leave the horizon permanently tilted after a pitched cut. |
+| `RemixViewTieBreak` | bool | `True` | Prefer the calm-camera hypothesis when two clusters are near-equal in size. |
+
+### Sky
+
+The game's own skybox is rendered, not replaced. Detection is by transform
+signature — a skybox translates with the camera while its rotation holds still —
+so it also catches untextured domes that no texture-hash list can reach.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixSkyAutoDetect` | int | `1` | `0` off, `1` classify (and push/light per the knobs below), `2` classify *and tag*. **Leave at `1` to render the game's sky.** Mode `2` tags SKY/IGNORE, and on the API path both resolve to *hidden* — see the warning below. |
+| `RemixSkyAtInfinity` | bool | `True` | Scale each classified sky instance about the camera position, `x → p + k(x − p)`. Directions from the eye are unchanged, so the image is identical angle-for-angle while the surface moves behind all world geometry. This is the console's "drawn first, no depth write" expressed as geometry. |
+| `RemixSkyInfinityScale` | float | `16.0` | The `k` above. Needs to exceed `far_plane / dome_extent` to clear the world (≈10.5 on Wind Waker). |
+| `RemixSkyEmissive` | bool | `True` | Give classified sky an unlit (emissive) material carrying the folded TEV constant, with albedo zeroed so emission is the surface's entire output. GX draws a skybox unlit, so its authored colour *is* the pixel; emissive-plus-lit is neither. |
+| `RemixSkyEmissiveIntensity` | float | `1.0` | Sky radiance multiplier. `1.0` is the console's colour at face value; higher makes the sky a stronger light source and pushes it above white. This is the closest equivalent to Remix's `rtx.skyForceHDR`, which is unreachable on the API path. |
+| `RemixSkyAutoFrames` | int | `30` | Consecutive *informative* frames a candidate must hold the signature before it is classified. |
+| `RemixSkyAutoMinExtent` | float | `0.05` | Minimum dome extent as a fraction of the far plane. A GC skybox is a modest dome near the camera (0.09–0.16× far), **not** geometry scaled to clip distance — at `0.25` the size gate alone rejects every real skybox. |
+| `RemixSkyTextures` | string | *(empty)* | Comma-separated stage-0 texture hashes to tag as sky manually. |
+| `RemixSkyVetoHashes` | string | *(empty)* | Hashes — texture or mesh — never treated as sky. Highest precedence: veto beats the manual list, which beats auto-detection. |
+| `RemixSkyAutoUntexturedIgnore` | bool | `True` | Only consulted in mode `2`. Untextured classified draws take IGNORE rather than SKY. |
+| `RemixSkyMode` | int | `0` | Legacy depth-state heuristic (`ztest off && zwrite off`). **Superseded and best left at `0`** — it matched 41–88 draws a frame in Wind Waker and never the actual dome, which is depth-tested. |
+
+> ⚠ **Do not tag sky on this backend.** `REMIXAPI_INSTANCE_CATEGORY_BIT_SKY`
+> becomes `CameraType::Sky`, which the runtime forces to hidden; the pass that
+> would draw it instead (`RtxContext::tryHandleSky`) is D3D9-raster-only and API
+> draws never reach it. So SKY means *delete, with nothing in its place* — under
+> every `rtx.skyMode`. The same applies to `rtx.skyBoxTextures` in `rtx.conf`,
+> and note that for an **untextured** draw those lists key on the **mesh** hash,
+> so a dev-menu texture tag can silently delete a dome that has no texture.
+
+### GX semantics
+
+All default on; `False` is the pre-fix behaviour in every case.
 
 | Key | Default | What it fixes |
 |---|---|---|
-| `RemixUiScaleToXfb` | `True` | Maps the UI overlay onto the region the console *presents* — the XFB copy's source rect — instead of onto the EFB's full 640×528. Wind Waker presents 480 rows, so the old mapping put every HUD element ~9% too high and left the bottom of the window dead. |
-| `RemixGxRasChannel` | `True` | Takes the rasterized colour channel from the TEV stage that actually reads `RasColor`/`RasAlpha`, not from stage 0. GX names that channel per stage, and the consuming stage is routinely not stage 0. World draws only; `RemixUiRasChannel` governs the UI overlay. |
-| `RemixUiRasChannel` | `True` | The same rule for orthographic (UI overlay) draws. **This is the knob that removes Wind Waker's leaked title-screen HUD** — hearts, D-pad, item icons, the R counter. Not settled: the same build was also missing PRESS START and produced an empty overlay on one frame, so it may over-suppress. `False` reinstates the leak. Judge it on a frame that contains PRESS START, never on one without. |
-| `RemixWorldScissorSkip` | `True` | Skips world draws whose scissor result is empty. The world path read scissor state nowhere, so a draw the game hid by scissoring it away was drawn in full — and cast shadows. Only the all-or-nothing case is acted on; a path tracer has no screen-space clip. |
-| `RemixViewportFix` | `True` | Folds each draw's `xfmem.viewport` difference from the frame's reference rect into its instance transform, alongside the projection fold and through the same affine. Without it a draw the game gave a sub-screen rect — F-Zero GX's position-ladder portraits, PiP panels — is rendered through the reference rect and lands in the middle of the world. Reduces term-for-term to the projection-only correction when the rects match, so a game that never moves its viewport (Wind Waker measures `viewport changes 0`) is bit-identical either way. Does nothing while `RemixProjectionFix` is off. |
+| `RemixGxColor` | `True` | Per-draw material/ambient colour sources (`xfmem.matColor`), which the backend previously dropped. |
+| `RemixGxTevColor` | `True` | Evaluates the TEV **colour** chain, with the texture pinned white so the result is exactly the non-texture factor. GC titles keep colour in TEV *registers* and use the vertex colour only as the lerp weight between two of them, so without this a register-coloured surface renders greyscale or white. |
+| `RemixGxTextureStage` | `True` | Read the albedo from whichever stage actually samples, plus **its** texture coordinate, when stage 0 samples nothing. Identity decisions (sky lists, untextured test) keep reading stage 0 either way. |
+| `RemixGxRasChannel` | `True` | Take the rasterized colour channel from the TEV stage that reads it, not from stage 0. GX names that channel per stage. World draws only. |
+| `RemixGxTexGen` | `True` | Non-trivial texture-coordinate generation. |
+| `RemixGxBlend` | `True` | Translate GX blend factors to Vulkan ones for the runtime's own classifier, rather than leaving everything opaque. |
+| `RemixGxLightFix` | `True` | XF light kinds by attenuation function, calibrated radiance, and the spot cone axis/angle. |
+| `RemixGxLightNoFalloffDistant` | `True` | Route a Spot whose distance **and** angular attenuation are both constant to a *distant* light. GX has no directional type, so a sun is an ordinary light parked far away with falloff off; as a sphere it takes a 1/r² the console never applied, contributes nothing, and still suppresses `rtx.fallbackLightMode`. |
+| `RemixWorldScissorSkip` | `True` | Skip world draws whose scissor result is empty. Only the all-or-nothing case — a path tracer has no screen-space clip. |
 
-**Performance:** the main lever is `RemixUiOverlayScale` (default `1.0`). The UI
-overlay is rasterized on the CPU and is fill-rate bound, so `0.5` quarters its
-cost. GC UI is authored for a 640×528 framebuffer, so there is little real detail
-to lose on a large window.
+### Projection and viewport
 
-**Diagnostics:** `RemixLogStats` (on by default) emits one statistics line per
-frame, which needs `Logger.ini` to have `Video = True`, `Verbosity = 4` and
-`WriteToFile = True`. `RemixUiDumpFrame = <n>` dumps the composited UI overlay to
-`Logs/remix-ui-overlay.bmp`, drawn over a checkerboard so transparent and black
-are distinguishable. The log **appends across runs** — delete it before a run you
-intend to read.
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixProjectionFix` | bool | `True` | Fold each draw's projection difference from the frame's reference into its instance transform, including the off-centre shear terms. A dropped oblique term reads almost exactly like a small camera rotation. |
+| `RemixViewportFix` | bool | `True` | The same for `xfmem.viewport`. Without it a sub-screen rect (F-Zero GX position-ladder portraits, PiP panels) renders through the reference rect and lands mid-world. Reduces term-for-term to the projection-only correction when rects match. Inert while `RemixProjectionFix` is off. |
+
+### UI overlay
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixUiMode` | int | `1` | `0` drop the game's 2D layer entirely, `1` software-rasterize it into a screen overlay, `2` place it as world-space geometry. Mode `2` is a look experiment — it is genuinely path-traced and swims when the camera moves. |
+| `RemixUiOverlayScale` | float | `1.0` | Fraction of the window the overlay is rasterized at. **The main performance lever** — the overlay is CPU-rasterized and fill-rate bound, so `0.5` quarters its cost. GC UI is authored for 640×528, so there is little real detail to lose on a large window. |
+| `RemixUiScaleToXfb` | bool | `True` | Map the overlay onto the region the console *presents* (the XFB copy's source rect) instead of the EFB's full 640×528. Wind Waker presents 480 rows, so the old mapping put every element ~9% too high. |
+| `RemixUiRasChannel` | bool | `True` | The per-stage RAS-channel rule applied to ortho draws. **This is what removes Wind Waker's leaked title-screen HUD.** |
+| `RemixUiDropDstAlpha` | bool | `True` | Skip UI draws whose colour blend factor is `DST_ALPHA`/`ONE_MINUS_DST_ALPHA`. A screen overlay composites at present time, so there is no EFB alpha for the factor to read — the draw is not representable, and falling through to `Over` at full weight produces an opaque wash. |
+| `RemixUiDropEfbCopyTextures` | bool | `False` | Filter UI draws textured from EFB-copy RAM. Measured a no-op on Wind Waker (0 of 691,200 pixels), hence off. |
+| `RemixWorldUiDistance` | float | `2.0` | Mode `2` only: distance of the UI plane, in near-plane units. The plane scales with distance so apparent size is unchanged. |
+| `RemixWorldUiFlipY` | bool | `False` | Mode `2` only: flip the plane vertically. |
+
+### EFB emulation
+
+The backend keeps a real CPU-side EFB — 640×528, the Software backend's store
+reused unchanged. Clears, CPU pokes and CPU peeks all work against it, and every
+EFB copy the game triggers is **classified** and then either executed (encoded
+into game RAM out of that EFB) or **deliberately discarded**.
+
+Discarding is not a gap; for most classes it is the point. A GameCube game's
+baked shadow maps, mirrored-camera water reflections and bloom chains are
+screen-space fakes of things the path tracer does natively and better, and
+throwing them away is what lets the traced result show through. Discard is also
+bit-for-bit what this backend did before any of this existed, so **the
+fall-through arm of every classification is discard** and an unrecognised or
+misclassified copy can never look worse than the previous build.
+
+| Class | Signal | Exact? | Default | Why |
+|---|---|---|---|---|
+| **Xfb** | `EFBCopyFormat::XFB` | yes | discard | Presentation copy. The runtime presents; nothing here consumes the XFB image, and it is the only per-frame full-width encode in the feature. |
+| **Depth** | source pixel format Z24 | signal exact, purpose inferred | discard | Almost always a shadow map, and the tracer casts real shadows. The EFB's depth plane holds only clear-Z, so executing would hand the game a *uniform* depth map — a full-screen wrong shadow test, worse than absence. |
+| **Intensity** | luminance destination format | purpose inferred | discard | Bloom/glow luminance tap, usually riding with `half`. The runtime does its own bloom; a flat clear-luminance only washes the screen. |
+| **Scene** | colour copy, ≥1 perspective draw already this frame | **heuristic** | discard | The rect very likely holds world pixels, which this backend never rasterizes — executing paints a flat clear-coloured rectangle where the console had the scene. |
+| **Composed2D** | colour copy, **zero** perspective draws so far this frame | yes, by construction | **execute** | With no world draw yet, the console's EFB held clear colour + 2D draws + pokes — exactly what this EFB holds. Render-to-texture menus, title screens, composed text windows. |
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixEfbEmulation` | bool | `True` | Master switch over the whole feature: the EFB store, clears, peeks, pokes, classification and any encode. `False` is the pre-feature behaviour in every particular — peeks return 0, pokes and clears do nothing, every class counter reads 0. |
+| `RemixEfbCopy2D` | bool | `True` | Execute the **Composed2D** class. The one default here that changes behaviour, because that class's content is exact by construction. |
+| `RemixEfbCopyScene` | bool | `False` | Execute the **Scene** class. `True` is the GFX.ini recovery lever for a game that draws world geometry early and then composes a 2D element by copy later in the same frame — no rebuild needed. |
+| `RemixEfbCopyDepth` | bool | `False` | Execute the **Depth** class. |
+| `RemixEfbCopyIntensity` | bool | `False` | Execute the **Intensity** class, for a game using an intensity copy as a legitimate 2D mask. |
+| `RemixEfbXfbEncode` | bool | `False` | Execute the **Xfb** class. Does **not** wire Dolphin's screenshot/AV-dump pipeline to Remix frames. |
+| `RemixEfbUiCompose` | bool | `True` | Composite the frame's 2D layer into the EFB before an executed encode, via a second `UiRasterizer` running at 640×528. Without it an executed copy encodes bare clear colour. |
+| `RemixEfbSkipDiscardedTex` | bool | `True` | Skip draws whose stage-0 texture samples a **discarded** copy destination, so the game's screen-space fake is absent and the traced result behind it shows. Without it those draws render as blank rectangles over the scene — zero bytes decode into a valid texture, so nothing else refuses them. Confirmed on SpongeBob: Battle for Bikini Bottom (two 256×256 top-left copies per frame, drawn as a white box over a quarter of the screen). Counter: `efbdisc` in the frame line. |
+
+Reading the result. The frame line carries
+`efb copies N (… | xfb A depth B int C scene D 2d E | exec F disc G, H us, I folds) | efb peeks J pokes K`,
+and on trace frames each copy also prints
+
+```
+Remix EFB copy: class scene action discard | rect [...] dst 0x... fmt 4 depth 0 int 0 half 1 yscale 1.000 clear 1 | world-draws 214 ui-draws 0
+```
+
+That line names **every input the decision used**, which is the whole point of
+it: a depth copy says `depth 1`, a bloom tap says `int 1 half 1`, a mid-gameplay
+colour copy says `world-draws` above zero. If a class looks wrong, the knob above
+flips its action without a rebuild. `efb_ui_folds` exceeding `exec` means the
+fold bookkeeping has broken and copied UI is being double-blended.
+
+**Still broken, by design.** Nothing rasterizes *world* geometry into this EFB —
+that is a full software TEV rasterizer, i.e. the Software backend inside this
+one, and it is rejected outright. So anything that samples world pixels back
+(Wind Waker's pictograph, heat haze, peek-driven logic that inspects the scene)
+is wrong under **both** actions: executing gives flat clear colour, discarding
+gives zeroes. Frame-late traced depth/colour through the runtime's own readback
+is the upgrade path, not something this does.
+
+### Diagnostics
+
+`RemixLogStats` needs `Logger.ini` to have `Video = True`, `Verbosity = 4` and
+`WriteToFile = True`, or the per-frame line goes nowhere. **The log appends
+across runs** — delete it before a run you intend to read, or you will analyse an
+older run's output.
+
+| Key | Type | Default | Emits |
+|---|---|---|---|
+| `RemixLogStats` | bool | `True` | One statistics line per frame: draw classification, mesh/instance counts, colour routes, lights, UI, sky. The primary instrument. |
+| `RemixTraceColors` | bool | `False` | Per-draw TEV chain, both channels' lighting state, resolved args, raw vertex colour bytes and the albedo texture's mean colour. |
+| `RemixDebugColorRoutes` | bool | `False` | Paints every world draw a flat colour naming which colour *route* it took (red vertex+folded, magenta vertex+unfolded, blue tFactor, green none). Counters say how many draws took a route; this says **which pixels** — which is usually the actual question. |
+| `RemixTraceProjections` | bool | `False` | Per-frame projection variant table. |
+| `RemixTraceModelviews` | bool | `True` | Modelview histogram — which matrix the most distinct meshes share, i.e. the camera candidate. |
+| `RemixTraceEfbCopies` | bool | `True` | Every EFB copy's rect, destination, XFB flag and clear bit, plus each UI draw's EFB-space footprint. |
+| `RemixUiDumpFrame` | int | `0` | Dump the composited overlay to `Logs/remix-ui-overlay.bmp` on frame *n*, drawn over a checkerboard so transparent and black are distinguishable. |
+
+Two diagnostics that are not Dolphin options but belong in the same toolkit:
+`rtx.debugView.debugViewIdx = 23` in `rtx.conf` shows **Diffuse Albedo**, which
+separates "no geometry is there" from "geometry that isn't being lit" outright;
+and `rtx.logApiDrawCategoryKeys = True` reports which key each API draw is
+categorised on — writing to the *runtime's* log at
+`Binaries/rtx-remix/logs/remix-dxvk.log`, not `dolphin.log`.
 
 ---
 
 ## Status
 
 **Working:** geometry, textures, materials and lighting path-traced; camera
-recovery from the position-matrix palette; automatic skybox detection and
-suppression; GX semantics (vertex colour, texgen, blend translation, alpha test,
-face winding, XF spot and distant lights); UI, HUD and menus via a software
-rasterizer composited as a screen overlay.
+recovery from the position-matrix palette; **the game's own skybox, rendered as
+unlit geometry pushed behind the world**; GX semantics (vertex colour resolved
+through the TEV chain, texgen, blend translation, alpha test, face winding, XF
+spot and distant lights); UI, HUD and menus via a software rasterizer composited
+as a screen overlay.
 
 **Known broken or missing:**
+
+- ⚠ **No keyboard input reaches the emulator while a game is running.** Not
+  hotkeys, not keyboard-bound controller input. The Remix runtime lives in
+  Dolphin's process and registers a raw-input keyboard device for its overlay
+  window (`RIDEV_INPUTSINK | RIDEV_NOLEGACY`, `rtx_overlay_window.cpp`).
+  Raw-input registration is per-process per-usage-page, so it displaces
+  DirectInput's own registration: DInput then returns `DI_OK` forever with an
+  empty state array, never an error, so Dolphin's re-acquire path never fires.
+  Measured against the Vulkan backend on the same binary and the same injected
+  keys: Vulkan sees them, Remix sees `keysDown 0` always. **Workaround: use a
+  gamepad** — only the keyboard and mouse usage pages are hijacked. The fix
+  belongs in dxvk-remix (scope the registration to when the dev menu is open, or
+  drop it in favour of the runtime's existing legacy WndProc path), not here.
 
 - Split-screen — one world camera cannot express two views. Each half carries its
   own view matrix, and `RemixViewportFix` folds *placement*, not a second camera:
@@ -159,8 +319,14 @@ rasterizer composited as a screen overlay.
 - Points and lines are not submitted.
 - Skinned characters can ghost: matrix-palette draws are CPU-transformed and
   re-hash every frame, so they carry no motion vectors.
-- **EFB copies are not executed.** Anything a game renders to texture and reads
-  back — heat haze, pictographs, some reflections — is wrong or absent.
+- **EFB copies are classified, not all executed** (see *EFB emulation* above).
+  Copies of *2D-composed* content run against a real CPU-side EFB and produce
+  real pixels; scene, depth and intensity copies are **deliberately** discarded,
+  so the path tracer's own shadows, reflections and bloom replace the game's
+  baked versions instead of fighting them. What stays genuinely broken is
+  anything that samples **world** content back out — heat haze, Wind Waker's
+  pictograph, peek-driven logic that inspects the scene — because nothing
+  rasterizes world geometry into that EFB and nothing will.
 - Assorted per-game UI artefacts.
 
 Games that reach 3D quickly are easiest to test with: Wind Waker, Super Monkey

@@ -46,7 +46,18 @@ void VideoBackend::InitBackendInfo(const WindowSystemInfo& wsi)
   g_backend_info.bSupports3DVision = false;
   g_backend_info.bSupportsEarlyZ = true;
   g_backend_info.bSupportsBindingLayout = true;
-  g_backend_info.bSupportsBBox = true;
+  // Deliberately false. RemixBoundingBox::Read returns zeros
+  // (RemixBoundingBox.h:18-22), and zeros are strictly WORSE than not claiming
+  // support at all: with the flag false, InitializeShared skips bbox init
+  // (VideoBackendBase.cpp:338) and BoundingBox::Get serves VideoCommon's
+  // fallback, which echoes back the SDK's own "no pixels drawn" register writes
+  // (BoundingBox.cpp:53-63,75-86) - the mechanism that keeps a game like
+  // Ultimate Spider-Man from dividing by a bounding box it never got.
+  //
+  // The RemixBoundingBox instance stays: it is still a required InitializeShared
+  // parameter below, just never consulted. A real bbox computed from
+  // post-transform vertices is a future upgrade, not something to fake here.
+  g_backend_info.bSupportsBBox = false;
   g_backend_info.bSupportsGSInstancing = true;
   g_backend_info.bSupportsPostProcessing = false;
   g_backend_info.bSupportsPaletteConversion = true;

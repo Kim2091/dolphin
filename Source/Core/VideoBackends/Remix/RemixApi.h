@@ -47,6 +47,13 @@ struct FrameStats
   u32 skipped_non_triangle = 0;
   u32 skipped_ortho = 0;
   u32 skipped_efb_texture = 0;
+  // Draws dropped because stage 0 sampled an EFB copy destination this backend
+  // deliberately discarded. Answers "how many blank rectangles did we stop the
+  // game drawing over the traced scene". Distinct from skipped_efb_texture,
+  // which counts the older case of a texture that failed to load at all - a
+  // zero-filled destination loads perfectly happily, so that counter never
+  // fires on this path.
+  u32 skipped_efb_discarded = 0;
   u32 skipped_degenerate = 0;
   // Draws that write neither colour nor alpha, or whose alpha test can never
   // pass. Depth-only geometry in a backend that has no depth buffer.
@@ -158,6 +165,11 @@ struct FrameStats
   // point of reading the attenuation function - a game whose suns show up as
   // spheres is a game rendering nearly black.
   u32 lights_distant = 0;
+  // Directional lights dropped so an atmosphere mod owns the key light. Answers
+  // "is the game still adding a sun on top of the sky" - if the scene is too
+  // bright with the knob on, this reading zero says the brightness is coming
+  // from somewhere else.
+  u32 lights_dropped_distant = 0;
   u32 lights_sphere = 0;
   u32 lights_spot = 0;
   // Spot lights whose distance AND angular attenuation polynomials are both the
@@ -227,6 +239,11 @@ struct FrameStats
   // classification one.
   u32 ui_placed = 0;
   u32 ui_unplaceable = 0;
+  // Untextured ortho draws dropped because they arrived before any world
+  // geometry - EFB clears and scratch-region fills, which the overlay would
+  // composite on top of the scene instead of underneath it. Answers "how much
+  // of the screen did we stop being painted flat".
+  u32 ui_dropped_pre_world = 0;
   // UI draws refused, and why. Both are removals of content that WOULD have been
   // painted, so they belong in the frame line next to ui_placed rather than in a
   // trace-only log: a menu that vanishes in some other game is diagnosed by
@@ -246,6 +263,49 @@ struct FrameStats
   // is the whole hypothesis in one number.
   u32 efb_copies = 0;
   u32 efb_copies_scratch = 0;
+  // The same copies broken down by CLASS, which is what decides whether each one
+  // is executed against the CPU EFB or deliberately discarded. Each answers
+  // "what did the classifier think this frame was doing?", and together they are
+  // how a misclassification is spotted without a debugger:
+  //   `efb_copies_xfb`        - the presentation copy. One per frame, normally.
+  //   `efb_copies_depth`      - Z24 source, i.e. almost always a shadow map.
+  //   `efb_copies_intensity`  - luminance format, i.e. a bloom/glow tap.
+  //   `efb_copies_scene`      - colour copy taken after a world draw. World
+  //       content this backend never rasterizes, so executing it would paint a
+  //       flat rectangle. A non-zero count on a MENU screen is the tell that the
+  //       frame-level world-draw signal is too blunt for that game.
+  //   `efb_copies_composed2d` - colour copy taken before any world draw, whose
+  //       content the CPU EFB holds exactly. The one class that executes by
+  //       default; finding a screen where this is non-zero is how the payoff
+  //       gets tested at all.
+  u32 efb_copies_xfb = 0;
+  u32 efb_copies_depth = 0;
+  u32 efb_copies_intensity = 0;
+  u32 efb_copies_scene = 0;
+  u32 efb_copies_composed2d = 0;
+  // Actions actually taken. `discarded` must equal the sum of the classes whose
+  // knobs are off; `executed` the sum of those that are on. They are counted
+  // separately from the classes on purpose - a knob flipped in GFX.ini is
+  // invisible in the class counts alone.
+  u32 efb_copies_executed = 0;
+  u32 efb_copies_discarded = 0;
+  // Microseconds spent inside the copy encoders. Zero on a frame where
+  // everything is discarded (a discard pays only its zero-fill), so a non-zero
+  // value here is also the confirmation that something executed at all. This is
+  // the regression tripwire for a 2D-heavy title: sustained values in the
+  // thousands mean the encode is eating the frame.
+  u64 efb_encode_us = 0;
+  // Times the 2D layer was composited into the EFB before an encode. Should
+  // never exceed `efb_copies_executed`; if it does, the re-Begin bookkeeping in
+  // FoldUiIntoEfb has broken and copied UI is being double-blended.
+  u32 efb_ui_folds = 0;
+  // CPU-thread EFB accesses through MMU (MMU.cpp:142-190), drained from the EFB
+  // interface at frame end. Zero is a perfectly valid answer - most GC titles
+  // never touch the EFB from the CPU - but a title that does (Super Mario
+  // Galaxy's pointer) reads 0 forever if the emulation knob is off, which is the
+  // difference these two make visible.
+  u32 efb_peeks = 0;
+  u32 efb_pokes = 0;
   // Microseconds spent rasterizing the overlay, and handing it to the runtime.
   // Split because they have different fixes: the first is this backend's inner
   // loop, the second is a per-frame staging-buffer create plus a multi-megabyte
@@ -306,15 +366,41 @@ struct FrameStats
   u32 viewport_overflow = 0;
 };
 
+// What an EFB copy is FOR, decided from state already in hand at the copy. The
+// order of the enumerators is the order the classifier tests them in, and that
+// order is load-bearing: a depth copy is also a copy with world draws behind it,
+// an intensity tap is also a colour copy, and the first match wins.
+//
+// Only Composed2D executes by default. See GFX_REMIX_EFB_COPY_* for why each
+// class does what it does.
+enum class EfbCopyClass
+{
+  // EFBCopyFormat::XFB - the copy that ends the frame.
+  Xfb,
+  // params.depth: source pixel format is Z24 (BPStructs.cpp:308).
+  Depth,
+  // params.yuv (isIntensity): a luminance destination format.
+  Intensity,
+  // Colour copy with at least one perspective draw already submitted this frame.
+  // The one HEURISTIC class.
+  Scene,
+  // Colour copy with none - so everything the console's EFB held is clear colour
+  // plus ortho draws plus pokes, which is exactly what the CPU EFB holds.
+  Composed2D,
+};
+
+const char* EfbCopyClassName(EfbCopyClass copy_class);
+
 // One EFB copy the game triggered, stamped WHERE IT HAPPENED. Recorded rather
 // than re-read at frame end for the usual reason: every field here is per-copy
 // BP state, and a frame-end read of bpmem sees only the last copy's.
 //
-// This backend executes no copies (RemixTextureCache::CopyEFB writes nothing),
-// but the console-side consequence of one still decides what is on screen: a
-// copy that takes a region and sets the clear bit wipes that region off the EFB
-// (BPStructs.cpp:377-393), so anything drawn into it beforehand never reaches
-// the XFB.
+// Copies are now CLASSIFIED and then either executed against the CPU EFB or
+// deliberately discarded (see EfbCopyClass). The console-side consequence
+// recorded here still matters either way: a copy that takes a region and sets
+// the clear bit wipes that region off the EFB (BPStructs.cpp:377-393), so
+// anything drawn into it beforehand never reaches the XFB - and that is true of
+// a discarded copy too, because the clear arrives through separate machinery.
 struct EfbCopyEvent
 {
   // FrameStats::draws_seen at the moment the copy fired. Every draw increments
@@ -332,6 +418,22 @@ struct EfbCopyEvent
   // A box-filtered 2:1 downsample (UPE_Copy::half_scale). Bloom and glow chains
   // use it; a pixel-exact compose of the same region cannot.
   bool half_scale = false;
+  // Source pixel format was Z24, and destination format was a luminance one -
+  // EFBCopyParams::depth and ::yuv (TextureCacheBase.h:72-87). The two exact
+  // signals the classifier reads.
+  bool depth = false;
+  bool intensity = false;
+  // Vertical scale of the copy. Recorded so the trace line can print every input
+  // the decision saw, even the ones it did not use.
+  float y_scale = 1.0f;
+  // What the classifier decided, and what was done about it.
+  EfbCopyClass copy_class = EfbCopyClass::Scene;
+  bool executed = false;
+  // The two counters that decided Scene vs Composed2D, as they stood AT THE
+  // COPY. Frame-end values would be the last copy's view of the frame, which is
+  // exactly the reading that would make a misclassification look justified.
+  u32 world_draws = 0;
+  u32 ui_draws = 0;
 };
 
 // One UI draw's EFB-space footprint, recorded in the draw path so it can be
@@ -796,12 +898,42 @@ public:
   //
   // Recording is on whenever the audit or the filter is, and off otherwise, so
   // an untraced run pays nothing.
-  void NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_addr, u8 copy_format, bool xfb,
-                   bool clear, bool half_scale);
+  //
+  // Also CLASSIFIES the copy and returns the action to take: true = execute it
+  // against the CPU EFB, false = discard it. Discard is the fall-through and is
+  // bit-for-bit what this backend did before any of this existed, so an
+  // unrecognised or misclassified copy can never look worse than it used to.
+  // Returns false unconditionally when EFB emulation is off.
+  bool NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_addr, u8 copy_format, bool xfb,
+                   bool clear, bool half_scale, bool is_depth, bool is_intensity, float y_scale);
 
   // True when NoteEfbCopy should record. Read by the texture cache before it
   // touches bpmem at all.
   bool RecordEfbCopies() const { return m_trace_efb_copies; }
+
+  // GFX_REMIX_EFB_EMULATION. Off means the texture cache takes the pre-change
+  // path out of CopyEFB - record and return, touching no staging memory at all.
+  bool EfbEmulationEnabled() const { return m_efb_emulation; }
+
+  // True when `addr` is an EFB copy destination whose copy this backend
+  // deliberately discarded, so the memory there holds no meaningful pixels.
+  //
+  // The draw path asks this to drop draws that sample such a destination. That
+  // is the difference between a game's screen-space fake being ABSENT - letting
+  // the traced result behind it show - and it being drawn as a blank rectangle
+  // over the scene, which is what a zero-filled destination renders as. Returns
+  // false when the skip is knobbed off or the emulation is off, so both restore
+  // the draw-it-anyway behaviour.
+  bool EfbDestinationDiscarded(u32 addr) const;
+
+  // Composites the frame's 2D layer into the CPU EFB's colour plane, so an
+  // executed copy encodes the UI the console would have had there rather than
+  // bare clear colour. Called ONLY from the execute arm of
+  // Remix::TextureCache::CopyEFB: a discarded copy must pay nothing for it.
+  //
+  // Safe to call repeatedly in one frame - it re-Begins the recorder afterwards,
+  // so a second executed copy folds only what was submitted since the first.
+  void FoldUiIntoEfb();
 
   FrameStats& Stats() { return m_stats; }
 
@@ -1138,7 +1270,56 @@ private:
   // this one is session-long. Small enough that a linear scan is the right
   // lookup: Wind Waker's entire run puts three addresses in it.
   std::vector<u32> m_efb_copy_destinations;
+  // The subset of the above whose most recent copy was DISCARDED, i.e. the
+  // addresses this backend has deliberately left without content. Session-long
+  // for the same reason as the set above, but unlike it this one is maintained
+  // in both directions: a destination that later executes is removed, because
+  // by then it does hold real pixels and a draw sampling it must not be skipped.
+  //
+  // A game re-uses a handful of these, so the linear scan is the right lookup at
+  // this size and matches how m_efb_copy_destinations is already searched.
+  std::vector<u32> m_efb_discarded_destinations;
+  // The SOURCE rects of discarded copies, in EFB units - the regions of the EFB
+  // this backend treats as scratch. A draw clipped to exactly one of them is
+  // rendering INTO that scratch, which on console is captured and then covered
+  // over, and here would be composited on top of the traced frame instead.
+  //
+  // Session-long and deduped for the same reason as the destination set: the
+  // game re-uses the same handful of rects every frame, and the draw arrives
+  // BEFORE the copy that would classify it, so this frame's decision has to be
+  // made from what previous frames established.
+  //
+  // Full-EFB rects are never recorded - the pre-world rule covers a full-screen
+  // clear, and admitting one here could blank a legitimate full-screen 2D layer.
+  std::vector<MathUtil::Rectangle<int>> m_efb_discarded_rects;
   bool m_trace_efb_copies = true;
+  // EFB emulation. All read once in Initialize, never on the copy path.
+  // m_efb_emulation false is the pre-change behaviour in every particular: no
+  // classification happens, so every class counter reads zero exactly as it did
+  // when they did not exist.
+  bool m_efb_emulation = true;
+  bool m_efb_copy_2d = true;
+  bool m_efb_copy_scene = false;
+  bool m_efb_copy_depth = false;
+  bool m_efb_copy_intensity = false;
+  bool m_efb_xfb_encode = false;
+  bool m_efb_ui_compose = true;
+  bool m_efb_skip_discarded_tex = true;
+  bool m_ui_drop_pre_world_blank = true;
+  bool m_gx_light_drop_distant = false;
+  bool m_fallback_light_enabled = true;
+  // Perspective draws that reached submission so far THIS frame. The whole of
+  // the Scene-vs-Composed2D signal: a colour copy taken while this is zero
+  // cannot contain world content, because none has been drawn yet. Incremented
+  // in SubmitMesh on the non-world_ui path, reset with the stats.
+  u32 m_frame_world_draws = 0;
+  // A second rasterizer instance, running at the EFB's own 640x528 rather than
+  // at the swapchain's size, so that UI draws - whose viewport and scissor
+  // arrive in EFB units already (RemixVertexManager.cpp:2608-2617) - can be
+  // composited into the EFB with no rescaling at all. Deliberately a second
+  // INSTANCE of the existing class, not a second implementation.
+  UiRasterizer m_efb_ui_raster;
+  bool m_efb_ui_frame_begun = false;
   // Read once in Initialize, never in the draw path. OFF for either is exactly
   // the pre-change behaviour: the draw is classified and submitted as before.
   bool m_ui_drop_dst_alpha = true;

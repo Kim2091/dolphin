@@ -162,6 +162,17 @@ extern const Info<bool> GFX_REMIX_TRACE_COLORS;
 extern const Info<bool> GFX_REMIX_GX_TEV_COLOR;
 extern const Info<bool> GFX_REMIX_GX_TEXTURE_STAGE;
 extern const Info<bool> GFX_REMIX_DEBUG_COLOR_ROUTES;
+extern const Info<bool> GFX_REMIX_EFB_EMULATION;
+extern const Info<bool> GFX_REMIX_EFB_COPY_2D;
+extern const Info<bool> GFX_REMIX_EFB_COPY_SCENE;
+extern const Info<bool> GFX_REMIX_EFB_COPY_DEPTH;
+extern const Info<bool> GFX_REMIX_EFB_COPY_INTENSITY;
+extern const Info<bool> GFX_REMIX_EFB_XFB_ENCODE;
+extern const Info<bool> GFX_REMIX_EFB_UI_COMPOSE;
+extern const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX;
+extern const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD_BLANK;
+extern const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT;
+extern const Info<bool> GFX_REMIX_FALLBACK_LIGHT;
 
 // Graphics.Enhancements
 

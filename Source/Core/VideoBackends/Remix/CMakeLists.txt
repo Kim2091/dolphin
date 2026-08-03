@@ -23,6 +23,15 @@ PUBLIC
   videocommon
 PRIVATE
   xxhash::xxhash
+  # The Software backend's EFB core, reused wholesale rather than duplicated:
+  # its packed 640x528 colour+depth store (SWEfbInterface.cpp:24-38), its clear
+  # (EfbCopy.cpp:16-34), its ~1500-line copy encoder for every GC destination
+  # format (TextureEncoder.cpp) and its XFB YUV encoder
+  # (SWEfbInterface.cpp:577-664). No cycle: videosoftware links only
+  # common/videocommon (Software/CMakeLists.txt), both of which videoremix
+  # already links, and both libraries were already going into the final binary
+  # so this costs no size.
+  videosoftware
 )
 
 # Note: deliberately NOT linking d3d9.lib. Nothing here imports a d3d9 entry

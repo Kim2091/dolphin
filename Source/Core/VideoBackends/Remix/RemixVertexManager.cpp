@@ -1747,6 +1747,38 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       texture_is_xfb_copy = false;
       --stats.texture_later_stage;
     }
+    // The destination was copied to, but this backend deliberately DISCARDED
+    // that copy - it is a shadow map, a reflection, or any other capture of
+    // world content we cannot reproduce (see EfbCopyClass). The memory holds
+    // zeroes, and the test above cannot catch it: zero bytes decode into a
+    // perfectly valid texture, so HasData() is true and the draw sails through
+    // to be rendered as a blank rectangle over the traced scene. Confirmed on
+    // SpongeBob: Battle for Bikini Bottom, whose two 256x256 top-left copies
+    // per frame produced exactly that as a white box across a quarter of the
+    // screen.
+    //
+    // Dropping the draw instead is what the discard decision MEANT: the game's
+    // screen-space fake goes away and the path-traced result behind it shows,
+    // which is the same bargain the discard itself makes.
+    //
+    // Matched on the ADDRESS alone - deliberately NOT on entry->is_efb_copy,
+    // which is never set on this path and would make the whole test dead. This
+    // backend's CopyEFB creates no copy cache entry, so a draw sampling the
+    // destination gets an ordinary entry decoded from that RAM and arrives here
+    // with is_efb_copy false. Measured on BFBB: 122 draws sample the discarded
+    // destination 0x009f3220, every one of them reporting `efbcopy 0`, while
+    // `efbcopy 1` appears nowhere in the entire log. The address list is the
+    // authority here because we populated it ourselves, at the copy.
+    //
+    // Gated on stage 0 for the reason given above - a draw that only reached
+    // here through a later stage rendered untextured before, and making
+    // geometry disappear that used to be visible would be a regression dressed
+    // up as a fix.
+    else if (stage0_textured && g_remix_api->EfbDestinationDiscarded(texture_addr))
+    {
+      ++stats.skipped_efb_discarded;
+      return;
+    }
   }
   if (albedo_textured)
   {
@@ -2677,11 +2709,21 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       }
 
       INFO_LOG_FMT(VIDEO,
-                   "Remix UI draw {}: tex {:#018x} src {:#010x} efbcopy {} xfbcopy {} | blend en {} "
+                   "Remix UI draw {}: WHERE clip [{:.0f} {:.0f} {:.0f} {:.0f}] vp [{:.0f} {:.0f} "
+                   "{:.0f} {:.0f}] COL v0 {:#010x} v1 {:#010x} | tex {:#018x} src {:#010x} "
+                   "efbcopy {} xfbcopy {} | blend en {} "
                    "src {} dst {} sub {} logic {} op "
                    "{} | colorupd {} alphaupd {} pixfmt {} | atest {:#010x} | dstalpha {:#x} | "
                    "verts {} | ind stages {} ind0 {:#07x} | swap {} | tev stages {} alpha {}",
-                   stats.ui_placed, albedo != nullptr ? albedo->GetContentHash() : 0, texture_addr,
+                   stats.ui_placed, clip[0], clip[1], clip[2], clip[3], viewport[0], viewport[1],
+                   viewport[2], viewport[3],
+                   // The colour the rasterizer will actually fill an UNTEXTURED
+                   // draw with - it has nothing else to go on. If this reads
+                   // white on a draw the console shaded from a TEV register,
+                   // that is the bug, not the symptom.
+                   out_vertices->empty() ? 0 : (*out_vertices)[0].color,
+                   out_vertices->size() < 2 ? 0 : (*out_vertices)[1].color,
+                   albedo != nullptr ? albedo->GetContentHash() : 0, texture_addr,
                    texture_is_efb_copy ? 1 : 0, texture_is_xfb_copy ? 1 : 0,
                    bpmem.blendmode.blend_enable ? 1 : 0,
                    static_cast<u32>(bpmem.blendmode.src_factor.Value()),

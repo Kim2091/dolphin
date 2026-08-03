@@ -471,7 +471,7 @@ void SetDepth(u16 x, u16 y, u32 depth)
     SetPixelDepth(GetDepthOffset(x, y), depth);
 }
 
-static u32 GetColor(u16 x, u16 y)
+u32 GetColor(u16 x, u16 y)
 {
   u32 offset = GetColorOffset(x, y);
   return GetPixelColor(offset);
@@ -561,7 +561,7 @@ static yuv444 ConvertColorToYUV(u32 color)
   return {y_round, u_round, v_round};
 }
 
-static u32 GetDepth(u16 x, u16 y)
+u32 GetDepth(u16 x, u16 y)
 {
   u32 offset = GetDepthOffset(x, y);
   return GetPixelDepth(offset);

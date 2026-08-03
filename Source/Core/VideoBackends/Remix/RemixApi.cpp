@@ -27,6 +27,13 @@
 #include "Core/Config/GraphicsSettings.h"
 
 #include "VideoBackends/Remix/RemixTexture.h"
+// For RemixEFBInterface::DrainAccessCounters and the shared store's colour
+// packer, both of which live with the EFB interface itself.
+#include "VideoBackends/Remix/RemixGfx.h"
+
+// The Software backend's EFB store, which the UI fold blends into. Linked in
+// rather than duplicated; see CMakeLists.txt.
+#include "VideoBackends/Software/SWEfbInterface.h"
 
 #include "Common/FileUtil.h"
 
@@ -624,6 +631,17 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_sky_emissive = Config::Get(Config::GFX_REMIX_SKY_EMISSIVE);
   m_sky_emissive_intensity = std::max(0.0f, Config::Get(Config::GFX_REMIX_SKY_EMISSIVE_INTENSITY));
   m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
+  m_efb_emulation = Config::Get(Config::GFX_REMIX_EFB_EMULATION);
+  m_efb_copy_2d = Config::Get(Config::GFX_REMIX_EFB_COPY_2D);
+  m_efb_copy_scene = Config::Get(Config::GFX_REMIX_EFB_COPY_SCENE);
+  m_efb_copy_depth = Config::Get(Config::GFX_REMIX_EFB_COPY_DEPTH);
+  m_efb_copy_intensity = Config::Get(Config::GFX_REMIX_EFB_COPY_INTENSITY);
+  m_efb_xfb_encode = Config::Get(Config::GFX_REMIX_EFB_XFB_ENCODE);
+  m_efb_ui_compose = Config::Get(Config::GFX_REMIX_EFB_UI_COMPOSE);
+  m_efb_skip_discarded_tex = Config::Get(Config::GFX_REMIX_EFB_SKIP_DISCARDED_TEX);
+  m_ui_drop_pre_world_blank = Config::Get(Config::GFX_REMIX_UI_DROP_PRE_WORLD_BLANK);
+  m_gx_light_drop_distant = Config::Get(Config::GFX_REMIX_GX_LIGHT_DROP_DISTANT);
+  m_fallback_light_enabled = Config::Get(Config::GFX_REMIX_FALLBACK_LIGHT);
   m_ui_drop_dst_alpha = Config::Get(Config::GFX_REMIX_UI_DROP_DST_ALPHA);
   m_ui_drop_efb_copy_textures = Config::Get(Config::GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES);
   m_ui_scale_to_xfb = Config::Get(Config::GFX_REMIX_UI_SCALE_TO_XFB);
@@ -1375,6 +1393,18 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
 
+  // "A perspective draw reached submission." This is the entire Scene signal the
+  // EFB copy classifier reads, and it is counted HERE rather than at the
+  // vertex-manager's classification point so that it means what it says: a draw
+  // that was classified world but then refused still contributed no world pixels
+  // to the console's EFB either. A non-null world_ui_projection marks the
+  // orthographic path (RemixApi.h:735-738), which must not count.
+  //
+  // Counted before the poisoned-mesh check on purpose: the game DREW that
+  // geometry, whether or not the runtime would take it.
+  if (world_ui_projection == nullptr)
+    ++m_frame_world_draws;
+
   // Mesh identity = geometry bytes folded with the material hash. The material
   // has to participate: Remix handles ARE hashes and a mesh bakes its surface
   // material at create time, so two material variants of the same geometry must
@@ -1527,8 +1557,27 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
   m_pending_instances.push_back(pending);
 }
 
-void RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_addr, u8 copy_format,
-                           bool xfb, bool clear, bool half_scale)
+const char* EfbCopyClassName(EfbCopyClass copy_class)
+{
+  switch (copy_class)
+  {
+  case EfbCopyClass::Xfb:
+    return "xfb";
+  case EfbCopyClass::Depth:
+    return "depth";
+  case EfbCopyClass::Intensity:
+    return "intensity";
+  case EfbCopyClass::Scene:
+    return "scene";
+  case EfbCopyClass::Composed2D:
+    return "composed2d";
+  }
+  return "unknown";
+}
+
+bool RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_addr, u8 copy_format,
+                           bool xfb, bool clear, bool half_scale, bool is_depth, bool is_intensity,
+                           float y_scale)
 {
   ++m_stats.efb_copies;
   if (!xfb && clear)
@@ -1579,14 +1628,147 @@ void RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_add
     m_efb_copy_destinations.push_back(dst_addr);
   }
 
+  // --- Classification ---
+  //
+  // Tested in the priority order of the enum, because the signals overlap: a
+  // depth copy is also a copy with world draws behind it, an intensity tap is
+  // also a colour copy. First match wins.
+  //
+  // `execute` starts false and is only ever assigned from a per-class knob, so
+  // the fall-through of every arm is DISCARD - which is bit-for-bit what this
+  // backend did before any of this existed (the staging buffers were never
+  // written, so destinations received zeroes). That is the whole safety
+  // argument: an unrecognised or misclassified copy cannot look worse than the
+  // build before this one.
+  //
+  // Skipped entirely when the emulation is off, so that every counter below
+  // reads zero exactly as it did when these counters did not exist.
+  EfbCopyClass copy_class = EfbCopyClass::Scene;
+  bool execute = false;
+  if (m_efb_emulation)
+  {
+    if (xfb)
+    {
+      // The presentation copy. Nothing on this backend consumes the XFB image -
+      // the Remix runtime produces and presents the picture - so this is off by
+      // default, and it is also the one recurring per-frame full-width encode.
+      copy_class = EfbCopyClass::Xfb;
+      execute = m_efb_xfb_encode;
+      ++m_stats.efb_copies_xfb;
+    }
+    else if (is_depth)
+    {
+      // Source pixel format Z24 (BPStructs.cpp:308). The signal is exact; the
+      // purpose - a shadow map - is inferred, and both point at discard: the
+      // tracer casts real shadows, and this EFB's depth plane holds only clear-Z
+      // plus pokes, so executing would hand the game a uniform depth map.
+      copy_class = EfbCopyClass::Depth;
+      execute = m_efb_copy_depth;
+      ++m_stats.efb_copies_depth;
+    }
+    else if (is_intensity)
+    {
+      // Luminance destination format - how a bloom or glow chain opens. The
+      // runtime does its own bloom; feeding the chain flat clear-luminance only
+      // blends a uniform wash back over the screen.
+      copy_class = EfbCopyClass::Intensity;
+      execute = m_efb_copy_intensity;
+      ++m_stats.efb_copies_intensity;
+    }
+    else if (m_frame_world_draws > 0)
+    {
+      // THE heuristic. World geometry has been submitted this frame, so the
+      // copied rect very likely holds world pixels - which this backend never
+      // rasterizes, so an encode would produce a flat clear-coloured rectangle
+      // where the console had the scene. Discarding keeps the invisible zeroes
+      // and lets the traced effect show through instead.
+      copy_class = EfbCopyClass::Scene;
+      execute = m_efb_copy_scene;
+      ++m_stats.efb_copies_scene;
+    }
+    else
+    {
+      // Not a fall-through: this arm is positively identified by
+      // m_frame_world_draws == 0. With no world draw yet, everything the
+      // console's EFB contained is clear colour plus ortho draws plus pokes -
+      // exactly what this EFB holds - so the content is complete by
+      // construction rather than by luck. The only class that executes by
+      // default.
+      copy_class = EfbCopyClass::Composed2D;
+      execute = m_efb_copy_2d;
+      ++m_stats.efb_copies_composed2d;
+    }
+
+    if (execute)
+      ++m_stats.efb_copies_executed;
+    else
+      ++m_stats.efb_copies_discarded;
+
+    // Maintain the discarded-destination set in both directions, so the draw
+    // path can tell "we left this memory empty on purpose" from "this memory
+    // holds a real encode". XFB is excluded for the same reason it is excluded
+    // from m_efb_copy_destinations above: it is not an off-screen surface a
+    // draw samples.
+    //
+    // Note this runs on the CLASSIFICATION, not on what the encode produced -
+    // a destination is discarded the moment we decide not to write it, which is
+    // before any draw this frame could sample it.
+    if (!xfb && dst_addr != 0)
+    {
+      const auto it = std::find(m_efb_discarded_destinations.begin(),
+                                m_efb_discarded_destinations.end(), dst_addr);
+      if (!execute)
+      {
+        if (it == m_efb_discarded_destinations.end() &&
+            m_efb_discarded_destinations.size() < MAX_EFB_COPY_DESTINATIONS)
+        {
+          m_efb_discarded_destinations.push_back(dst_addr);
+        }
+      }
+      else if (it != m_efb_discarded_destinations.end())
+      {
+        // It holds real pixels now. Anything sampling it must be drawn.
+        m_efb_discarded_destinations.erase(it);
+      }
+    }
+
+    // The scratch REGION, for the UI path. Recorded only for a discarded copy of
+    // a strict subregion: a full-EFB rect is a whole-frame capture, and the
+    // pre-world rule already handles the clear that precedes one.
+    if (!xfb && !execute && src_rect.GetWidth() > 0 && src_rect.GetHeight() > 0 &&
+        (src_rect.GetWidth() < static_cast<int>(EFB_WIDTH) ||
+         src_rect.GetHeight() < static_cast<int>(EFB_HEIGHT)) &&
+        m_efb_discarded_rects.size() < MAX_EFB_COPY_DESTINATIONS &&
+        std::find(m_efb_discarded_rects.begin(), m_efb_discarded_rects.end(), src_rect) ==
+            m_efb_discarded_rects.end())
+    {
+      m_efb_discarded_rects.push_back(src_rect);
+    }
+  }
+
+  // The misclassification instrument. It names every input the decision used,
+  // because "why did this copy get that class" is the only question anyone will
+  // ask of it: a depth copy says `depth 1`, a bloom tap says `int 1 half 1`, and
+  // a mid-gameplay colour copy says `world-draws` greater than zero.
+  if (ShouldTraceDraws())
+  {
+    INFO_LOG_FMT(VIDEO,
+                 "Remix EFB copy: class {} action {} | rect [{} {} {} {}] dst {:#010x} fmt {} "
+                 "depth {} int {} half {} yscale {:.3f} clear {} | world-draws {} ui-draws {}",
+                 EfbCopyClassName(copy_class), execute ? "exec" : "discard", src_rect.left,
+                 src_rect.top, src_rect.right, src_rect.bottom, dst_addr, copy_format,
+                 is_depth ? 1 : 0, is_intensity ? 1 : 0, half_scale ? 1 : 0, y_scale, clear ? 1 : 0,
+                 m_frame_world_draws, m_stats.ui_placed);
+  }
+
   if (!m_trace_efb_copies)
-    return;
+    return execute;
 
   // A frame cannot legitimately need more than a handful of these; the cap only
   // exists so a runaway game cannot grow the vector without bound. Overflowing
   // copies are still counted above, so the summary stays honest about them.
   if (m_efb_copies.size() >= MAX_EFB_COPY_EVENTS)
-    return;
+    return execute;
 
   EfbCopyEvent event;
   event.seq = m_stats.draws_seen;
@@ -1596,7 +1778,29 @@ void RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_add
   event.xfb = xfb;
   event.clear = clear;
   event.half_scale = half_scale;
+  event.depth = is_depth;
+  event.intensity = is_intensity;
+  event.y_scale = y_scale;
+  event.copy_class = copy_class;
+  event.executed = execute;
+  // Latched here, at the copy, rather than read at frame end: frame-end values
+  // are the LAST copy's view of the frame, which would make every
+  // misclassification look retroactively justified.
+  event.world_draws = m_frame_world_draws;
+  event.ui_draws = m_stats.ui_placed;
   m_efb_copies.push_back(event);
+  return execute;
+}
+
+bool RemixApi::EfbDestinationDiscarded(u32 addr) const
+{
+  // Both knobs restore the draw-it-anyway behaviour, so either one is a full
+  // escape hatch if skipping ever removes something the game genuinely needed.
+  if (!m_efb_emulation || !m_efb_skip_discarded_tex || addr == 0)
+    return false;
+
+  return std::find(m_efb_discarded_destinations.begin(), m_efb_discarded_destinations.end(),
+                   addr) != m_efb_discarded_destinations.end();
 }
 
 void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
@@ -1682,6 +1886,35 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     // repeat in the sampler; see the note there.
     call.texture.clamp_u = wrap_mode_u == 0;
     call.texture.clamp_v = wrap_mode_v == 0;
+  }
+
+  // A BACKGROUND draw, not a UI draw, and the overlay cannot express it.
+  //
+  // An untextured ortho quad submitted before any world geometry this frame is
+  // the game clearing the EFB - a full-screen wash, or a scratch region it is
+  // about to render into and copy out. On console the scene is drawn over it.
+  // Here the ortho layer is composited ON TOP of the traced image, so the draw
+  // that belongs underneath everything lands over everything and the order is
+  // inverted.
+  //
+  // Measured on BFBB: draw 0 is a full-screen white quad and draw 1 clips to
+  // [0 0 256 256] - the exact rect of the EFB copy it feeds - and both carry
+  // vertex colour 0xffffffff. They are the white screen and the white box.
+  //
+  // Untextured is load-bearing: real 2D content is textured, so this cannot
+  // swallow a menu or a HUD element. The pre-world test is what separates a
+  // clear from a legitimate 2D layer drawn after the scene.
+  if (m_ui_drop_pre_world_blank && call.texture.pixels == nullptr)
+  {
+    if (m_frame_world_draws == 0)
+    {
+      ++m_stats.ui_dropped_pre_world;
+      return;
+    }
+
+    // The mid-frame scratch case is NOT tested here. It has to be decided on
+    // what the draw paints, which is not known until the vertices have been
+    // transformed - see the `painted` test further down.
   }
 
   // Blend state arrives already translated into Vulkan's numbering, so the cases
@@ -1787,21 +2020,79 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
                     static_cast<float>((source.color >> 24) & 0xFF) / 255.0f};
     m_ui_vertices.push_back(vertex);
 
-    if (record_footprint)
-    {
-      // NDC -> EFB, the pre-scale analogue of UiRasterizer's to_screen_x/y. y is
-      // flipped for the same reason: GX ndc y points up and EFB row 0 is the top.
-      const float efb_x = viewport[0] + (vertex.x * 0.5f + 0.5f) * viewport[2];
-      const float efb_y = viewport[1] + (0.5f - vertex.y * 0.5f) * viewport[3];
-      footprint_left = std::min(footprint_left, efb_x);
-      footprint_right = std::max(footprint_right, efb_x);
-      footprint_top = std::min(footprint_top, efb_y);
-      footprint_bottom = std::max(footprint_bottom, efb_y);
-    }
+    // Accumulated unconditionally, not just for the audit: the scratch-region
+    // drop below needs the real painted extent, and a few min/max per vertex is
+    // nothing next to rasterizing the quad.
+    //
+    // NDC -> EFB, the pre-scale analogue of UiRasterizer's to_screen_x/y. y is
+    // flipped for the same reason: GX ndc y points up and EFB row 0 is the top.
+    const float efb_x = viewport[0] + (vertex.x * 0.5f + 0.5f) * viewport[2];
+    const float efb_y = viewport[1] + (0.5f - vertex.y * 0.5f) * viewport[3];
+    footprint_left = std::min(footprint_left, efb_x);
+    footprint_right = std::max(footprint_right, efb_x);
+    footprint_top = std::min(footprint_top, efb_y);
+    footprint_bottom = std::max(footprint_bottom, efb_y);
+  }
+
+  // What the draw actually covers: its geometry, cut down by its own scissor.
+  const MathUtil::Rectangle<int> painted{
+      std::max(static_cast<int>(std::floor(footprint_left)), static_cast<int>(clip[0])),
+      std::max(static_cast<int>(std::floor(footprint_top)), static_cast<int>(clip[1])),
+      std::min(static_cast<int>(std::ceil(footprint_right)), static_cast<int>(clip[2])),
+      std::min(static_cast<int>(std::ceil(footprint_bottom)), static_cast<int>(clip[3]))};
+
+  // The mid-frame scratch fill, tested on what the draw PAINTS rather than on
+  // its scissor. BFBB's is scissored to the whole screen but covers exactly
+  // [0 0 256 256] - the rect of the EFB copy it feeds - and arrives at
+  // world-draw 204, so neither the clip rect nor the pre-world test above can
+  // see it. Measured: `Remix UI paints: efb [0 0 256 256] | clip [0 0 640 528]`.
+  //
+  // Exact match against a rect we discard a copy of, and untextured, for the
+  // same reason as before: it is the tightest test that catches the case.
+  if (m_ui_drop_pre_world_blank && call.texture.pixels == nullptr &&
+      std::find(m_efb_discarded_rects.begin(), m_efb_discarded_rects.end(), painted) !=
+          m_efb_discarded_rects.end())
+  {
+    ++m_stats.ui_dropped_pre_world;
+    return;
   }
 
   m_ui_raster.Draw(call, m_ui_vertices, indices);
   ++m_stats.ui_placed;
+
+  // The same draw, recorded a second time at the EFB's own resolution, so that
+  // an EXECUTED EFB copy encodes the 2D layer the console would have had there
+  // instead of bare clear colour.
+  //
+  // The incoming viewport and clip go in UNSCALED because they are already in
+  // EFB units (RemixVertexManager.cpp:2608-2617); the scale applied above exists
+  // only to map them onto the swapchain, and applying it here would be undoing
+  // the coordinate system this rasterizer works in. The vertices need no
+  // adjustment at all - they are NDC.
+  //
+  // Placed after every drop rule above, so the EFB copy sees the same 2D layer
+  // the overlay does, minus nothing and plus nothing.
+  if (m_efb_emulation && m_efb_ui_compose)
+  {
+    if (!m_efb_ui_frame_begun)
+    {
+      m_efb_ui_raster.Begin(EFB_WIDTH, EFB_HEIGHT);
+      m_efb_ui_frame_begun = true;
+    }
+
+    UiRasterizer::DrawCall efb_call = call;
+    efb_call.viewport_x = viewport[0];
+    efb_call.viewport_y = viewport[1];
+    efb_call.viewport_width = viewport[2];
+    efb_call.viewport_height = viewport[3];
+    efb_call.clip_left = static_cast<int>(std::floor(clip[0]));
+    efb_call.clip_top = static_cast<int>(std::floor(clip[1]));
+    // Right/bottom of an EFB rect are exclusive; the rasterizer's clip is
+    // inclusive on all four sides, same conversion as above.
+    efb_call.clip_right = static_cast<int>(std::ceil(clip[2])) - 1;
+    efb_call.clip_bottom = static_cast<int>(std::ceil(clip[3])) - 1;
+    m_efb_ui_raster.Draw(efb_call, m_ui_vertices, indices);
+  }
 
   // Recorded after the rasterizer has taken the draw and keyed by the same
   // counter the per-draw GX dump uses (RemixVertexManager.cpp:1670 keys on
@@ -1829,7 +2120,103 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     footprint.depth_test = blend.depth_test;
     footprint.depth_write = blend.depth_write;
     m_ui_footprints.push_back(footprint);
+
+    // What this draw ACTUALLY paints, after geometry and scissor are both
+    // applied - as opposed to `clip`, which is only the scissor. A quad can be
+    // scissored to the whole screen and still cover one corner, so identifying
+    // draws by their clip rect (as an earlier pass here did) misattributes them.
+    //
+    // Everything reaching this point has already survived the drop rules above,
+    // so a rectangle that appears here is a rectangle that ends up on screen.
+    if (ShouldTraceDraws())
+    {
+      INFO_LOG_FMT(VIDEO,
+                   "Remix UI paints: efb [{} {} {} {}] | clip [{:.0f} {:.0f} {:.0f} {:.0f}] | tex "
+                   "{:#018x} untextured {} | blend {} | world-draws {}",
+                   footprint.left, footprint.top, footprint.right, footprint.bottom, clip[0],
+                   clip[1], clip[2], clip[3], footprint.texture_hash,
+                   call.texture.pixels == nullptr ? 1 : 0, static_cast<int>(call.blend),
+                   m_frame_world_draws);
+    }
   }
+}
+
+void RemixApi::FoldUiIntoEfb()
+{
+  if (!m_efb_emulation || !m_efb_ui_compose || !m_efb_ui_frame_begun)
+    return;
+
+  // Replays everything recorded since the last Begin. Cheap when nothing was
+  // recorded - Flush returns immediately on an empty draw list
+  // (RemixUiRaster.cpp:162-163).
+  m_efb_ui_raster.Flush();
+
+  if (m_efb_ui_raster.HasContent())
+  {
+    const std::vector<u32>& pixels = m_efb_ui_raster.Buffer();
+    const u32 width = std::min(m_efb_ui_raster.Width(), static_cast<u32>(EFB_WIDTH));
+    const u32 height = std::min(m_efb_ui_raster.Height(), static_cast<u32>(EFB_HEIGHT));
+
+    for (u32 y = 0; y < height; ++y)
+    {
+      const u32* row = pixels.data() + static_cast<size_t>(y) * m_efb_ui_raster.Width();
+      for (u32 x = 0; x < width; ++x)
+      {
+        // Packed 0xAABBGGRR, straight (non-premultiplied) alpha
+        // (RemixUiRaster.h:149-151).
+        const u32 src = row[x];
+        const u32 src_a = src >> 24;
+        // The overwhelming majority of the buffer on any real screen. Skipping
+        // it is what keeps this a scan rather than a full read-modify-write of
+        // the EFB.
+        if (src_a == 0)
+          continue;
+
+        const u32 src_r = src & 0xFF;
+        const u32 src_g = (src >> 8) & 0xFF;
+        const u32 src_b = (src >> 16) & 0xFF;
+
+        // GetColor unpacks whatever the current pixel format is into 0xRRGGBBAA
+        // (SWEfbInterface.cpp:147-172 through :474-478), which is the same byte
+        // order EfbWriteStoreColor packs back down from - so the round trip is
+        // format-agnostic and neither end needs to know the format.
+        const u32 dst = EfbInterface::GetColor(static_cast<u16>(x), static_cast<u16>(y));
+        const u32 dst_r = dst >> 24;
+        const u32 dst_g = (dst >> 16) & 0xFF;
+        const u32 dst_b = (dst >> 8) & 0xFF;
+        const u32 dst_a = dst & 0xFF;
+
+        // Over. Fully opaque is the common case and skips the arithmetic
+        // entirely; the rounding is +127 so that a = 255 is exactly src.
+        u32 out_r = src_r;
+        u32 out_g = src_g;
+        u32 out_b = src_b;
+        u32 out_a = 255;
+        if (src_a != 255)
+        {
+          const u32 inv = 255 - src_a;
+          out_r = (src_r * src_a + dst_r * inv + 127) / 255;
+          out_g = (src_g * src_a + dst_g * inv + 127) / 255;
+          out_b = (src_b * src_a + dst_b * inv + 127) / 255;
+          out_a = src_a + (dst_a * inv + 127) / 255;
+        }
+
+        const u32 store = (out_r << 24) | (out_g << 16) | (out_b << 8) | std::min(out_a, 255u);
+        EfbWriteStoreColor(static_cast<u16>(x), static_cast<u16>(y), store);
+      }
+    }
+
+    ++m_stats.efb_ui_folds;
+  }
+
+  // Flush replays EVERYTHING recorded since Begin (RemixUiRaster.cpp:160-173),
+  // so a second executed copy in the same frame would fold the first copy's
+  // draws a second time. Re-Begin resets the draw list and clears the buffer, so
+  // each fold sees only what was submitted since the previous one. This is the
+  // whole guard against double-composited UI in copied textures; the
+  // efb_ui_folds counter exceeding efb_copies_executed is the log-side tell that
+  // it has broken.
+  m_efb_ui_raster.Begin(EFB_WIDTH, EFB_HEIGHT);
 }
 
 namespace
@@ -1895,11 +2282,14 @@ void RemixApi::AuditUiFootprints()
     else
       ++tex_copies;
     INFO_LOG_FMT(VIDEO,
-                 "Remix EFB copy {}: seq {} rect [{},{} -> {},{}] dst {:#010x} fmt {} xfb {} "
-                 "clear {} half {}",
-                 i, copy.seq, copy.rect.left, copy.rect.top, copy.rect.right, copy.rect.bottom,
-                 copy.dst_addr, copy.copy_format, copy.xfb ? 1 : 0, copy.clear ? 1 : 0,
-                 copy.half_scale ? 1 : 0);
+                 "Remix EFB copy {}: class {} action {} | seq {} rect [{},{} -> {},{}] dst "
+                 "{:#010x} fmt {} xfb {} clear {} depth {} int {} half {} yscale {:.3f} | "
+                 "world-draws {} ui-draws {}",
+                 i, EfbCopyClassName(copy.copy_class), copy.executed ? "exec" : "discard", copy.seq,
+                 copy.rect.left, copy.rect.top, copy.rect.right, copy.rect.bottom, copy.dst_addr,
+                 copy.copy_format, copy.xfb ? 1 : 0, copy.clear ? 1 : 0, copy.depth ? 1 : 0,
+                 copy.intensity ? 1 : 0, copy.half_scale ? 1 : 0, copy.y_scale, copy.world_draws,
+                 copy.ui_draws);
   }
 
   u32 scratch = 0;
@@ -3218,6 +3608,28 @@ void RemixApi::SubmitLights()
     const bool is_positional =
         attnfunc == AttenuationFunc::Spot && !(m_gx_light_no_falloff_distant && falloff_free_spot);
 
+    // Drop the game's own suns, so an atmosphere mod owns the key light.
+    //
+    // A GC title's sun is a baked-in directional light with a fixed colour and
+    // direction that knows nothing about a physically-modelled sky. Run both and
+    // they double up: the scene reads far too bright and the game's flat white
+    // fights whatever the atmosphere is doing. Numos is the case this exists for.
+    //
+    // Positional lights are kept. Lamps, glows and cone lights are local set
+    // dressing an atmosphere model does not replace, and dropping them would put
+    // the scene's interiors in the dark.
+    //
+    // Note this can leave a frame with NO lights at all, which lets the runtime's
+    // rtx.fallbackLightMode reach NoLightsPresent - the opposite of the trap
+    // described above, and here it is the desired outcome rather than an
+    // accident. If the scene goes black instead of sky-lit, that fallback is the
+    // first thing to check.
+    if (!is_positional && m_gx_light_drop_distant)
+    {
+      ++m_stats.lights_dropped_distant;
+      continue;
+    }
+
     // Remix always renders a clamped N.L. GX's other two diffuse functions have
     // no translation at all - None makes the light behave as pure ambient, Sign
     // lets it darken a surface - so a scene lit mainly by them reads dark and
@@ -3452,6 +3864,18 @@ void RemixApi::SubmitLights()
   if (drawn != 0)
     return;
 
+  // The fallback exists for a scene with no light at all. An atmosphere mod IS
+  // that light, so inventing another one on top of it is exactly the clash the
+  // drop knob was turned on to remove - and dropping the game's suns only to
+  // replace them with ours would make that knob do nothing visible.
+  //
+  // This is why RemixGxLightDropDistant appeared not to work: dropping all four
+  // of BFBB's suns left `drawn` at zero, so this fired and put a distant light
+  // straight back. The Remix light statistics showed 2 distant lights with the
+  // backend reporting `lights 0 distant, 4 dropped`, which is the tell.
+  if (!m_fallback_light_enabled || m_gx_light_drop_distant)
+    return;
+
   // Nothing lit the scene this frame (very common: many GC titles bake lighting
   // into vertex colors and enable no XF lights at all). Fall back to one
   // persistent distant light so the path tracer has something to integrate.
@@ -3624,27 +4048,37 @@ void RemixApi::OnAfterFrame()
   present_info.hwndOverride = nullptr;
   CallGuarded("Present", [&] { m_interface.Present(&present_info); });
 
+  // CPU-thread counters, moved into this frame's stats. Drained every frame
+  // rather than only on logging frames, so the line reports one frame's accesses
+  // and not sixty frames' worth.
+  RemixEFBInterface::DrainAccessCounters(m_stats.efb_peeks, m_stats.efb_pokes);
+
   if (m_log_stats && (m_frame_index % 60) == 0)
   {
     INFO_LOG_FMT(VIDEO,
-                 "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} empty {} invisible {} "
+                 "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} efbdisc {} empty {} "
+                 "invisible {} "
                  "scissor {} "
                  "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
                  "register, {} none, {} split | tev colour {} folded, {} tinted, {} identity, {} bailed, {} "
                  "later-stage tex | texgen {} ({} non-trivial) | blended {} tested {} "
                  "logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot, {} "
-                 "falloff-free->distant), draws "
+                 "falloff-free->distant, {} dropped), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
-                 "unplaceable, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} dstalpha + {} "
+                 "unplaceable, {} preworld, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} "
+                 "dstalpha + {} "
                  "efbcopytex, raster {} us, upload {} us) | "
-                 "efb copies {} ({} non-xfb+clear) | viewport changes {} (corrected {}, refused {}, "
+                 "efb copies {} ({} non-xfb+clear | xfb {} depth {} int {} scene {} 2d {} | "
+                 "exec {} disc {}, {} us, {} folds) | efb peeks {} pokes {}"
+                 " | viewport changes {} (corrected {}, refused {}, "
                  "mirrored {}, depth-only {}) | sky auto: candidates {}, "
                  "classified {}, tagged {} ({} ignored), pushed {} (x{:.0f}), emissive {} (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
-                 m_stats.skipped_degenerate, m_stats.skipped_invisible, m_stats.skipped_scissor,
+                 m_stats.skipped_efb_discarded, m_stats.skipped_degenerate,
+                 m_stats.skipped_invisible, m_stats.skipped_scissor,
                  m_stats.meshes_created,
                  m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
                  m_stats.color_register, m_stats.color_none, m_stats.ras_channel_split,
@@ -3654,16 +4088,22 @@ void RemixApi::OnAfterFrame()
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,
-                 m_stats.lights_falloff_free, m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
+                 m_stats.lights_falloff_free, m_stats.lights_dropped_distant,
+                 m_stats.draw_light_mask, m_stats.lights_rewritten, m_stats.lights_conflicted,
                  m_stats.lights_alpha_only, m_stats.lights_diffuse_none,
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
                  m_stats.ambient_bright ? "bright" : "dim", m_stats.ui_placed,
-                 m_stats.ui_unplaceable, m_stats.ui_tev_alpha, m_stats.tev_bail_stages,
+                 m_stats.ui_unplaceable, m_stats.ui_dropped_pre_world, m_stats.ui_tev_alpha,
+                 m_stats.tev_bail_stages,
                  m_stats.tev_bail_konst, m_stats.tev_bail_compare, m_stats.tev_bail_rasterized,
                  m_stats.ui_skipped_dst_alpha, m_stats.ui_skipped_efb_copy_tex,
                  m_stats.ui_raster_us,
                  m_stats.ui_upload_us,
-                 m_stats.efb_copies, m_stats.efb_copies_scratch, m_stats.viewport_changed,
+                 m_stats.efb_copies, m_stats.efb_copies_scratch, m_stats.efb_copies_xfb,
+                 m_stats.efb_copies_depth, m_stats.efb_copies_intensity, m_stats.efb_copies_scene,
+                 m_stats.efb_copies_composed2d, m_stats.efb_copies_executed,
+                 m_stats.efb_copies_discarded, m_stats.efb_encode_us, m_stats.efb_ui_folds,
+                 m_stats.efb_peeks, m_stats.efb_pokes, m_stats.viewport_changed,
                  m_stats.viewport_corrected, m_stats.viewport_uncorrectable,
                  m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
                  m_stats.sky_auto_candidates,
@@ -3698,6 +4138,15 @@ void RemixApi::OnAfterFrame()
   m_view_samples.clear();
   m_view_duplicate_hashes.clear();
   m_ui_frame_begun = false;
+  // The EFB-space recorder, same discipline. Anything recorded but never folded
+  // (a frame whose copies were all discarded, or that had no copy at all) is
+  // dropped rather than carried into the next frame, where it would composite
+  // last frame's HUD into this frame's copy. Begin() next frame does the actual
+  // clearing; this flag is what makes it happen.
+  m_efb_ui_frame_begun = false;
+  // The Scene-vs-Composed2D signal is frame-local by definition: "has world
+  // geometry been drawn YET, this frame".
+  m_frame_world_draws = 0;
   // Promote this frame's XFB copy extent to "the region the console presents",
   // which the next frame's UI draws are mapped onto. It has to happen here and
   // not in the draw path: the XFB copy is the event that ENDS a frame

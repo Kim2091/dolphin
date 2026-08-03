@@ -687,6 +687,179 @@ const Info<bool> GFX_REMIX_GX_TEXTURE_STAGE{{System::GFX, "Settings", "RemixGxTe
 const Info<bool> GFX_REMIX_DEBUG_COLOR_ROUTES{
     {System::GFX, "Settings", "RemixDebugColorRoutes"}, false};
 
+// Maintain a real CPU-side EFB: honour clears, pokes and peeks against it, and
+// let a CLASSIFIED subset of EFB copies encode out of it into game RAM.
+//
+// Before this, the backend had no EFB at all. Peeks returned 0, pokes did
+// nothing, ClearRegion was a no-op through the stub pipelines, and
+// RemixTextureCache::CopyEFB wrote nothing - so every copy destination received
+// the staging buffer's zeroes. Every copy was, in effect, discarded.
+//
+// That accident is desirable for a large class of copies and is deliberately
+// preserved: a GC game's baked shadow maps, mirrored-camera reflections and
+// bloom chains are screen-space fakes of things the path tracer does natively
+// and better, and discarding them is what lets the traced result show. So the
+// copies are classified (see RemixEfbCopy2D and friends below) rather than
+// executed wholesale - executing a world-content copy against this EFB would
+// paint a flat clear-coloured rectangle, which is visibly WORSE than the
+// invisible zeroes it replaced.
+//
+// The storage, the clear and the encoders are the Software backend's, reused
+// unchanged (SWEfbInterface.cpp, EfbCopy.cpp, TextureEncoder.cpp) rather than
+// duplicated.
+//
+// False = the pre-change behaviour in every particular: peeks return 0, pokes
+// and clears do nothing, no copy is classified and no copy is encoded.
+const Info<bool> GFX_REMIX_EFB_EMULATION{{System::GFX, "Settings", "RemixEfbEmulation"}, true};
+// Execute a colour EFB copy taken before any perspective draw reached submission
+// this frame.
+//
+// This is the one class whose content the synthesized EFB holds EXACTLY, by
+// construction rather than by luck: with no world draw yet, everything the
+// console's EFB contained is clear colour plus orthographic/UI draws plus pokes,
+// which is precisely what this EFB holds. Render-to-texture menus, title
+// screens and composed text windows are the shapes that fit.
+//
+// It is therefore the only class that executes by default, and the only knob
+// here whose default changes behaviour.
+//
+// False = discard it, i.e. the pre-change behaviour.
+const Info<bool> GFX_REMIX_EFB_COPY_2D{{System::GFX, "Settings", "RemixEfbCopy2D"}, true};
+// Execute a colour EFB copy taken AFTER a perspective draw this frame.
+//
+// The frame-level world-draw count is a heuristic, and a deliberately blunt one:
+// the copied rect very likely holds world pixels, and this backend rasterizes no
+// world pixels, so executing hands the game a flat clear-coloured image where
+// the console had the scene. Discarding leaves today's zeroes and lets the
+// traced effect show instead of the baked one.
+//
+// Its failure mode is the safe one - a game that draws world geometry early and
+// then composes a pure-2D element by copy later in the same frame loses that
+// element - and this knob is the recovery lever for exactly that case, with no
+// rebuild. The per-copy trace line names `world-draws N`, which is the signal
+// that decided it.
+//
+// True = execute, i.e. encode the (mostly clear-coloured) EFB into the copy's
+// destination.
+const Info<bool> GFX_REMIX_EFB_COPY_SCENE{{System::GFX, "Settings", "RemixEfbCopyScene"}, false};
+// Execute a DEPTH EFB copy (source pixel format Z24, BPStructs.cpp:308).
+//
+// The format signal is exact; the purpose - almost always a shadow map - is
+// inferred. Both point the same way. The path tracer casts real shadows, so the
+// baked one is redundant; and this EFB's depth plane holds only the clear Z plus
+// pokes, so executing would hand the game a UNIFORM depth map, i.e. a
+// full-screen wrong shadow test. That is worse than the absence.
+//
+// True = execute anyway, for a game that uses a depth copy for something else.
+const Info<bool> GFX_REMIX_EFB_COPY_DEPTH{{System::GFX, "Settings", "RemixEfbCopyDepth"}, false};
+// Execute an INTENSITY (luminance-format, isIntensity) EFB copy.
+//
+// Luminance extraction is what a bloom or glow chain opens with, and it usually
+// rides with half_scale. The runtime does its own bloom, and feeding the game's
+// chain a flat clear-luminance only blends a uniform wash back over the screen.
+//
+// True = execute, which is the lever if a game turns out to use an intensity
+// copy for a legitimate 2D mask. The trace line names `int 1` on these.
+const Info<bool> GFX_REMIX_EFB_COPY_INTENSITY{{System::GFX, "Settings", "RemixEfbCopyIntensity"},
+                                              false};
+// Execute the XFB copy - the frame's presentation copy - by running the YUV
+// encoder over the synthesized EFB.
+//
+// Off, and right to be off twice over. Nothing on this backend consumes the XFB
+// image: the Remix runtime produces and presents the picture. And even executed,
+// the encode would only emit clear colour plus the 2D layer, because no world
+// content is ever rasterized into this EFB. Meanwhile it is the one recurring
+// per-frame full-width cost in the whole feature, which the fill-rate history of
+// this backend's UI rasterizer says not to pay by default.
+//
+// True = encode it. Dolphin's screenshot and AV-dump pipeline is NOT wired to
+// this and will not start producing Remix frames because of it.
+const Info<bool> GFX_REMIX_EFB_XFB_ENCODE{{System::GFX, "Settings", "RemixEfbXfbEncode"}, false};
+// Composite the frame's 2D layer into the EFB before an EXECUTED copy encodes.
+//
+// The EFB's colour plane is otherwise only written by clears and pokes, so
+// without this an executed Composed2D copy encodes bare clear colour - correct,
+// but empty. The fold replays the frame's orthographic draws through a second
+// UiRasterizer instance running at the EFB's own 640x528 (their viewport and
+// scissor arrive in EFB units already) and blends the result Over the colour
+// plane.
+//
+// Costs nothing on a frame whose copies are all discarded beyond the recording
+// itself: the fold is called from the execute arm only.
+//
+// False = encode the EFB without the 2D layer.
+const Info<bool> GFX_REMIX_EFB_UI_COMPOSE{{System::GFX, "Settings", "RemixEfbUiCompose"}, true};
+// Skip draws that sample an EFB copy destination whose copy was DISCARDED.
+//
+// Discarding a copy leaves that memory holding zeroes. Zero bytes decode into a
+// perfectly valid texture, so the draw that samples it is not refused anywhere -
+// it renders as a blank rectangle sitting over the path-traced scene. SpongeBob:
+// Battle for Bikini Bottom is the confirmed case: two 256x256 copies from the
+// top-left corner every frame, both classified Scene, drawn as a white box over
+// a quarter of the screen.
+//
+// True = drop those draws, so the game's screen-space fake is ABSENT and the
+// traced result behind it shows. That is what the discard decision already
+// meant; this only stops the game papering over it.
+//
+// False = draw them anyway, blank texture and all - the behaviour before this
+// existed. Set it if skipping ever removes something a game genuinely needed;
+// the frame line's `efbdisc` counter says how many draws are affected.
+const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX{
+    {System::GFX, "Settings", "RemixEfbSkipDiscardedTex"}, true};
+// Drop untextured 2D draws that arrive before any world geometry in the frame.
+//
+// Those are EFB clears and scratch-region fills, not UI. The console draws the
+// scene over them; this backend composites the 2D layer ON TOP of the traced
+// image, so they land over everything instead of under it and paint the screen
+// flat. SpongeBob: Battle for Bikini Bottom is the confirmed case - a
+// full-screen white quad (the screen going white outdoors) and a 256x256 one
+// clipped to the exact rect of the EFB copy it feeds (the white box top-left),
+// both carrying vertex colour 0xffffffff.
+//
+// Untextured is what keeps this from swallowing real 2D: menus, HUD elements
+// and text are textured. The pre-world test is what separates a clear from a
+// legitimate 2D layer drawn after the scene.
+//
+// True = drop them. False = composite them as before. If a game's genuine 2D
+// background disappears, this is the knob; the frame line's `preworld` counter
+// says how many draws are affected.
+const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD_BLANK{
+    {System::GFX, "Settings", "RemixUiDropPreWorldBlank"}, true};
+// Drop the game's DIRECTIONAL lights, so an atmosphere mod owns the key light.
+//
+// A GC title's sun is a baked directional light with a fixed colour and
+// direction that knows nothing about a physically-modelled sky. Run it alongside
+// one and they double up - the scene reads far too bright and the game's flat
+// white fights the atmosphere's own sun. Numos is the case this exists for.
+//
+// Positional lights are kept: lamps, glows and cone lights are local set
+// dressing no atmosphere model replaces, and dropping them would darken
+// interiors.
+//
+// True = drop them. Default False, because with no atmosphere mod loaded this
+// removes the scene's only key light. Turn it on together with the sky, and
+// watch the frame line's `dropped` count to confirm the game really was adding
+// one. If the scene goes black rather than sky-lit, check the runtime's
+// rtx.fallbackLightMode - dropping every light is what lets NoLightsPresent
+// trigger.
+const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT{
+    {System::GFX, "Settings", "RemixGxLightDropDistant"}, false};
+// The backend's own fallback light: one persistent distant light, drawn only on
+// frames where the scene submitted NO lights at all.
+//
+// It exists because many GC titles bake their lighting into vertex colours and
+// enable no XF lights, which would otherwise leave the path tracer nothing to
+// integrate. It is NOT the runtime's rtx.fallbackLightMode - that is a separate
+// mechanism in rtx.conf, and having both is why "where is this extra distant
+// light coming from" is an easy question to get wrong.
+//
+// False = never draw it, so an atmosphere mod is the only key light. Turn it off
+// whenever a sky mod is providing illumination; leave it on for bare Remix.
+// RemixGxLightDropDistant already implies this off - dropping the game's suns
+// and then inserting our own would cancel out.
+const Info<bool> GFX_REMIX_FALLBACK_LIGHT{{System::GFX, "Settings", "RemixFallbackLight"}, true};
+
 const Info<std::string> GFX_DRIVER_LIB_NAME{{System::GFX, "Settings", "DriverLibName"}, ""};
 
 const Info<VertexLoaderType> GFX_VERTEX_LOADER_TYPE{{System::GFX, "Settings", "VertexLoaderType"},

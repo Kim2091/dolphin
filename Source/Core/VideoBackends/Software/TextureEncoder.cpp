@@ -1423,8 +1423,9 @@ static void EncodeZ24halfscale(u8* dst, const u8* src, EFBCopyFormat format)
   }
 }
 
-namespace
-{
+// Hoisted out of the anonymous namespace it used to live in, so the Remix
+// backend can call it; declared in TextureEncoder.h. Nothing else about it
+// changes, and the helpers it calls stay internal.
 void EncodeEfbCopy(u8* dst, const EFBCopyParams& params, u32 native_width, u32 bytes_per_row,
                    u32 num_blocks_y, u32 memory_stride, const MathUtil::Rectangle<int>& src_rect,
                    bool scale_by_half)
@@ -1472,7 +1473,6 @@ void EncodeEfbCopy(u8* dst, const EFBCopyParams& params, u32 native_width, u32 b
     }
   }
 }
-}  // namespace
 
 void Encode(AbstractStagingTexture* dst, const EFBCopyParams& params, u32 native_width,
             u32 bytes_per_row, u32 num_blocks_y, u32 memory_stride,
