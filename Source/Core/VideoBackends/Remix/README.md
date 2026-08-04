@@ -101,9 +101,11 @@ must go in `GFX.ini`.
 
 ## Configuration
 
-Every knob is editable in the GUI: **Options → Graphics → Remix**. Labels there
-are the exact INI key names used below, and each carries a plain-language
-tooltip.
+Every knob is editable in the GUI: **Options → Graphics → Remix**. Options are
+labelled with a short descriptive phrase rather than the raw INI key, but every
+tooltip is titled with the key, and the filter box matches key names as well as
+labels — so a name read off a log line or an existing `GFX.ini` can be pasted
+straight in to find the option it belongs to.
 
 The same tab appears under **right-click a game → Properties → Game Config →
 Graphics → Remix**, which scopes any of these to one title. Per-game values land

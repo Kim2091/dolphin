@@ -59,9 +59,18 @@ TEST(RemixSettings, EveryLocationIsUniqueAndInTheRightSection)
 
 TEST(RemixSettings, EveryRowIsDescribed)
 {
+  // Labels have to be unique as well as present: they are what the GUI shows, so
+  // two rows sharing one would be indistinguishable on screen even though the
+  // keys behind them differ.
+  std::set<std::string> labels;
+
   for (const Config::RemixSettingMeta& meta : Config::GetRemixSettingsMetadata())
   {
     const Config::Location& location = RowLocation(meta);
+
+    ASSERT_NE(meta.label, nullptr) << location.key;
+    EXPECT_NE(std::string{meta.label}, "") << location.key;
+    EXPECT_TRUE(labels.insert(meta.label).second) << "duplicate label: " << meta.label;
 
     ASSERT_NE(meta.tooltip, nullptr) << location.key;
     EXPECT_NE(std::string{meta.tooltip}, "") << location.key;

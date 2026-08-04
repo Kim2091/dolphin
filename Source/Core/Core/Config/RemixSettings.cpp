@@ -765,222 +765,224 @@ constexpr const char* const UI_MODE_CHOICES[] = {
 // One builder per control type, so a row says what it is rather than counting
 // commas. Defaults cover the common case: read once at backend init, and not an
 // experiment.
-constexpr RemixSettingMeta Toggle(const Info<bool>* setting, const char* tooltip, Group group,
+constexpr RemixSettingMeta Toggle(const Info<bool>* setting, const char* label,
+                                  const char* tooltip, Group group,
                                   Liveness liveness = Liveness::RequiresRestart,
                                   Maturity maturity = Maturity::Stable)
 {
-  return {setting, tooltip, group, liveness, maturity, 0.0f, 0.0f, 0.0f, {}};
+  return {setting, label, tooltip, group, liveness, maturity, 0.0f, 0.0f, 0.0f, {}};
 }
 
-constexpr RemixSettingMeta Whole(const Info<int>* setting, const char* tooltip, Group group,
-                                 float min, float max,
+constexpr RemixSettingMeta Whole(const Info<int>* setting, const char* label, const char* tooltip,
+                                 Group group, float min, float max,
                                  Liveness liveness = Liveness::RequiresRestart,
                                  Maturity maturity = Maturity::Stable)
 {
-  return {setting, tooltip, group, liveness, maturity, min, max, 1.0f, {}};
+  return {setting, label, tooltip, group, liveness, maturity, min, max, 1.0f, {}};
 }
 
-constexpr RemixSettingMeta Choice(const Info<int>* setting, const char* tooltip, Group group,
-                                  std::span<const char* const> choices,
+constexpr RemixSettingMeta Choice(const Info<int>* setting, const char* label, const char* tooltip,
+                                  Group group, std::span<const char* const> choices,
                                   Liveness liveness = Liveness::RequiresRestart,
                                   Maturity maturity = Maturity::Stable)
 {
-  return {setting,  tooltip, group, liveness, maturity, 0.0f,
+  return {setting,  label, tooltip, group, liveness, maturity, 0.0f,
           static_cast<float>(choices.size() - 1), 1.0f, choices};
 }
 
-constexpr RemixSettingMeta Real(const Info<float>* setting, const char* tooltip, Group group,
-                                float min, float max, float step,
+constexpr RemixSettingMeta Real(const Info<float>* setting, const char* label, const char* tooltip,
+                                Group group, float min, float max, float step,
                                 Liveness liveness = Liveness::RequiresRestart,
                                 Maturity maturity = Maturity::Stable)
 {
-  return {setting, tooltip, group, liveness, maturity, min, max, step, {}};
+  return {setting, label, tooltip, group, liveness, maturity, min, max, step, {}};
 }
 
-constexpr RemixSettingMeta Text(const Info<std::string>* setting, const char* tooltip, Group group,
+constexpr RemixSettingMeta Text(const Info<std::string>* setting, const char* label,
+                                const char* tooltip, Group group,
                                 Liveness liveness = Liveness::RequiresRestart,
                                 Maturity maturity = Maturity::Stable)
 {
-  return {setting, tooltip, group, liveness, maturity, 0.0f, 0.0f, 0.0f, {}};
+  return {setting, label, tooltip, group, liveness, maturity, 0.0f, 0.0f, 0.0f, {}};
 }
 
 constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
     // Runtime and scale.
-    Text(&GFX_REMIX_DLL_PATH,
+    Text(&GFX_REMIX_DLL_PATH, "Runtime DLL",
          "Filename or path of the Remix runtime DLL to load. It is passed straight to LoadLibrary, "
          "so the bare name 'd3d9.dll' resolves next to Dolphin.exe. Point it elsewhere to try a "
          "different Remix build without moving files around.",
          Group::RuntimeScale),
-    Real(&GFX_REMIX_SCENE_SCALE,
+    Real(&GFX_REMIX_SCENE_SCALE, "World scale (cm per game unit)",
          "Centimetres per GameCube world unit, handed to the runtime as rtx.sceneScale. It drives "
          "every distance the path tracer cares about: light falloff, volumetric fog, displacement. "
          "Titles use wildly different world units, so this is the first thing to adjust when fog "
          "and light ranges look wrong for the size of the scene.",
          Group::RuntimeScale, 0.01f, 100.0f, 0.01f),
-    Real(&GFX_REMIX_LIGHT_SCALE,
+    Real(&GFX_REMIX_LIGHT_SCALE, "Light brightness",
          "Multiplies the brightness of every light translated from the game. The lever for 'the "
          "whole scene is too dim' or 'too bright' once the lights themselves are being translated "
          "correctly.",
          Group::RuntimeScale, 0.0f, 10.0f, 0.1f),
-    Real(&GFX_REMIX_LIGHT_RANGE,
+    Real(&GFX_REMIX_LIGHT_RANGE, "Falloff-free light range",
          "Distance, in game units, at which a light that never falls off is treated as ending. "
          "GameCube lights can be configured with no distance falloff at all, and the brightness "
          "conversion borrowed from Direct3D needs a range; this stands in for it.",
          Group::RuntimeScale, 1.0f, 100000.0f, 100.0f),
 
     // Camera recovery.
-    Toggle(&GFX_REMIX_CAMERA_RECOVERY,
+    Toggle(&GFX_REMIX_CAMERA_RECOVERY, "Camera recovery",
            "Work out where the camera is instead of pinning it at the origin. GameCube hardware "
            "has no separate view matrix, so without this the world swings around a fixed viewer "
            "and every temporal feature - motion vectors, denoising, light sampling reuse - sees "
            "the entire world move whenever you turn. Off is identical to the old fixed-camera "
            "behaviour. In practice this needs to be on.",
            Group::CameraRecovery),
-    Toggle(&GFX_REMIX_CAMERA_FROM_MODELVIEW,
+    Toggle(&GFX_REMIX_CAMERA_FROM_MODELVIEW, "Take the camera from the dominant matrix",
            "Take the camera from the transform slot that the most objects share, instead of "
            "guessing it from how objects move between frames. The guess can invent camera motion "
            "out of a parked camera, which swings the whole world around the viewer. Needs "
            "RemixCameraRecovery; off restores the estimator exactly, so the two are a clean A/B.",
            Group::CameraRecovery),
-    Toggle(&GFX_REMIX_VIEW_ELECTORATE_FIX,
+    Toggle(&GFX_REMIX_VIEW_ELECTORATE_FIX, "Vote on every camera sample",
            "Let every object that survives from one frame to the next vote on how the camera "
            "moved, and ignore objects drawn more than once per frame (ocean tiles, repeated "
            "props), which cannot be matched up between frames. Off restores the old behaviour of "
            "sampling only the first 256 draws.",
            Group::CameraRecovery),
-    Toggle(&GFX_REMIX_VIEW_HOLD_ON_MISS,
+    Toggle(&GFX_REMIX_VIEW_HOLD_ON_MISS, "Hold the camera when recovery fails",
            "When the camera cannot be worked out for a few frames, keep the last known one rather "
            "than resetting to the origin. A reset re-anchors the world onto the current view, "
            "which rotates the entire sky in a single frame and can leave the horizon permanently "
            "tilted after a pitched cut.",
            Group::CameraRecovery),
-    Toggle(&GFX_REMIX_VIEW_TIE_BREAK,
+    Toggle(&GFX_REMIX_VIEW_TIE_BREAK, "Break camera consensus ties",
            "When two camera motions look equally plausible, prefer the calmer one. Two comparable "
            "candidates usually means a large moving object arguing with the static world, and the "
            "camera is not the part that is moving.",
            Group::CameraRecovery),
 
     // Sky.
-    Choice(&GFX_REMIX_SKY_AUTO_DETECT,
+    Choice(&GFX_REMIX_SKY_AUTO_DETECT, "Skybox detection",
            "Find the game's skybox automatically by its giveaway property: it slides along with "
            "the camera while its rotation stays put. 'Off' uses only the manual RemixSkyTextures "
            "list. 'Classify' finds the sky and applies the sky options below without tagging it. "
            "'Classify and tag' also marks it for the runtime - which on this backend DELETES it, "
            "so leave that alone unless you want the game's sky gone.",
            Group::Sky, SKY_AUTO_DETECT_CHOICES),
-    Toggle(&GFX_REMIX_SKY_AT_INFINITY,
+    Toggle(&GFX_REMIX_SKY_AT_INFINITY, "Push skyboxes out to infinity",
            "Push the detected sky far behind the world so it cannot block anything. The console "
            "draws the sky first and never lets it write depth; a path tracer has no draw order, so "
            "the same dome is otherwise solid geometry parked in front of the scenery. Scaling it "
            "about the camera keeps the picture identical angle for angle.",
            Group::Sky),
-    Real(&GFX_REMIX_SKY_INFINITY_SCALE,
+    Real(&GFX_REMIX_SKY_INFINITY_SCALE, "Skybox distance multiplier",
          "How far RemixSkyAtInfinity pushes the sky out, as a multiplier. It has to beat the ratio "
          "of view distance to dome size to clear the world (about 10.5 in Wind Waker). Raise it if "
          "the sky still hides scenery; too high and floating-point precision becomes the next "
          "problem.",
          Group::Sky, 1.0f, 64.0f, 0.5f),
-    Toggle(&GFX_REMIX_SKY_EMISSIVE,
+    Toggle(&GFX_REMIX_SKY_EMISSIVE, "Emissive skyboxes",
            "Make the detected sky glow with its own colour instead of waiting to be lit. The "
            "console draws a skybox with lighting off, so its authored colour IS the final pixel; "
            "treating it as an ordinary surface makes it go dark on the side facing away from the "
            "sun. This also lets the sky light the scene.",
            Group::Sky),
-    Real(&GFX_REMIX_SKY_EMISSIVE_INTENSITY,
+    Real(&GFX_REMIX_SKY_EMISSIVE_INTENSITY, "Skybox brightness",
          "How brightly the sky glows. 1.0 reproduces the console's colour at face value; higher "
          "makes the sky a stronger light source for the rest of the scene.",
          Group::Sky, 0.0f, 10.0f, 0.1f),
-    Whole(&GFX_REMIX_SKY_AUTO_FRAMES,
+    Whole(&GFX_REMIX_SKY_AUTO_FRAMES, "Frames before classifying a skybox",
           "How many frames in a row a surface has to look like a skybox before it is accepted as "
           "one. Higher is slower to react but less likely to misfire. The decision sticks for the "
           "rest of the session, because a flickering sky would be worse than a late one.",
           Group::Sky, 1.0f, 600.0f),
-    Real(&GFX_REMIX_SKY_AUTO_MIN_EXTENT,
+    Real(&GFX_REMIX_SKY_AUTO_MIN_EXTENT, "Minimum skybox size",
          "Smallest a surface may be, as a fraction of the view distance, and still count as a "
          "skybox. It exists to reject camera-mounted view models. A GameCube skybox is a modest "
          "dome near the camera - 0.09 to 0.16 of the view distance in Wind Waker - and NOT "
          "geometry scaled out to the far plane, so at 0.25 this gate alone rejects every real "
          "skybox.",
          Group::Sky, 0.0f, 1.0f, 0.01f),
-    Text(&GFX_REMIX_SKY_TEXTURES,
+    Text(&GFX_REMIX_SKY_TEXTURES, "Manual skybox hashes",
          "Comma-separated texture hashes, as printed in dolphin.log (for example "
          "0x8b1d0f1752d9a3c1), whose draws are the skybox. Use this when auto-detection cannot see "
          "it. Explicit hashes beat the runtime's own texture tagging, which never reaches draws "
          "submitted through the Remix API.",
          Group::Sky),
-    Text(&GFX_REMIX_SKY_VETO_HASHES,
+    Text(&GFX_REMIX_SKY_VETO_HASHES, "Never-a-skybox hashes",
          "Comma-separated hashes - texture or mesh - that must never be treated as sky, for when "
          "the detector is wrong about something. Highest precedence: a veto beats the manual list, "
          "which beats auto-detection.",
          Group::Sky),
-    Toggle(&GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE,
+    Toggle(&GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE, "Remove untextured sky domes",
            "Only consulted when RemixSkyAutoDetect is set to tag. Untextured sky is removed from "
            "the scene outright rather than marked as sky. Four of Wind Waker's seven sky meshes "
            "have no texture at all, and such a dome left in place is a closed shell around the "
            "viewer that blocks a sky mod's sun - which reads as a dark scene rather than as a sky "
            "problem.",
            Group::Sky),
-    Choice(&GFX_REMIX_SKY_MODE,
+    Choice(&GFX_REMIX_SKY_MODE, "Manual skybox handling",
            "Superseded legacy sky heuristic based on depth-buffer state. Best left off: in Wind "
            "Waker it matched 41 to 88 draws a frame and never the actual dome, which is "
            "depth-tested. Use RemixSkyAutoDetect instead.",
            Group::Sky, SKY_MODE_CHOICES),
 
     // GX semantics.
-    Toggle(&GFX_REMIX_GX_COLOR,
+    Toggle(&GFX_REMIX_GX_COLOR, "Material and vertex colour",
            "Read each draw's material and ambient colour registers, so surfaces the game tints "
            "keep that tint. Off drops register tints outright, and the vertex colour reaches the "
            "renderer with nothing reading it.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_TEV_COLOR,
+    Toggle(&GFX_REMIX_GX_TEV_COLOR, "Resolve colour through the TEV chain",
            "Evaluate the game's colour-combining chain and fold the result into the vertex "
            "colours. GameCube titles keep a surface's palette in combiner REGISTERS and use the "
            "vertex colour only as the blend weight between two of them, so without this a "
            "register-coloured surface comes out greyscale or white. This is what fixed Wind "
            "Waker's white ocean and sky.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_TEXTURE_STAGE,
+    Toggle(&GFX_REMIX_GX_TEXTURE_STAGE, "Sample from any texture stage",
            "Take the surface texture from whichever combiner stage actually samples one, for draws "
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_RAS_CHANNEL,
+    Toggle(&GFX_REMIX_GX_RAS_CHANNEL, "Per-stage colour channel (world)",
            "Take the vertex colour channel from the combiner stage that actually uses it rather "
            "than from stage 0. The console names that channel per stage, and the stage that reads "
            "it is routinely not the first one. World geometry only; the 2D equivalent is "
            "RemixUiRasChannel.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_TEXGEN,
+    Toggle(&GFX_REMIX_GX_TEXGEN, "Texture coordinate generation",
            "Run the game's texture-coordinate generation instead of passing raw vertex coordinates "
            "through. This is how every scrolling and animated texture on the console works, and "
            "they are frozen without it.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_BLEND,
+    Toggle(&GFX_REMIX_GX_BLEND, "Blend mode translation",
            "Translate the game's blend settings so the runtime can classify transparency. Without "
            "it, fire, glows, light shafts, windows and water are all submitted as opaque geometry "
            "that also casts full shadows.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_LIGHT_FIX,
+    Toggle(&GFX_REMIX_GX_LIGHT_FIX, "GameCube light translation",
            "Translate the game's lights the way the console's own renderer reads them: the "
            "spotlight cone pointed the right way (the raw data points at the light, not away from "
            "it), a real soft cone edge, and brightness derived the way the Remix runtime does it "
            "rather than from the raw 0-1 colour, which is roughly a hundred times too dim.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_LIGHT_NO_FALLOFF_DISTANT,
+    Toggle(&GFX_REMIX_GX_LIGHT_NO_FALLOFF_DISTANT, "Treat falloff-free lights as suns",
            "Treat a light with neither distance nor angle falloff as a distant sun rather than a "
            "light bulb. GameCube hardware has no directional light type, so a sun is an ordinary "
            "light parked very far away with falloff switched off. Sending that as a point light "
            "applies an inverse-square law the console never applied, so it contributes nothing "
            "while still counting as 'a light exists'.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_GX_LIGHT_DROP_DISTANT,
+    Toggle(&GFX_REMIX_GX_LIGHT_DROP_DISTANT, "Drop the game's directional lights",
            "Throw away the game's own sun so a sky or atmosphere mod owns the key light. Two suns "
            "double up: the scene reads far too bright and the game's flat white fights the mod's "
            "sun. Local lights - lamps, glows, cone lights - are kept. Off by default, because with "
            "no sky mod loaded this removes the scene's only key light.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_FALLBACK_LIGHT,
+    Toggle(&GFX_REMIX_FALLBACK_LIGHT, "Fallback light for unlit scenes",
            "Add one distant light on frames where the game submitted no lights at all. Many "
            "GameCube titles bake their lighting into vertex colours and enable no real lights, "
            "which would leave the path tracer nothing to integrate. Turn it off whenever a sky mod "
@@ -988,20 +990,20 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "rtx.fallbackLightMode - there are three separate things that can put a distant light "
            "in a scene.",
            Group::GxSemantics),
-    Toggle(&GFX_REMIX_WORLD_SCISSOR_SKIP,
+    Toggle(&GFX_REMIX_WORLD_SCISSOR_SKIP, "Skip fully scissored draws",
            "Skip world geometry the game has clipped away to nothing. Only the completely-empty "
            "case is acted on, deliberately: a path tracer has no screen-space clipping, so a draw "
            "the clip merely trims is submitted whole.",
            Group::GxSemantics),
 
     // Projection and viewport.
-    Toggle(&GFX_REMIX_PROJECTION_FIX,
+    Toggle(&GFX_REMIX_PROJECTION_FIX, "Per-draw projection correction",
            "Correct for the game changing its projection partway through a frame. Remix takes one "
            "camera per frame, but the console sets projection per draw, so each draw's difference "
            "from the frame's reference is folded into its position. A dropped off-centre term "
            "looks almost exactly like a small camera rotation.",
            Group::ProjectionViewport),
-    Toggle(&GFX_REMIX_VIEWPORT_FIX,
+    Toggle(&GFX_REMIX_VIEWPORT_FIX, "Per-draw viewport correction",
            "The same correction for the screen rectangle a draw targets. Without it a "
            "picture-in-picture panel or an F-Zero GX position-ladder portrait is rendered through "
            "the full-screen rectangle and lands in the middle of the world. Inert while "
@@ -1010,106 +1012,106 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            Group::ProjectionViewport),
 
     // UI overlay.
-    Choice(&GFX_REMIX_UI_MODE,
+    Choice(&GFX_REMIX_UI_MODE, "2D and HUD handling",
            "What to do with the game's 2D layer: HUD, menus, every flat screen. 'Drop' removes it "
            "entirely. 'Screen overlay' draws it in software and composites it over the finished "
            "image, which is what looks like a normal UI. 'World-space plane' puts it inside the "
            "traced world, where it is genuinely lit and denoised - a look experiment that swims "
            "whenever the camera moves.",
            Group::UiOverlay, UI_MODE_CHOICES, Liveness::Live),
-    Real(&GFX_REMIX_UI_OVERLAY_SCALE,
+    Real(&GFX_REMIX_UI_OVERLAY_SCALE, "Overlay resolution",
          "Fraction of the window the 2D overlay is drawn at. The main UI performance lever: the "
          "overlay is rasterized on the CPU and is fill-rate bound, so 0.5 quarters its cost. At "
          "1.0 it costs 3 to 9 ms a frame on Wind Waker's busiest 2D screens. GameCube UI is "
          "authored for a 640x528 framebuffer, so there is little real detail to lose on a large "
          "window.",
          Group::UiOverlay, 0.1f, 1.0f, 0.05f),
-    Toggle(&GFX_REMIX_UI_SCALE_TO_XFB,
+    Toggle(&GFX_REMIX_UI_SCALE_TO_XFB, "Scale the overlay to the presented image",
            "Stretch the overlay over the region the console actually presents rather than over the "
            "whole internal framebuffer. Wind Waker presents 480 rows rather than 528, so the old "
            "mapping squeezed the entire HUD into the top 91% of the window and left the bottom "
            "empty.",
            Group::UiOverlay),
-    Toggle(&GFX_REMIX_UI_RAS_CHANNEL,
+    Toggle(&GFX_REMIX_UI_RAS_CHANNEL, "Per-stage colour channel (2D)",
            "The per-stage vertex-colour rule described under RemixGxRasChannel, applied to 2D "
            "draws. This is what removes Wind Waker's leaked title-screen HUD. Not settled: the "
            "same change may also suppress legitimate UI, so check a frame that contains PRESS "
            "START before trusting it.",
            Group::UiOverlay),
-    Toggle(&GFX_REMIX_UI_DROP_DST_ALPHA,
+    Toggle(&GFX_REMIX_UI_DROP_DST_ALPHA, "Drop destination-alpha blends",
            "Skip 2D draws that blend against what is already on screen. The overlay is composited "
            "over an already-finished image, so there is nothing for such a draw to read; letting "
            "it fall through to ordinary blending paints an opaque wash over the whole screen, "
            "which is Wind Waker's title-screen glare pass. Narrow on purpose - ordinary fades are "
            "untouched.",
            Group::UiOverlay),
-    Toggle(&GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES,
+    Toggle(&GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES, "Drop draws reading copied framebuffers",
            "Skip 2D draws textured from memory the game filled with a framebuffer copy. This "
            "backend does not carry out most of those copies, so that memory holds stale bytes that "
            "still decode into a valid-looking texture. Measured a no-op on Wind Waker, hence off; "
            "the risk is that a game legitimately composing its menu this way loses the menu.",
            Group::UiOverlay),
-    Toggle(&GFX_REMIX_UI_DROP_PRE_WORLD_BLANK,
+    Toggle(&GFX_REMIX_UI_DROP_PRE_WORLD_BLANK, "Drop framebuffer-clear rectangles",
            "Drop untextured 2D draws that arrive before any world geometry in the frame. Those are "
            "screen clears, not UI: the console draws the scene over them, but this backend "
            "composites 2D ON TOP of the traced image, so they land over everything and paint the "
            "screen flat. This is the SpongeBob white-box fix. Genuine UI is textured, so it is "
            "unaffected.",
            Group::UiOverlay),
-    Real(&GFX_REMIX_WORLD_UI_DISTANCE,
+    Real(&GFX_REMIX_WORLD_UI_DISTANCE, "World-space HUD distance",
          "World-space UI mode only. How far in front of the camera the UI plane sits, in game "
          "units. Just past the near plane by default, so world geometry cannot poke through the "
          "HUD. The plane scales with distance, so its apparent size does not change.",
          Group::UiOverlay, 0.1f, 20.0f, 0.1f, Liveness::RequiresRestart, Maturity::Experimental),
-    Toggle(&GFX_REMIX_WORLD_UI_FLIP_Y,
+    Toggle(&GFX_REMIX_WORLD_UI_FLIP_Y, "Flip the world-space HUD vertically",
            "World-space UI mode only. Flip the UI plane vertically. The default should be right; "
            "this exists so that an upside-down HUD does not cost a rebuild to test.",
            Group::UiOverlay, Liveness::RequiresRestart, Maturity::Experimental),
 
     // EFB emulation.
-    Toggle(&GFX_REMIX_EFB_EMULATION,
+    Toggle(&GFX_REMIX_EFB_EMULATION, "Framebuffer copy handling",
            "Keep a real CPU-side copy of the console's framebuffer, so screen clears, CPU reads "
            "and CPU writes all work and a classified subset of the game's framebuffer copies can "
            "be carried out. Off is the pre-feature behaviour in every particular: reads return "
            "zero, writes and clears do nothing, every copy counter reads zero.",
            Group::Efb),
-    Toggle(&GFX_REMIX_EFB_COPY_2D,
+    Toggle(&GFX_REMIX_EFB_COPY_2D, "Execute 2D-only copies",
            "Carry out framebuffer copies taken before any 3D geometry was drawn this frame. This "
            "is the one class whose contents this backend holds exactly, by construction - "
            "render-to-texture menus, title screens, composed text windows. The only copy class on "
            "by default, and the only default here that changes behaviour.",
            Group::Efb),
-    Toggle(&GFX_REMIX_EFB_COPY_SCENE,
+    Toggle(&GFX_REMIX_EFB_COPY_SCENE, "Execute copies containing 3D",
            "Carry out framebuffer copies taken after 3D geometry was drawn this frame. Off by "
            "default because the copied region very likely holds world pixels, which this backend "
            "never rasterizes, so carrying it out hands the game a flat clear-coloured rectangle "
            "where the console had the scene. Turn it on for a game that draws the world early and "
            "then composes a genuine 2D element by copy later in the same frame.",
            Group::Efb, Liveness::RequiresRestart, Maturity::Experimental),
-    Toggle(&GFX_REMIX_EFB_COPY_DEPTH,
+    Toggle(&GFX_REMIX_EFB_COPY_DEPTH, "Execute depth copies",
            "Carry out depth-buffer copies, which are almost always shadow maps. Off because the "
            "path tracer casts real shadows, and because this backend's depth plane holds only the "
            "clear value - so carrying one out would hand the game a uniform depth map, i.e. a "
            "full-screen wrong shadow test, which is worse than its absence.",
            Group::Efb, Liveness::RequiresRestart, Maturity::Experimental),
-    Toggle(&GFX_REMIX_EFB_COPY_INTENSITY,
+    Toggle(&GFX_REMIX_EFB_COPY_INTENSITY, "Execute intensity copies",
            "Carry out brightness-extraction copies, which is what a bloom or glow chain opens "
            "with. Off because the runtime does its own bloom, and feeding the game's chain a flat "
            "clear-brightness only blends a uniform wash back over the screen. Turn it on if a game "
            "uses one as a legitimate 2D mask.",
            Group::Efb, Liveness::RequiresRestart, Maturity::Experimental),
-    Toggle(&GFX_REMIX_EFB_XFB_ENCODE,
+    Toggle(&GFX_REMIX_EFB_XFB_ENCODE, "Execute presentation copies",
            "Carry out the frame's presentation copy. Off: the Remix runtime produces and presents "
            "the picture, nothing here consumes this copy, and it is the only recurring "
            "full-width per-frame cost in the whole feature. Turning it on does NOT wire Dolphin's "
            "screenshot or video-dump pipeline to Remix frames.",
            Group::Efb, Liveness::RequiresRestart, Maturity::Experimental),
-    Toggle(&GFX_REMIX_EFB_UI_COMPOSE,
+    Toggle(&GFX_REMIX_EFB_UI_COMPOSE, "Include the 2D layer in copies",
            "Draw the frame's 2D layer into the framebuffer before a copy is carried out. Without "
            "it, a carried-out copy records bare clear colour - correct, but empty. Costs nothing "
            "on a frame whose copies are all discarded, because it runs only on the execute path.",
            Group::Efb),
-    Toggle(&GFX_REMIX_EFB_SKIP_DISCARDED_TEX,
+    Toggle(&GFX_REMIX_EFB_SKIP_DISCARDED_TEX, "Skip draws reading discarded copies",
            "Skip draws that read from a framebuffer copy this backend discarded. A discarded copy "
            "leaves zeroes behind, and zero bytes decode into a perfectly valid blank texture, so "
            "nothing else refuses the draw and it renders as a blank rectangle over the traced "
@@ -1118,41 +1120,41 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            Group::Efb),
 
     // Diagnostics.
-    Toggle(&GFX_REMIX_LOG_STATS,
+    Toggle(&GFX_REMIX_LOG_STATS, "Per-frame statistics in the log",
            "Print one statistics line per frame to dolphin.log: draw classification, mesh and "
            "instance counts, colour routes, lights, UI and sky. The primary instrument for "
            "everything else here. It needs Logger.ini to have Video = True, Verbosity = 4 and "
            "WriteToFile = True, or the line goes nowhere. The log APPENDS across runs, so delete "
            "it before a run you intend to read.",
            Group::Diagnostics, Liveness::Live, Maturity::Diagnostic),
-    Toggle(&GFX_REMIX_TRACE_COLORS,
+    Toggle(&GFX_REMIX_TRACE_COLORS, "Trace colour resolution",
            "Print, per draw, where a world surface's colour comes from: the combiner chain, both "
            "channels' lighting state, the resolved arguments and the raw vertex colour bytes. "
            "Heavy - hundreds of lines on each traced frame. Turn it on to answer 'why is this "
            "vertex-coloured surface white', which the frame counters cannot.",
            Group::Diagnostics, Liveness::Live, Maturity::Diagnostic),
-    Toggle(&GFX_REMIX_DEBUG_COLOR_ROUTES,
+    Toggle(&GFX_REMIX_DEBUG_COLOR_ROUTES, "Paint draws by colour route",
            "Paint every world surface a flat colour naming which colour path it took: red for "
            "vertex colour with the combiner chain folded in, magenta for vertex colour without, "
            "blue for a register tint, green for no colour at all. The counters say how many draws "
            "took each route; this says which PIXELS, which is usually the actual question.",
            Group::Diagnostics, Liveness::RequiresRestart, Maturity::Diagnostic),
-    Toggle(&GFX_REMIX_TRACE_PROJECTIONS,
+    Toggle(&GFX_REMIX_TRACE_PROJECTIONS, "Trace projections",
            "Print every distinct projection seen in a frame. The per-frame summary already reports "
            "these whenever there is more than one, so this is only needed to watch a projection "
            "change live.",
            Group::Diagnostics, Liveness::Live, Maturity::Diagnostic),
-    Toggle(&GFX_REMIX_TRACE_MODELVIEWS,
+    Toggle(&GFX_REMIX_TRACE_MODELVIEWS, "Trace modelview matrices",
            "Print the per-frame histogram of object transforms - which matrix the most distinct "
            "meshes share, i.e. the camera candidate. This is also where RemixCameraFromModelview "
            "reads the camera from, so it is forced on while that option is enabled.",
            Group::Diagnostics, Liveness::Live, Maturity::Diagnostic),
-    Toggle(&GFX_REMIX_TRACE_EFB_COPIES,
+    Toggle(&GFX_REMIX_TRACE_EFB_COPIES, "Trace framebuffer copies",
            "Print every framebuffer copy's rectangle, destination and classification, plus each 2D "
            "draw's footprint. That line names every input the decision used, which is what makes a "
            "misclassified copy diagnosable instead of mysterious.",
            Group::Diagnostics, Liveness::Live, Maturity::Diagnostic),
-    Whole(&GFX_REMIX_UI_DUMP_FRAME,
+    Whole(&GFX_REMIX_UI_DUMP_FRAME, "Dump the overlay on frame",
           "Non-zero writes the composited 2D overlay at that frame number to "
           "Logs/remix-ui-overlay.bmp, once, drawn over a checkerboard so transparent and black can "
           "be told apart. The only way to see what the overlay actually produced without trusting "

@@ -50,14 +50,23 @@ constexpr GroupTitle GROUP_TITLES[] = {
     {Group::Diagnostics, QT_TR_NOOP("Diagnostics")},
 };
 
-// The label text IS the INI key, deliberately: it is an identifier, it is what
-// GFX.ini and every log line call the option, and taking it from the Location
-// means a renamed key can never leave a stale label behind. For the same reason
-// it is never run through tr().
+// The INI key. It is not the visible label - the key names are abbreviations
+// that only read clearly once you already know the backend - but it is shown as
+// the title of every option's tooltip, so anything on screen can still be
+// matched to GFX.ini, to a log line or to a bug report. Taken from the Location
+// rather than stored, so a renamed key cannot leave a stale copy behind, and
+// never run through tr(): it is an identifier.
 QString SettingKey(const Config::RemixSettingMeta& meta)
 {
   return std::visit([](const auto* info) { return QString::fromStdString(info->GetLocation().key); },
                     meta.setting);
+}
+
+// The visible label: a short descriptive phrase from the metadata table.
+// Untranslated for the same reason as the tooltips below.
+QString SettingLabel(const Config::RemixSettingMeta& meta)
+{
+  return QString::fromUtf8(meta.label);
 }
 
 // Tooltips are untranslated too - they live in Core, which has no access to
@@ -71,6 +80,13 @@ QString SettingTooltip(const Config::RemixSettingMeta& meta)
   if (meta.liveness == Liveness::RequiresRestart)
     text += QStringLiteral("<br><br>Takes effect when a game starts - restart the game to apply.");
   return text;
+}
+
+// Ordinary Qt tooltips have no title line of their own, so the ones that do not
+// go through a BalloonTip have to carry the INI key in the body instead.
+QString PlainSettingTooltip(const Config::RemixSettingMeta& meta)
+{
+  return QStringLiteral("<b>%1</b><br><br>%2").arg(SettingKey(meta), SettingTooltip(meta));
 }
 }  // namespace
 
@@ -92,9 +108,10 @@ void RemixWidget::CreateWidgets()
   auto* const main_layout = new QVBoxLayout;
 
   auto* const status = new QLabel(
-      tr("Options for the Remix video backend. Every label is the exact GFX.ini key name. "
-         "Right-click a per-game value to clear it. Greyed-out options are read once when the "
-         "backend starts, so they apply after the game is restarted."));
+      tr("Options for the Remix video backend. Hover an option to see what it does and which "
+         "GFX.ini key it is; the filter matches key names too. Right-click a per-game value to "
+         "clear it. Greyed-out options are read once when the backend starts, so they apply "
+         "after the game is restarted."));
   status->setWordWrap(true);
   main_layout->addWidget(status);
 
@@ -168,15 +185,17 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
                              const Config::RemixSettingMeta& meta)
 {
   const QString key = SettingKey(meta);
+  const QString text = SettingLabel(meta);
   const QString tooltip = SettingTooltip(meta);
+  const QString plain_tooltip = PlainSettingTooltip(meta);
 
   QWidget* label = nullptr;
   QWidget* control = nullptr;
 
   if (const auto* const* bool_setting = std::get_if<const Config::Info<bool>*>(&meta.setting))
   {
-    // The checkbox carries the key name itself, so no separate label row.
-    auto* const check = new ConfigBool(key, **bool_setting, m_game_layer);
+    // The checkbox carries its own text, so no separate label row.
+    auto* const check = new ConfigBool(text, **bool_setting, m_game_layer);
     check->SetTitle(key);
     check->SetDescription(tooltip);
     control = check;
@@ -193,7 +212,7 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
       auto* const combo = new ConfigChoice(options, **int_setting, m_game_layer);
       combo->SetTitle(key);
       combo->SetDescription(tooltip);
-      label = new QLabel(key);
+      label = new QLabel(text);
       control = combo;
     }
     else
@@ -202,7 +221,7 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
                                            **int_setting, m_game_layer);
       spin->SetTitle(key);
       spin->SetDescription(tooltip);
-      label = new ConfigIntegerLabel(key, spin);
+      label = new ConfigIntegerLabel(text, spin);
       control = spin;
     }
   }
@@ -213,7 +232,7 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
         new ConfigFloatSlider(meta.min, meta.max, **float_setting, meta.step, m_game_layer);
     slider->SetTitle(key);
     slider->SetDescription(tooltip);
-    label = new ConfigFloatLabel(key, slider);
+    label = new ConfigFloatLabel(text, slider);
     control = slider;
   }
   else if (const auto* const* string_setting =
@@ -222,8 +241,8 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
     // ConfigText is a QLineEdit rather than a ToolTipWidget, so it gets an
     // ordinary tooltip instead of a balloon.
     auto* const edit = new ConfigText(**string_setting, m_game_layer);
-    edit->setToolTip(tooltip);
-    label = new QLabel(key);
+    edit->setToolTip(plain_tooltip);
+    label = new QLabel(text);
     control = edit;
   }
   else
@@ -235,11 +254,13 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
 
   if (label != nullptr)
   {
-    label->setToolTip(tooltip);
+    label->setToolTip(plain_tooltip);
     form->addRow(label, control);
   }
 
-  m_rows.push_back({form, box, label, control, &meta, (key + tooltip).toLower(), true});
+  // The filter matches the key too, so someone reading a log line or an existing
+  // GFX.ini can paste "RemixSkyEmissive" straight in and land on the option.
+  m_rows.push_back({form, box, label, control, &meta, (key + text + tooltip).toLower(), true});
 }
 
 void RemixWidget::OnBackendChanged(const QString& backend_name)

@@ -122,9 +122,16 @@ struct RemixSettingMeta
   // (combo when `choices` is non-empty), float -> slider, string -> line edit.
   std::variant<const Info<bool>*, const Info<int>*, const Info<float>*, const Info<std::string>*>
       setting;
-  // Plain, untranslated help text. Knob names are INI identifiers that must not
-  // be translated, and Core strings cannot go through Qt's translation
-  // pipeline, so the whole tab is deliberately English-only.
+  // What the GUI calls this option. A short descriptive phrase rather than the
+  // INI key, because the key names are abbreviations that only mean something
+  // once you already know the backend. The key is still shown, as the title of
+  // the option's tooltip, so anything on screen can still be found in GFX.ini,
+  // in a log line or in a bug report.
+  const char* label;
+  // Plain, untranslated help text. Labels and knob names live in Core, which
+  // cannot reach Qt's translation pipeline, so the whole tab is deliberately
+  // English-only; knob names are INI identifiers and must never be translated
+  // in any case.
   const char* tooltip;
   Group group;
   Liveness liveness;
