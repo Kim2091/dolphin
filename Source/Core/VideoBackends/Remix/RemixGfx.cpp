@@ -13,7 +13,7 @@
 #include "VideoBackends/Software/EfbCopy.h"
 #include "VideoBackends/Software/SWEfbInterface.h"
 
-#include "Core/Config/GraphicsSettings.h"
+#include "Core/Config/RemixSettings.h"
 
 #include "VideoCommon/AbstractPipeline.h"
 #include "VideoCommon/AbstractShader.h"

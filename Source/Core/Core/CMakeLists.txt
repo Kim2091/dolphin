@@ -35,6 +35,8 @@ add_library(core
   Config/MainSettings.h
   Config/NetplaySettings.cpp
   Config/NetplaySettings.h
+  Config/RemixSettings.cpp
+  Config/RemixSettings.h
   Config/SessionSettings.cpp
   Config/SessionSettings.h
   Config/SYSCONFSettings.cpp

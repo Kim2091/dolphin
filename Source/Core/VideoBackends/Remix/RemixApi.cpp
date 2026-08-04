@@ -24,7 +24,7 @@
 #include "Common/StringUtil.h"
 #include "Common/WindowSystemInfo.h"
 
-#include "Core/Config/GraphicsSettings.h"
+#include "Core/Config/RemixSettings.h"
 
 #include "VideoBackends/Remix/RemixTexture.h"
 // For RemixEFBInterface::DrainAccessCounters and the shared store's colour

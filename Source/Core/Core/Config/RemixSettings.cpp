@@ -1,0 +1,736 @@
+// Copyright 2026 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "Core/Config/RemixSettings.h"
+
+namespace Config
+{
+// Remix video backend. RemixDllPath is passed straight to LoadLibrary, so the
+// bare name resolves next to Dolphin.exe; RemixSceneScale is pushed to the
+// runtime as rtx.sceneScale (centimetres per GC world unit) and RemixLightScale
+// multiplies the radiance derived from XF lights.
+const Info<std::string> GFX_REMIX_DLL_PATH{{System::GFX, "Settings", "RemixDllPath"}, "d3d9.dll"};
+const Info<float> GFX_REMIX_SCENE_SCALE{{System::GFX, "Settings", "RemixSceneScale"}, 1.0f};
+const Info<float> GFX_REMIX_LIGHT_SCALE{{System::GFX, "Settings", "RemixLightScale"}, 1.0f};
+const Info<bool> GFX_REMIX_LOG_STATS{{System::GFX, "Settings", "RemixLogStats"}, true};
+// What to do with draws the sky heuristic matches:
+//   0 = nothing (submit them as ordinary world geometry)
+//   1 = tag REMIXAPI_INSTANCE_CATEGORY_BIT_SKY
+//   2 = drop them entirely, leaving clear sky for Remix's own atmosphere
+// 2 exists because tagging alone still hands Remix geometry to render as the
+// skybox, which can occlude a replacement atmosphere just as the raw draw did.
+const Info<int> GFX_REMIX_SKY_MODE{{System::GFX, "Settings", "RemixSkyMode"}, 0};
+// Comma-separated stage-0 texture hashes (as logged by the Remix backend, e.g.
+// "0x8b1d0f1752d9a3c1,0x…") whose draws are the skybox. Explicit hashes beat a
+// depth-state heuristic: the runtime's own texture-grid categories cannot reach
+// API-submitted draws, because cameraType is frozen from the instance's API
+// category flags before the grid's texture-category lookup ever runs. Passing
+// the SKY bit ourselves is the path that does work.
+const Info<std::string> GFX_REMIX_SKY_TEXTURES{{System::GFX, "Settings", "RemixSkyTextures"}, ""};
+// Remix takes one camera per frame, but GX projection state is per draw and
+// Dolphin flushes the batch whenever it changes. Folding each draw's projection
+// difference into its instance transform is what keeps mid-frame projection
+// switches - and the off-centre raw[1]/raw[3] shear terms, which the
+// parameterized camera cannot express at all - from moving geometry on screen.
+// Off is the pre-fix behaviour: first perspective projection of the frame wins
+// and every other draw is rendered through it.
+const Info<bool> GFX_REMIX_PROJECTION_FIX{{System::GFX, "Settings", "RemixProjectionFix"}, true};
+// The same problem one step further out. GX maps clip space to the EFB per draw
+// through xfmem.viewport - screen.x = (clip.x/clip.w)*wd + xOrig
+// (Clipper.cpp:553-554) - so a game that renders a picture-in-picture panel or a
+// position ladder gives those draws their own small screen rect. Remix's one
+// camera renders the reference draw's rect, so folding the difference between
+// the two rects into the instance transform is what puts such a draw in its own
+// corner of the screen instead of in the middle of the world. It rides the same
+// affine correction as the projection fold and reduces to it exactly when the
+// rects match, so a game that never moves its viewport is bit-identical either
+// way.
+//
+// Off is the pre-fix behaviour: the world path reads xfmem.viewport for the
+// face-winding sign and nothing else, and every sub-screen draw is rendered
+// full-screen. Split screens stay wrong with it either way - a second view
+// carries a second view matrix, which one camera cannot express no matter where
+// the geometry is folded.
+const Info<bool> GFX_REMIX_VIEWPORT_FIX{{System::GFX, "Settings", "RemixViewportFix"}, true};
+// Log every distinct projection seen per frame, every frame. The per-frame
+// summary already reports variants whenever there is more than one (or any
+// off-centre term), so this is only needed to watch a projection change live.
+const Info<bool> GFX_REMIX_TRACE_PROJECTIONS{
+    {System::GFX, "Settings", "RemixTraceProjections"}, false};
+// Histogram every draw's modelview by VALUE and report the one shared by the
+// most distinct meshes. Pure instrument: nothing reads the result.
+//
+// It exists to answer one question. GX has no view matrix, so the backend
+// ESTIMATES one from inter-frame deltas - but a modelview is V*M, and for any
+// object whose model transform is the identity that product IS V. World-authored
+// geometry (terrain, rooms, the sea) is very often drawn exactly that way, so V
+// is probably sitting in xfmem.posMatrices as a literal value and the only real
+// question is which slot. A histogram answers it from every draw in the frame,
+// where the estimator votes with the few dozen meshes that happen to persist.
+//
+// The dominant value alone is not proof - a room full of props drawn in one
+// room-local space would also dominate - so the log line carries the two checks
+// that separate the cases: whether the value is RIGID (a view matrix carries no
+// model scale), and what fraction of objects hold still when it is used as the
+// camera, measured against the estimator's own number on the same objects.
+const Info<bool> GFX_REMIX_TRACE_MODELVIEWS{
+    {System::GFX, "Settings", "RemixTraceModelviews"}, true};
+// Take the camera from the histogram's dominant modelview instead of estimating
+// it from inter-frame deltas. Needs RemixCameraRecovery on; off restores the
+// estimator exactly, so the two are a clean A/B.
+//
+// The estimator's problem was never its consensus rule, it was its evidence: it
+// votes with the few dozen meshes that persist across a frame boundary AND clear
+// a vertex floor, and when that electorate goes bad it invents camera motion out
+// of nothing - measured on Wind Waker at 0.66-1.25 deg/frame and hundreds of
+// units of translation across 90 frames during which the game's own view matrix
+// did not change to four decimal places. Every instance carries V^-1, so that
+// error swings the entire world around the viewer.
+//
+// This reads the answer instead. For an object drawn with an identity model
+// transform the combined modelview IS the view matrix, and Wind Waker puts it in
+// posMatrices slot 0 on every frame measured, rigid, shared by 160-293 meshes
+// against a runner-up of 14. A gate (mesh count, 2x dominance, rigidity) decides
+// per frame whether to believe it; a miss holds the previous pose.
+const Info<bool> GFX_REMIX_CAMERA_FROM_MODELVIEW{
+    {System::GFX, "Settings", "RemixCameraFromModelview"}, true};
+// How orthographic draws - HUD, menus, every 2D screen - are handled.
+//   0 = dropped. What v1 did, and why the path-traced output had no 2D in it.
+//   1 = software-rasterized into a screen overlay, composited at present. (default)
+//   2 = submitted as world-space geometry on a plane in front of the camera.
+//
+// Mode 1 is what looks like a normal UI, because it IS one: the pixels are drawn
+// by a small software rasterizer (RemixUiRaster) and handed to
+// remixapi_DrawScreenOverlay, which the runtime composites after the frame is
+// traced and denoised. Nothing about the UI touches the path tracer.
+//
+// Mode 2 was the first attempt and is kept only because it does something mode 1
+// cannot - it puts the UI inside the traced world, where it can light the scene
+// and be viewed at an angle. It is NOT passthrough: the runtime treats it as
+// geometry, so it is denoised, and being welded to the camera it swims whenever
+// the view moves. REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI patches the material
+// to emissive-from-albedo (rtx_instance_manager.cpp:1116-1123) so at least it is
+// unlit, but that does not make it a HUD.
+const Info<int> GFX_REMIX_UI_MODE{{System::GFX, "Settings", "RemixUiMode"}, 1};
+// Resolution of the mode-1 overlay, as a fraction of the render window. The
+// rasterizer is fill-rate bound and this is the only lever with a linear effect
+// on its cost: halving it quarters the pixels.
+//
+// 1.0 costs 3-9 ms a frame on Wind Waker's busiest 2D screens even threaded,
+// which is most of a 60 Hz budget, so this is the knob to reach for on a slow
+// machine. The runtime scales the overlay to the output when compositing, so the
+// only cost is sharpness - and GC UI is authored for a 640x528 framebuffer, so
+// there is not much real detail to lose below 1.0 on a high-resolution window.
+const Info<float> GFX_REMIX_UI_OVERLAY_SCALE{{System::GFX, "Settings", "RemixUiOverlayScale"},
+                                             1.0f};
+// Non-zero writes the composited UI overlay at that frame index to
+// Logs/remix-ui-overlay.bmp, once, over a checkerboard so transparent and black
+// are distinguishable. Diagnostic only - it is the only way to see what this
+// backend actually produced without trusting the screen.
+const Info<int> GFX_REMIX_UI_DUMP_FRAME{{System::GFX, "Settings", "RemixUiDumpFrame"}, 0};
+// Mode 2 only. The mapping from a draw's screen space onto the plane is exactly
+// affine, so it rides the INSTANCE transform rather than being baked into
+// vertices, which keeps one mesh handle per UI element instead of re-hashing it
+// every time the camera moves:
+//   ndc = (raw0*x + raw1, raw2*y + raw3, raw4*z + raw5)   [w = 1]
+// and a point at that ndc, distance d along the camera's forward, is
+//   C + F*d + R*(ndc.x * d*tan(fovY/2)*aspect) + U*(ndc.y * d*tan(fovY/2))
+// which composes with the draw's own modelview into a single 3x4.
+//
+// How far in front of the camera that plane sits, in game units. Just past the
+// near plane by default: the game guarantees nothing it draws is nearer than
+// that, so world geometry cannot poke through the HUD. Raise it only if the UI
+// is being occluded; the plane scales with distance so its apparent size does
+// not change.
+const Info<float> GFX_REMIX_WORLD_UI_DISTANCE{{System::GFX, "Settings", "RemixWorldUiDistance"},
+                                              2.0f};
+// Mirror the UI vertically. GX ndc y points up (Dolphin's vertex shader negates
+// it on the way out, for APIs whose y points down - VertexShaderGen.cpp:876), so
+// the default should be right. This exists because an upside-down HUD is a
+// one-bit mistake that otherwise costs a rebuild to test.
+const Info<bool> GFX_REMIX_WORLD_UI_FLIP_Y{{System::GFX, "Settings", "RemixWorldUiFlipY"}, false};
+// GX has no view matrix - posMatrices are combined object-to-view - so by
+// default the backend submits an identity camera and lets instances carry the
+// modelview, making Remix's world space the same thing as camera space. That
+// costs every temporal feature: motion vectors are meaningless and RTXDI /
+// ReSTIR / the denoiser all see the whole world move whenever the camera does.
+// Enabling this recovers a real camera from inter-frame modelview deltas so
+// world space holds still. Off is byte-identical to the identity-view path.
+const Info<bool> GFX_REMIX_CAMERA_RECOVERY{{System::GFX, "Settings", "RemixCameraRecovery"},
+                                           false};
+// Resolve what TEV stage 0 actually rasterizes as its colour - the channel named
+// by tevorders, and either the vertex colour or the xfmem.matColor register
+// depending on that channel's material source - and hand it to Remix as a
+// texture-stage argument so it modulates albedo. Off leaves the runtime at its
+// defaults, where the vertex colour reaches the geometry buffer but nothing ever
+// reads it and a register tint is lost outright.
+const Info<bool> GFX_REMIX_GX_COLOR{{System::GFX, "Settings", "RemixGxColor"}, true};
+// Run GX texture coordinate generation instead of passing vertex attribute 0
+// through raw: the texgen slot TEV stage 0 actually samples, its source row, and
+// the xfmem texture matrix - which is how every scrolling or animated texture on
+// the console works, and is frozen without this. Off is the raw passthrough.
+const Info<bool> GFX_REMIX_GX_TEXGEN{{System::GFX, "Settings", "RemixGxTexGen"}, true};
+// Translate the draw's GX blend state and hand it to the runtime's own legacy
+// blend classifier, so fire, glows, light shafts, windows and water stop being
+// submitted as opaque geometry that also casts full shadows. Off submits
+// everything opaque, which is what the backend did before.
+const Info<bool> GFX_REMIX_GX_BLEND{{System::GFX, "Settings", "RemixGxBlend"}, true};
+// Translate GX lights the way the console's own renderers read them, instead of
+// approximately. Three things change: a spot cone is aimed along -ddir (xfmem's
+// ddir points from the scene TOWARD the light, so the pre-fix cone faced
+// backwards), the cosatt polynomial's inner edge becomes a real coneSoftness
+// instead of a hard 0, and radiance is derived from the distance attenuation the
+// way the Remix runtime's own D3D9 legacy-light conversion does it rather than
+// being handed the raw 0-1 colour, which is roughly a hundred times too dim.
+// Off reproduces the pre-fix behaviour exactly.
+const Info<bool> GFX_REMIX_GX_LIGHT_FIX{{System::GFX, "Settings", "RemixGxLightFix"}, true};
+// Distance, in GC world units, at which a light with NO distance attenuation
+// (GX_DA_OFF leaves distatt = (1,0,0), so the polynomial never falls off) is
+// considered to have ended. It stands in for D3D9's Light.Range, which the
+// radiance conversion needs and GX simply does not have.
+const Info<float> GFX_REMIX_LIGHT_RANGE{{System::GFX, "Settings", "RemixLightRange"}, 5000.0f};
+// Let every persisting draw vote on the camera delta, and drop the ones that
+// cannot mean anything. The sample map was capped at 256 entries, which on a
+// scene submitting well over a thousand instances makes the electorate an
+// arbitrary submission-order slice; and a mesh hash submitted more than once in
+// a frame (ocean tiles, repeated props) has no unique cross-frame
+// correspondence, so the delta built from it pairs two arbitrary instances.
+// Off is the 256-entry cap plus keep-first, exactly the pre-fix behaviour.
+const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX{
+    {System::GFX, "Settings", "RemixViewElectorateFix"}, true};
+// On a run of frames the estimator could not read, keep the view it already has
+// instead of resetting it to the identity. Both are equally correct for
+// geometry - the image is invariant to the view and the world origin is
+// arbitrary - but a reset re-welds world space onto the CURRENT camera pose,
+// which rotates the entire replacement sky in a single frame and, after a
+// pitched or rolled cut, leaves its horizon permanently tilted to that pose.
+// Off is the reset, which is what the backend did before.
+const Info<bool> GFX_REMIX_VIEW_HOLD_ON_MISS{{System::GFX, "Settings", "RemixViewHoldOnMiss"},
+                                             true};
+// When the two largest hypothesis clusters are within a quarter of each other's
+// inlier count, take the one closer to "the camera did not move" instead of the
+// merely-bigger one. A genuinely turning camera makes every static draw vote
+// together and never gets here; two comparable clusters mean a large rigid
+// animated object arguing with the static world, and the camera is not the part
+// of a title screen swinging around. Off is pure max-inliers.
+//
+// Measured on Wind Waker's 3D window, where it is what stops the camera
+// inventing motion. Frames 780-960, pure max-inliers: the estimator claims
+// 1.20-1.30 deg of rotation and 330-434 units of translation EVERY frame,
+// forever, so the recovered basis rotates without end - which is precisely the
+// "sky swings while the geometry holds still" symptom. With the tie-break: 0.06
+// to 0.13 deg and 57-62 units, and the absolute drift plateaus instead of
+// climbing. The classifier agrees independently: the sky signature only resolves
+// under this estimate, and when it does it names exactly the frame's first draws
+// including both hand-tagged sky textures.
+//
+// Do NOT read stable W alone here. It is HIGHER with the tie-break off
+// (37-41% vs 18-19%) because it measures agreement with whichever cluster won,
+// not whether that cluster was the camera - so an estimator riding a large
+// coherent moving object scores well on it. That is the trap this default was
+// briefly flipped into and back out of.
+const Info<bool> GFX_REMIX_VIEW_TIE_BREAK{{System::GFX, "Settings", "RemixViewTieBreak"}, true};
+// Identify skyboxes by the one property that defines them: they translate with
+// the camera. Under camera recovery a skybox's recovered world transform slides
+// with the camera position while its rotation holds still, so the frame-to-frame
+// ratio is a pure translation equal to the camera's own position delta - which
+// static world geometry (ratio = identity) and camera-welded overlays (rotation
+// tracks the camera) both fail. This needs RemixCameraRecovery on, and it can
+// only make progress on frames where the camera actually translates.
+//   0 = off, manual RemixSkyTextures only - exactly the pre-feature behaviour
+//   1 = classify, count and log, but tag nothing (the default)
+//   2 = classify and tag matching draws as sky
+// Nothing about the retired depth-state heuristic is involved; that is
+// RemixSkyMode, and it stays off.
+const Info<int> GFX_REMIX_SKY_AUTO_DETECT{{System::GFX, "Settings", "RemixSkyAutoDetect"}, 1};
+// Consecutive informative frames a mesh has to satisfy the signature before it
+// is classified. Classification is sticky for the session: sky must not flicker,
+// and a restart clears the set.
+const Info<int> GFX_REMIX_SKY_AUTO_FRAMES{{System::GFX, "Settings", "RemixSkyAutoFrames"}, 30};
+// Minimum size, as a fraction of the frame's far plane, for a draw to be
+// considered a skybox. A camera-welded view model is small, and during a
+// translation-only window this is the only thing separating it from a dome.
+//
+// The value is empirical and NOT a quarter of the far plane, which was the first
+// guess: Wind Waker's seven real sky draws measure 0.09x to 0.16x of a 160000
+// far plane, because a GC skybox is a modest dome drawn near the camera rather
+// than something scaled out to the clip distance. At 0.25 the gate rejected
+// every genuine skybox in the game and the feature classified nothing at all.
+// 0.05 keeps a real gate with room to spare under the smallest true positive.
+const Info<float> GFX_REMIX_SKY_AUTO_MIN_EXTENT{
+    {System::GFX, "Settings", "RemixSkyAutoMinExtent"}, 0.05f};
+// Hashes - texture or mesh, same format as RemixSkyTextures - that are never
+// treated as sky, for the day the classifier is wrong about something. Highest
+// precedence: veto beats the manual list, which beats auto-detection.
+const Info<std::string> GFX_REMIX_SKY_VETO_HASHES{
+    {System::GFX, "Settings", "RemixSkyVetoHashes"}, ""};
+// Auto-classified draws that carry NO texture are tagged IGNORE rather than SKY.
+//
+// The SKY tag routes a draw to CameraType::Sky, which under rtx.skyMode = 1 is
+// meant to drop it. IGNORE removes it from the scene outright. The difference
+// matters for the untextured draws specifically: four of Wind Waker's seven
+// classified sky meshes have no texture at all, and if such a dome survives as a
+// closed shell around the viewpoint it occludes the Numos distant sun no matter
+// what the sky path does with it - which reads as a dark scene rather than as a
+// sky problem. Untextured is the right discriminator because those draws carry
+// no albedo worth keeping, whereas a textured sky dome is exactly what the sky
+// path is designed to consume.
+//
+// False = tag every auto-classified draw SKY, the pre-flag behaviour.
+const Info<bool> GFX_REMIX_SKY_AUTO_UNTEXTURED_IGNORE{
+    {System::GFX, "Settings", "RemixSkyAutoUntexturedIgnore"}, true};
+// Render the game's OWN sky instead of deleting it, by pushing classified sky
+// geometry behind the world rather than tagging it away.
+//
+// Every classified draw logs `ztest 1 zwrite 0`: the console draws its sky
+// first and never lets it write depth, which is a hard guarantee it cannot
+// occlude anything drawn afterwards. A path tracer has no draw order, so the
+// same dome - 15k-25k units out against a 160k far plane in Wind Waker - is
+// simply solid geometry parked in front of the island, and it hides it.
+//
+// Scaling the instance about the CAMERA POSITION is the exact translation of
+// that guarantee into geometry. Every vertex keeps its direction from the eye,
+// so the image is unchanged angle for angle, while the surface moves beyond all
+// world geometry. It also removes the residual parallax that makes a dome drawn
+// close to the camera read as fake.
+//
+// Note this is what makes RemixSkyAutoDetect = 1 no longer purely log-only:
+// classification still does not TAG anything, but it does now move geometry.
+const Info<bool> GFX_REMIX_SKY_AT_INFINITY{
+    {System::GFX, "Settings", "RemixSkyAtInfinity"}, true};
+// How far out RemixSkyAtInfinity pushes. Needs to exceed far_plane / dome_extent
+// to clear the world - about 10.5 on Wind Waker's smallest classified dome - and
+// wants margin without going so far that float precision at the resulting
+// coordinates, or a ray tmax, becomes the next problem.
+const Info<float> GFX_REMIX_SKY_INFINITY_SCALE{
+    {System::GFX, "Settings", "RemixSkyInfinityScale"}, 16.0f};
+// Route falloff-free GX Spot lights to Remix's DISTANT light instead of a sphere.
+//
+// GX has no directional light type. A light whose distance attenuation is
+// GX_DA_OFF - distatt = (1,0,0), so the polynomial is the constant 1 - and whose
+// angular attenuation is likewise constant has no falloff of any kind, which is
+// how a GC title builds a sun: an ordinary light parked far enough away that its
+// direction hardly varies over the scene. Wind Waker's is at |dpos| 24873 with
+// distatt (1,0,0) and cosatt (1,0,0).
+//
+// Submitting that as a sphere applies a real 1/r^2 the console never applied, so
+// the sun contributes essentially nothing - and because it still counts as "a
+// light was drawn", it also suppresses rtx.fallbackLightMode's rescue. The scene
+// renders black with a light in it. False reproduces the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_LIGHT_NO_FALLOFF_DISTANT{
+    {System::GFX, "Settings", "RemixGxLightNoFalloffDistant"}, true};
+// Give classified sky geometry an UNLIT (emissive) material.
+//
+// GX draws a skybox with lighting off, and Wind Waker's dome goes further: its
+// TEV chain is `K0` alone, a constant with no rasterized-colour input at all, so
+// the authored value [80 120 255] IS the final pixel on console. Submitting that
+// as diffuse albedo asks a light to reveal it, which shades a surface that was
+// never meant to be shaded - it goes dark on the side facing away from the sun
+// and can never match the original. An emissive material reproduces "this
+// colour regardless of lighting" exactly, and lets the sky light the scene.
+//
+// Textured sky uses its own albedo as the emissive texture, the same patch the
+// runtime applies to WorldUI; untextured sky uses the folded TEV constant.
+const Info<bool> GFX_REMIX_SKY_EMISSIVE{{System::GFX, "Settings", "RemixSkyEmissive"}, true};
+// Emissive radiance multiplier for the sky. 1.0 reproduces the console's colour
+// at face value; higher makes the sky a stronger light source for the scene.
+const Info<float> GFX_REMIX_SKY_EMISSIVE_INTENSITY{
+    {System::GFX, "Settings", "RemixSkyEmissiveIntensity"}, 1.0f};
+// Record every EFB copy the game triggers - rect, destination, XFB-or-not, the
+// clear bit - and, on trace frames, print each UI draw's EFB-space footprint
+// next to a verdict on whether a non-XFB copy+clear later in the same frame
+// swallowed it.
+//
+// It exists to answer one question with console truth rather than with more
+// heuristics. A UI draw is invisible on hardware if the region it drew into is
+// copied off-screen and then cleared before the frame reaches the XFB - whatever
+// that draw's own blend, alpha and scissor state says about it. This backend
+// executes no EFB copies at all (RemixTextureCache), so such a draw survives to
+// the overlay and appears on screen. Four alpha/blend/scissor discriminators
+// were already tried on Wind Waker's title screen and none of them separated the
+// spurious HUD from the real title art; what happens to the EFB pixels
+// AFTERWARDS is the remaining console-side difference between the two.
+//
+// Log-only, and the heavy per-draw lines are gated to ShouldTraceDraws()
+// frames, so it defaults on the same way RemixTraceModelviews does.
+const Info<bool> GFX_REMIX_TRACE_EFB_COPIES{{System::GFX, "Settings", "RemixTraceEfbCopies"}, true};
+// Skip UI overlay draws whose blend factors read the DESTINATION ALPHA.
+//
+// The overlay is composited over a finished path-traced image at present time.
+// There is no EFB alpha for a destination-alpha factor to read, so a draw that
+// blends against it is not representable in this compositing model at all - and
+// it is not merely an approximation problem, because the value it wants is what
+// the 3D pass wrote, not what the overlay accumulated. Emulating it against the
+// overlay's own alpha would look right on a UI-only screen and be silently wrong
+// on a post-process pass, which is exactly where these draws come from.
+//
+// Today such a draw matches neither arm of SubmitUiDraw's classifier and falls
+// through to Over at full weight, which is the worst available answer: Wind
+// Waker's glare/scatter pass is a full-screen untextured quad with
+// DstAlpha/One, so it lands as an opaque wash over the entire title screen.
+// Skipping it is strictly better, and for a glare pass specifically it is
+// correct - Remix does its own bloom and glare.
+//
+// Narrow on purpose. It does not touch SrcAlpha/InvSrcAlpha, so a fade to black
+// survives by construction, and it says nothing about full-screen ortho draws in
+// general. Wind Waker's whole title screen contains exactly one such draw per
+// frame; a count much above one per frame is the sign it is over-reaching.
+//
+// False = classify as before, i.e. fall through to Over.
+const Info<bool> GFX_REMIX_UI_DROP_DST_ALPHA{{System::GFX, "Settings", "RemixUiDropDstAlpha"}, true};
+// Skip UI overlay draws textured from the destination of an EFB copy.
+//
+// This backend executes no EFB copies (RemixTextureCache::CopyEFB copies
+// nothing), so the GC memory an EFB copy targets keeps whatever was there
+// before. A cache entry decoded out of that memory is not empty - it decodes
+// successfully, from stale bytes - so RemixTexture::HasData() is true and the
+// existing skipped_efb_texture guard, which tests exactly that, lets it through.
+// The result is a quad painted with garbage: Wind Waker's white-noise speckle,
+// whose texture hash is byte-identical across 27 trace frames of moving camera
+// because no one is writing the source.
+//
+// There is no correct content available for such a draw, and inventing some
+// would be worse than omitting it, so it is omitted. The counter in the frame
+// line is the diagnostic for the real risk here: a game that legitimately
+// composes its menu through an EFB copy loses that menu, and the count is what
+// makes that recognisable instead of mysterious.
+//
+// DEFAULT OFF, and measured rather than cautious. On Wind Waker's title screen
+// this fires on exactly the draw it was designed for - one per frame, the
+// full-screen compose quad whose texture sits at 0x0065ff20, the address the
+// copy recorder saw one draw earlier - and removing it changes ZERO pixels of
+// the overlay dump. That draw's alpha test is "alpha > 0" and the stale bytes it
+// decodes are transparent, so it paints nothing to begin with. The white-noise
+// speckle it was blamed for is a different thing entirely: the item-box texture
+// 0x745553491ccc0dba at 0x00ea1580, an ordinary heap address that no EFB copy
+// has ever targeted, and the white field behind it was the destination-alpha
+// wash above.
+//
+// So the rule is principled but has no demonstrated benefit, while its risk - a
+// game that legitimately composes a menu through an EFB copy losing that menu -
+// is real. It stays off until some game shows a symptom it actually fixes.
+//
+// False = draw it, garbage and all.
+const Info<bool> GFX_REMIX_UI_DROP_EFB_COPY_TEXTURES{
+    {System::GFX, "Settings", "RemixUiDropEfbCopyTextures"}, false};
+// Map the UI overlay onto the region the console PRESENTS rather than onto the
+// whole EFB.
+//
+// UI draw coordinates arrive in EFB units and the overlay is the swapchain, so
+// something has to say how large the EFB region is that fills the window. The
+// backend used EFB_WIDTH x EFB_HEIGHT, 640x528 (VideoCommon.h:15-16) - but that
+// is the EFB's maximum size, not the part of it that reaches the screen. What
+// reaches the screen is the source rect of the frame's XFB copy, and Wind Waker
+// copies 480 rows, not 528. Scaling by 528 therefore squeezed the whole HUD into
+// the top 91% of the window and left the bottom ~9% permanently empty.
+//
+// The rect is taken from the XFB copies the texture cache already reports
+// (RemixApi::NoteEfbCopy), unioned over the frame - an interlaced or two-field
+// game presents more than one - and promoted at frame end, so a UI draw uses the
+// region the PREVIOUS frame presented. That one-frame lag is deliberate: this
+// frame's XFB copy is the event that ends the frame, long after its UI has been
+// submitted, and a game changing its presented size mid-run is the only case it
+// could ever be visible in.
+//
+// Until a first XFB copy is seen the EFB constants stand, so a game that somehow
+// presents without one behaves exactly as before.
+//
+// False = scale by the EFB constants, the pre-fix mapping.
+const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiScaleToXfb"}, true};
+// Take the rasterized colour channel from the TEV stage that actually consumes
+// it, rather than from stage 0.
+//
+// GX names the rasterized channel PER STAGE - bpmem.tevorders[stage>>1]
+// .getColorChan(stage&1) (Tev.cpp:489, PixelShaderGen.cpp:257) - and the stage
+// that reads RasColor/RasAlpha is routinely not stage 0. Reading stage 0's
+// channel therefore answers a different question than the one being asked: on a
+// chain whose stage 0 is a plain texture fetch that rasterizes nothing, the old
+// code resolved "no tint" no matter how strongly a later stage tinted the draw,
+// and on a chain whose stages name different channels it read the wrong one.
+//
+// The colour half and the alpha half are resolved separately, because they are
+// separate LitChannels with their own material sources; when they end up on
+// different vertex attributes the colour half wins and the frame line's
+// "colour ... split" counter says so.
+//
+// WORLD DRAWS ONLY - orthographic draws are governed by RemixUiRasChannel below.
+//
+// False = stage 0's channel for both halves, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
+// The same per-stage rasterized-channel rule, applied to orthographic (UI
+// overlay) draws.
+//
+// This is separated from RemixGxRasChannel because it is the one knob known to
+// change Wind Waker's title-screen HUD leak, and it needs to be A/B-able on its
+// own. With it ON the leaked gameplay HUD - hearts, D-pad, item icons, the R
+// counter - is GONE from the overlay, observed by eye on the build at commit
+// 495ea26957. The mechanism is direct: the overlay's software rasterizer reads
+// its rasterized-alpha input out of the submitted vertex colour, so a draw
+// promoted from "no channel, write opaque white" to "channel 0, write the vertex
+// colour" gets Wind Waker's actual UI vertex alpha of 0 and resolves away.
+//
+// It is ON by default because a leaked HUD is the worse of the two failures, but
+// this is NOT settled and the caveat is concrete: the same screenshot is also
+// missing PRESS START and the Japanese subtitle, and frame 600 of that run
+// produced no overlay at all (HasContent false). So it plausibly over-suppresses
+// legitimate UI along with the leak. The frame it was first judged on is not
+// enough - always confirm against a frame that contains PRESS START, and read
+// ui_upload_us in the frame line, not one dump.
+//
+// What a UI draw's rasterized alpha SHOULD be is still the open question; this
+// knob is the best answer measured so far, not the right one derived.
+//
+// False = stage 0's channel, which reinstates the HUD leak.
+const Info<bool> GFX_REMIX_UI_RAS_CHANNEL{{System::GFX, "Settings", "RemixUiRasChannel"}, true};
+// Skip world draws whose scissor rectangle is empty.
+//
+// Every reference implementation clips every draw: the software rasterizer
+// builds scissor rects from bpmem.scissorTL/BR and rejects pixels outside them
+// (Rasterizer.cpp:117-119, 364-365), and the hardware backends set the scissor
+// per draw (BPFunctions.cpp:103-104). The Remix UI path already honours it, but
+// the world path read scissor state nowhere - so geometry the game hid by
+// scissoring it away was drawn in full, and in a path tracer it also lit and
+// shadowed the scene.
+//
+// Only the empty case is acted on, and deliberately: Remix has no screen-space
+// clip, so a draw the scissor merely trims cannot be expressed and is submitted
+// whole. Empty is the one case where the console's answer - "no pixels" - is
+// exactly representable.
+//
+// Emptiness is read off ScissorResult::rectangles, not off Best(): Best()
+// fabricates an out-of-bounds rectangle when the list is empty
+// (BPFunctions.cpp:166-171), so a caller testing the returned rect would never
+// see the condition at all.
+//
+// False = submit them, which is the pre-fix behaviour.
+const Info<bool> GFX_REMIX_WORLD_SCISSOR_SKIP{{System::GFX, "Settings", "RemixWorldScissorSkip"},
+                                              true};
+
+// Per-draw trace of where a WORLD draw's colour comes from: the TEV stage that
+// consumes ras, the XF channel it names, both channels' material/lighting/
+// ambient sources, the resolved texture-stage arguments, and the raw vertex
+// colour bytes.
+//
+// Log-only and gated to ShouldTraceDraws() frames, but it emits a line per draw
+// for the first few hundred draws of such a frame, which is far heavier than the
+// other trace knobs. Off by default; turn it on to answer "why is this
+// vertex-coloured surface white", which the frame counters cannot.
+const Info<bool> GFX_REMIX_TRACE_COLORS{{System::GFX, "Settings", "RemixTraceColors"}, false};
+
+// Resolve the TEV COLOUR chain and fold it into the submitted vertex colours.
+//
+// GC titles keep a surface's palette in TEV colour REGISTERS (GXSetTevColor) and
+// use the per-vertex rasterized colour as the lerp WEIGHT between two of them.
+// Measured on Wind Waker's title scene: 3263 of 3865 vertex-coloured draws are
+// exactly lerp(c0, c1, ras) and another 546 are lerp(c0, konst, ras). Submitting
+// the raw weight as an albedo tint therefore drops the colour and renders a
+// greyscale surface - which is why the ocean and the vertex-coloured skybox came
+// out white.
+//
+// False = submit the raw rasterized colour, which is exactly the pre-fix
+// behaviour, so this is a clean A/B. Chains the evaluator cannot resolve fall back
+// to it per draw; the frame log counts folded/identity/bailed.
+const Info<bool> GFX_REMIX_GX_TEV_COLOR{{System::GFX, "Settings", "RemixGxTevColor"}, true};
+
+// Take the albedo texture from the first ENABLED TEV stage rather than from stage
+// 0 alone.
+//
+// Wind Waker's sea samples nothing on stage 0 (it is a pure register lerp) and
+// samples the water texture on stage 1, so the whole surface arrived untextured.
+// Only consulted when stage 0 samples nothing, which makes it a strict extension:
+// a draw that samples on stage 0 resolves exactly as before. Identity decisions -
+// the sky texture list, the sky auto-detector's untextured test - keep reading
+// stage 0 either way.
+//
+// False = stage 0 only, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_TEXTURE_STAGE{{System::GFX, "Settings", "RemixGxTextureStage"},
+                                            true};
+
+// Diagnostic. Paints every world draw a flat colour naming the colour ROUTE it
+// took, with the texture and the register selected out of the material so the
+// route colour is the whole albedo:
+//   red     - vertex colour, TEV chain folded
+//   magenta - vertex colour, fold refused or identity
+//   blue    - register tint through tFactor
+//   green   - no rasterized colour at all
+//
+// The frame counters say how many draws took each route; they cannot say which
+// PIXELS a route owns, and that is the question when a surface comes out the
+// wrong colour and the arithmetic says it should not. Never on by default.
+const Info<bool> GFX_REMIX_DEBUG_COLOR_ROUTES{
+    {System::GFX, "Settings", "RemixDebugColorRoutes"}, false};
+
+// Maintain a real CPU-side EFB: honour clears, pokes and peeks against it, and
+// let a CLASSIFIED subset of EFB copies encode out of it into game RAM.
+//
+// Before this, the backend had no EFB at all. Peeks returned 0, pokes did
+// nothing, ClearRegion was a no-op through the stub pipelines, and
+// RemixTextureCache::CopyEFB wrote nothing - so every copy destination received
+// the staging buffer's zeroes. Every copy was, in effect, discarded.
+//
+// That accident is desirable for a large class of copies and is deliberately
+// preserved: a GC game's baked shadow maps, mirrored-camera reflections and
+// bloom chains are screen-space fakes of things the path tracer does natively
+// and better, and discarding them is what lets the traced result show. So the
+// copies are classified (see RemixEfbCopy2D and friends below) rather than
+// executed wholesale - executing a world-content copy against this EFB would
+// paint a flat clear-coloured rectangle, which is visibly WORSE than the
+// invisible zeroes it replaced.
+//
+// The storage, the clear and the encoders are the Software backend's, reused
+// unchanged (SWEfbInterface.cpp, EfbCopy.cpp, TextureEncoder.cpp) rather than
+// duplicated.
+//
+// False = the pre-change behaviour in every particular: peeks return 0, pokes
+// and clears do nothing, no copy is classified and no copy is encoded.
+const Info<bool> GFX_REMIX_EFB_EMULATION{{System::GFX, "Settings", "RemixEfbEmulation"}, true};
+// Execute a colour EFB copy taken before any perspective draw reached submission
+// this frame.
+//
+// This is the one class whose content the synthesized EFB holds EXACTLY, by
+// construction rather than by luck: with no world draw yet, everything the
+// console's EFB contained is clear colour plus orthographic/UI draws plus pokes,
+// which is precisely what this EFB holds. Render-to-texture menus, title
+// screens and composed text windows are the shapes that fit.
+//
+// It is therefore the only class that executes by default, and the only knob
+// here whose default changes behaviour.
+//
+// False = discard it, i.e. the pre-change behaviour.
+const Info<bool> GFX_REMIX_EFB_COPY_2D{{System::GFX, "Settings", "RemixEfbCopy2D"}, true};
+// Execute a colour EFB copy taken AFTER a perspective draw this frame.
+//
+// The frame-level world-draw count is a heuristic, and a deliberately blunt one:
+// the copied rect very likely holds world pixels, and this backend rasterizes no
+// world pixels, so executing hands the game a flat clear-coloured image where
+// the console had the scene. Discarding leaves today's zeroes and lets the
+// traced effect show instead of the baked one.
+//
+// Its failure mode is the safe one - a game that draws world geometry early and
+// then composes a pure-2D element by copy later in the same frame loses that
+// element - and this knob is the recovery lever for exactly that case, with no
+// rebuild. The per-copy trace line names `world-draws N`, which is the signal
+// that decided it.
+//
+// True = execute, i.e. encode the (mostly clear-coloured) EFB into the copy's
+// destination.
+const Info<bool> GFX_REMIX_EFB_COPY_SCENE{{System::GFX, "Settings", "RemixEfbCopyScene"}, false};
+// Execute a DEPTH EFB copy (source pixel format Z24, BPStructs.cpp:308).
+//
+// The format signal is exact; the purpose - almost always a shadow map - is
+// inferred. Both point the same way. The path tracer casts real shadows, so the
+// baked one is redundant; and this EFB's depth plane holds only the clear Z plus
+// pokes, so executing would hand the game a UNIFORM depth map, i.e. a
+// full-screen wrong shadow test. That is worse than the absence.
+//
+// True = execute anyway, for a game that uses a depth copy for something else.
+const Info<bool> GFX_REMIX_EFB_COPY_DEPTH{{System::GFX, "Settings", "RemixEfbCopyDepth"}, false};
+// Execute an INTENSITY (luminance-format, isIntensity) EFB copy.
+//
+// Luminance extraction is what a bloom or glow chain opens with, and it usually
+// rides with half_scale. The runtime does its own bloom, and feeding the game's
+// chain a flat clear-luminance only blends a uniform wash back over the screen.
+//
+// True = execute, which is the lever if a game turns out to use an intensity
+// copy for a legitimate 2D mask. The trace line names `int 1` on these.
+const Info<bool> GFX_REMIX_EFB_COPY_INTENSITY{{System::GFX, "Settings", "RemixEfbCopyIntensity"},
+                                              false};
+// Execute the XFB copy - the frame's presentation copy - by running the YUV
+// encoder over the synthesized EFB.
+//
+// Off, and right to be off twice over. Nothing on this backend consumes the XFB
+// image: the Remix runtime produces and presents the picture. And even executed,
+// the encode would only emit clear colour plus the 2D layer, because no world
+// content is ever rasterized into this EFB. Meanwhile it is the one recurring
+// per-frame full-width cost in the whole feature, which the fill-rate history of
+// this backend's UI rasterizer says not to pay by default.
+//
+// True = encode it. Dolphin's screenshot and AV-dump pipeline is NOT wired to
+// this and will not start producing Remix frames because of it.
+const Info<bool> GFX_REMIX_EFB_XFB_ENCODE{{System::GFX, "Settings", "RemixEfbXfbEncode"}, false};
+// Composite the frame's 2D layer into the EFB before an EXECUTED copy encodes.
+//
+// The EFB's colour plane is otherwise only written by clears and pokes, so
+// without this an executed Composed2D copy encodes bare clear colour - correct,
+// but empty. The fold replays the frame's orthographic draws through a second
+// UiRasterizer instance running at the EFB's own 640x528 (their viewport and
+// scissor arrive in EFB units already) and blends the result Over the colour
+// plane.
+//
+// Costs nothing on a frame whose copies are all discarded beyond the recording
+// itself: the fold is called from the execute arm only.
+//
+// False = encode the EFB without the 2D layer.
+const Info<bool> GFX_REMIX_EFB_UI_COMPOSE{{System::GFX, "Settings", "RemixEfbUiCompose"}, true};
+// Skip draws that sample an EFB copy destination whose copy was DISCARDED.
+//
+// Discarding a copy leaves that memory holding zeroes. Zero bytes decode into a
+// perfectly valid texture, so the draw that samples it is not refused anywhere -
+// it renders as a blank rectangle sitting over the path-traced scene. SpongeBob:
+// Battle for Bikini Bottom is the confirmed case: two 256x256 copies from the
+// top-left corner every frame, both classified Scene, drawn as a white box over
+// a quarter of the screen.
+//
+// True = drop those draws, so the game's screen-space fake is ABSENT and the
+// traced result behind it shows. That is what the discard decision already
+// meant; this only stops the game papering over it.
+//
+// False = draw them anyway, blank texture and all - the behaviour before this
+// existed. Set it if skipping ever removes something a game genuinely needed;
+// the frame line's `efbdisc` counter says how many draws are affected.
+const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX{
+    {System::GFX, "Settings", "RemixEfbSkipDiscardedTex"}, true};
+// Drop untextured 2D draws that arrive before any world geometry in the frame.
+//
+// Those are EFB clears and scratch-region fills, not UI. The console draws the
+// scene over them; this backend composites the 2D layer ON TOP of the traced
+// image, so they land over everything instead of under it and paint the screen
+// flat. SpongeBob: Battle for Bikini Bottom is the confirmed case - a
+// full-screen white quad (the screen going white outdoors) and a 256x256 one
+// clipped to the exact rect of the EFB copy it feeds (the white box top-left),
+// both carrying vertex colour 0xffffffff.
+//
+// Untextured is what keeps this from swallowing real 2D: menus, HUD elements
+// and text are textured. The pre-world test is what separates a clear from a
+// legitimate 2D layer drawn after the scene.
+//
+// True = drop them. False = composite them as before. If a game's genuine 2D
+// background disappears, this is the knob; the frame line's `preworld` counter
+// says how many draws are affected.
+const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD_BLANK{
+    {System::GFX, "Settings", "RemixUiDropPreWorldBlank"}, true};
+// Drop the game's DIRECTIONAL lights, so an atmosphere mod owns the key light.
+//
+// A GC title's sun is a baked directional light with a fixed colour and
+// direction that knows nothing about a physically-modelled sky. Run it alongside
+// one and they double up - the scene reads far too bright and the game's flat
+// white fights the atmosphere's own sun. Numos is the case this exists for.
+//
+// Positional lights are kept: lamps, glows and cone lights are local set
+// dressing no atmosphere model replaces, and dropping them would darken
+// interiors.
+//
+// True = drop them. Default False, because with no atmosphere mod loaded this
+// removes the scene's only key light. Turn it on together with the sky, and
+// watch the frame line's `dropped` count to confirm the game really was adding
+// one. If the scene goes black rather than sky-lit, check the runtime's
+// rtx.fallbackLightMode - dropping every light is what lets NoLightsPresent
+// trigger.
+const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT{
+    {System::GFX, "Settings", "RemixGxLightDropDistant"}, false};
+// The backend's own fallback light: one persistent distant light, drawn only on
+// frames where the scene submitted NO lights at all.
+//
+// It exists because many GC titles bake their lighting into vertex colours and
+// enable no XF lights, which would otherwise leave the path tracer nothing to
+// integrate. It is NOT the runtime's rtx.fallbackLightMode - that is a separate
+// mechanism in rtx.conf, and having both is why "where is this extra distant
+// light coming from" is an easy question to get wrong.
+//
+// False = never draw it, so an atmosphere mod is the only key light. Turn it off
+// whenever a sky mod is providing illumination; leave it on for bare Remix.
+// RemixGxLightDropDistant already implies this off - dropping the game's suns
+// and then inserting our own would cancel out.
+const Info<bool> GFX_REMIX_FALLBACK_LIGHT{{System::GFX, "Settings", "RemixFallbackLight"}, true};
+
+}  // namespace Config
