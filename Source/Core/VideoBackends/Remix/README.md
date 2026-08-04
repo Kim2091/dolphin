@@ -65,11 +65,35 @@ The Remix API header is vendored at `Externals/remix/remix_c.h`, so building doe
 
 ## The runtime
 
-The backend loads `d3d9.dll` from next to the executable. That DLL **is** the RTX
-Remix runtime (~231 MB — it contains the whole path tracer), not a system file
-and not a stub. It is distributed separately from this repository.
+The backend loads `d3d9-remix.dll` from next to the executable. That DLL **is**
+the RTX Remix runtime (~231 MB — it contains the whole path tracer), not a system
+file and not a stub. It is distributed separately from this repository.
 
-Two things worth knowing before swapping runtimes:
+### ⚠ Do not name the runtime `d3d9.dll`
+
+Qt's Windows platform plugin, `QtPlugins\platforms\qwindows.dll`, has a real
+import on `d3d9.dll`, and Windows resolves an implicit import out of the
+**application directory** before `System32`. So a Remix runtime called `d3d9.dll`
+next to `Dolphin.exe` is loaded and fully self-initialized while Qt is starting
+up — measured at **1.8 seconds before the video backend runs**, before a game has
+even been chosen. The runtime resolves its config layers and its file paths once,
+at that moment, and refuses to redo them.
+
+Consequences, in order of how much they matter:
+
+- **Per-game files cannot work** (`RemixPerGamePaths`). Nothing Dolphin sets after
+  Qt has started can reach the runtime, so every game silently falls back to the
+  shared `rtx.conf` — the exact failure the feature exists to prevent.
+- A 242 MB path tracer is loaded into **every** Dolphin process, including runs
+  using Vulkan or D3D12 that will never touch it.
+
+The fix is a file rename; nothing else. The backend loads the runtime explicitly
+and drives it through its `remixapi_*` exports, so the filename carries no
+meaning — it is not acting as a `d3d9` stand-in for anything. An install still
+carrying `d3d9.dll` keeps working: `RemixApi::Initialize` falls back to it and
+logs the warning above, it just cannot have per-game files until it is renamed.
+
+Two more things worth knowing before swapping runtimes:
 
 - **A stock RTX Remix release will not work.** This backend targets a fork
   carrying its own ABI line, `REMIXAPI_VERSION_MINOR 1000`, versus stock 0.6.x;
@@ -114,7 +138,7 @@ and are cleared by right-clicking the control. Editing that file by hand works
 just as well.
 
 Global values live in `%APPDATA%\Dolphin Emulator\Config\GFX.ini` under
-`[Settings]`. All 57 knobs are declared in
+`[Settings]`. All 60 knobs are declared in
 `Source/Core/Core/Config/RemixSettings.cpp` with a comment explaining what each
 is for and why its default is what it is; the tables below are a summary, and
 that file is the authority. The metadata table at the bottom of the same file is
@@ -144,10 +168,119 @@ Two conventions hold throughout:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `RemixDllPath` | string | `d3d9.dll` | Passed straight to `LoadLibrary`, so a bare name resolves next to `Dolphin.exe`. |
+| `RemixDllPath` | string | `d3d9-remix.dll` | Passed straight to `LoadLibrary`, so a bare name resolves next to `Dolphin.exe`. **Must not be `d3d9.dll`** — see "Do not name the runtime `d3d9.dll`" above; that name is loaded by Qt at startup and breaks per-game files. Left at its default and not found, the backend falls back to `d3d9.dll` with a warning. |
 | `RemixSceneScale` | float | `1.0` | Pushed to the runtime as `rtx.sceneScale` — centimetres per GC world unit. |
 | `RemixLightScale` | float | `1.0` | Multiplies the radiance derived from XF lights. The lever for "the scene is too dim/bright" once light translation itself is correct. |
 | `RemixLightRange` | float | `5000.0` | Stand-in for D3D9's `Light.Range`, which the ported radiance conversion needs and GX does not have. Consulted only when the distance-attenuation polynomial never falls off. |
+
+### Files and per-game folders
+
+Each game gets its own Remix settings, mods, captures and runtime log:
+
+```
+<Dolphin.exe dir>\
+    rtx.conf                        TEMPLATE — copied into a new game, never read at play time
+    user.conf                       TEMPLATE — same
+    rtx-remix\mods\                 cross-game mods (see RemixPerGameMods)
+    Remix\
+        GZLE01\                     one folder per game ID
+            rtx.conf                this game's settings, a full independent copy
+            user.conf               where the dev menu saves — see below
+            rtx-remix\
+                mods\               point the Remix Toolkit's project wizard here
+                captures\
+                logs\               remix-dxvk.log lives here now, NOT in dolphin.log
+```
+
+**Why it exists.** `rtx.conf` holds mesh and texture hashes — `rtx.skyBoxTextures`,
+the ignore lists, everything tagged from the dev menu. Those hashes mean nothing
+outside the game they came from, so one shared file lets a tag written while
+playing one title take effect in another. That is not hypothetical: a leftover
+skybox tag deleted Wind Waker's sky, silently, and cost a day to find.
+
+**How it works — the globals are templates, not layers.** Dolphin sets five
+environment variables just before it loads the runtime:
+`DXVK_RTX_CONFIG_FILE`, `DXVK_USER_CONFIG_FILE`, `DEFAULT_MODS_DIR`,
+`DXVK_CAPTURE_PATH` and `DXVK_LOG_PATH`. The two config variables point at the
+**game's own files and nothing else**.
+
+The `rtx.conf` and `user.conf` next to `Dolphin.exe` are a starting point. The
+first time a game's folder is set up they are copied into it; from then on that
+game reads and writes only its own pair, and the templates are never loaded
+again and never written to. So they can be curated as known-good defaults and
+left alone.
+
+Seeding only ever writes a file the game **does not already have**, which is what
+makes it safe to run on every boot — re-copying would wipe out everything tagged
+in-game since. Two consequences worth knowing:
+
+- **Each game is completely independent.** Deleting something from a game's
+  config actually deletes it. Nothing is re-supplied from a layer underneath on
+  the next boot, and nothing one game does can reach another.
+- **A later edit to a template does not reach games that already exist.** That is
+  the deliberate trade for the independence above. To refresh a game from the
+  template, delete that game's `rtx.conf` / `user.conf` and start it again.
+
+**`user.conf` is the one that actually matters**, even though `rtx.conf` gets all
+the attention. Every edit made through the Remix dev menu targets the *user*
+layer — `dxvk_imgui.cpp` wraps them in
+`RtxOptionLayerTarget(RtxOptionEditTarget::User)` — so tagging a texture in-game
+writes to `user.conf`, not `rtx.conf`. That layer was the only one with no
+environment variable, which meant the whole separation collapsed at the exact
+moment someone used it. `DXVK_USER_CONFIG_FILE` is a **fork addition** to the
+runtime (`rtx_option_layer.cpp` step 6) added for this; a stock runtime ignores
+it and puts every game's tags back in one shared file.
+
+**Do not move or rename these folders.** The RTX Remix Toolkit's project wizard
+binds a mod project to one with a *pair of symbolic links* — `<project>/deps` →
+the `rtx-remix` folder, and `rtx-remix/mods/<project>` → back to the project — so
+renaming or deleting one breaks the user's project. Nothing here ever removes or
+relocates a folder, and there is no cleanup feature by design. Symlinks also mean
+NTFS: a portable build on an exFAT USB stick cannot host mod projects.
+
+**Finding a folder.** `GZLE01` is not a name anyone recognises, so the Remix tab
+has an **Open Remix Folder** button. In a game's Properties it opens that game's
+folder; in the global dialog it opens the running game's, or the root when
+nothing is running. It creates the folder first, which is the point — the Toolkit
+has to be able to select it before the game has ever been played.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `RemixPerGamePaths` | bool | `True` | Master switch. `False` restores one shared `rtx.conf` and one shared `rtx-remix\` for every game, exactly as before. |
+| `RemixPerGameRoot` | string | *(empty)* | Where the per-game folders live. Empty means `Remix\` next to `Dolphin.exe`, falling back to the Dolphin user folder if that cannot be written to. **Worth setting on a development build**, whose executable sits in `build\release\x64\Binaries\` — cleaning that directory would take mod projects with it. |
+| `RemixPerGameMods` | bool | `True` | Whether the game's own `rtx-remix\mods` is the runtime's mods folder. The runtime takes exactly one, so this is a choice, not an addition: with it on, the shared `rtx-remix\mods` next to `Dolphin.exe` is **not searched at all**. Turn it off if you have mods there that every game should see. |
+
+Four things worth knowing when this does not behave:
+
+- **Keep hash lists out of the templates.** `rtx.skyBoxTextures`,
+  `rtx.ignoreTextures` and friends are texture and mesh hashes, and a hash means
+  something only in the game it was tagged in. Left in a template they get copied
+  into every new game folder, where they match nothing — or something else.
+  Dolphin counts them and says so in `dolphin.log` at the moment a game is
+  seeded (`the template '...' carries N texture/mesh hash entr(ies)`). It cannot
+  clean them up: only you know which game each came from.
+
+  Inside a single file, note that hash lists **merge** rather than replace, and
+  a `-0x…` entry is the runtime's own *removal* syntax
+  (`util_hash_set_layer.h`) — never corruption to be tidied away.
+- **If the runtime is still called `d3d9.dll`, none of this applies at all** —
+  see the section above. `dolphin.log` says so outright
+  (`was already loaded before this game started, so the per-game folders ... are
+  NOT in effect`). This is the first thing to check.
+- **The runtime log moved.** `remix-dxvk.log` — where `[RTX-API-Cat]` and
+  everything else the *runtime* prints goes — is now under the game's
+  `rtx-remix\logs\`. `dolphin.log` is unaffected and still names the resolved
+  paths at startup (`Remix: DXVK_RTX_CONFIG_FILE = ...`).
+- **An environment variable set outside Dolphin wins.** If any of the four is
+  already set when Dolphin starts, it is left alone and a line saying so goes
+  into `dolphin.log`. That is deliberate — someone who exported `DXVK_LOG_PATH`
+  meant it — but it will look like the per-game folder is being ignored.
+- **Booting a second game without restarting Dolphin is the risky case.** The
+  runtime fixes its file paths the first time it initializes and refuses to
+  redo it, so if it stays resident past `FreeLibrary` the second game reads the
+  first game's folders. Dolphin checks for exactly that and warns
+  (`is still loaded from an earlier game in this session`). Restart Dolphin
+  between games if the warning appears.
 
 ### Camera recovery
 
@@ -303,8 +436,12 @@ Two diagnostics that are not Dolphin options but belong in the same toolkit:
 `rtx.debugView.debugViewIdx = 23` in `rtx.conf` shows **Diffuse Albedo**, which
 separates "no geometry is there" from "geometry that isn't being lit" outright;
 and `rtx.logApiDrawCategoryKeys = True` reports which key each API draw is
-categorised on — writing to the *runtime's* log at
-`Binaries/rtx-remix/logs/remix-dxvk.log`, not `dolphin.log`.
+categorised on — writing to the *runtime's* log, which with `RemixPerGamePaths`
+on lives at `Remix\<GameID>\rtx-remix\logs\remix-dxvk.log` (and otherwise at
+`rtx-remix\logs\remix-dxvk.log` next to the executable), not `dolphin.log`.
+
+Both of those go in `rtx.conf` — which, with per-game files on, means the game's
+own `Remix\<GameID>\rtx.conf`, or the global one if you want them everywhere.
 
 ---
 

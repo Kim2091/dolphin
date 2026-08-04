@@ -6,17 +6,28 @@
 #include <span>
 #include <variant>
 
+#include <QDesktopServices>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QStringList>
+#include <QUrl>
 #include <QVBoxLayout>
+
+#include "Common/CommonPaths.h"
+#include "Common/FileUtil.h"
 
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/RemixSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/Core.h"
+#include "Core/RemixPaths.h"
 #include "Core/System.h"
+
+#include "DolphinQt/QtUtils/ModalMessageBox.h"
 
 #include "DolphinQt/Config/ConfigControls/ConfigBool.h"
 #include "DolphinQt/Config/ConfigControls/ConfigChoice.h"
@@ -41,6 +52,7 @@ struct GroupTitle
 
 constexpr GroupTitle GROUP_TITLES[] = {
     {Group::RuntimeScale, QT_TR_NOOP("Runtime and Scale")},
+    {Group::Files, QT_TR_NOOP("Files and Per-Game Folders")},
     {Group::CameraRecovery, QT_TR_NOOP("Camera Recovery")},
     {Group::Sky, QT_TR_NOOP("Sky")},
     {Group::GxSemantics, QT_TR_NOOP("GX Semantics")},
@@ -90,7 +102,8 @@ QString PlainSettingTooltip(const Config::RemixSettingMeta& meta)
 }
 }  // namespace
 
-RemixWidget::RemixWidget(GraphicsPane* gfx_pane) : m_game_layer{gfx_pane->GetConfigLayer()}
+RemixWidget::RemixWidget(GraphicsPane* gfx_pane)
+    : m_game_layer{gfx_pane->GetConfigLayer()}, m_game_id{gfx_pane->GetGameId()}
 {
   CreateWidgets();
 
@@ -120,12 +133,28 @@ void RemixWidget::CreateWidgets()
   m_filter->setClearButtonEnabled(true);
   connect(m_filter, &QLineEdit::textChanged, this, &RemixWidget::OnFilterChanged);
 
+  // A game's Remix folder is named after its game ID, which is not something a
+  // modder can be expected to recognise or type. This is how it is found.
+  auto* const open_folder =
+      new QPushButton(m_game_id.empty() ? tr("Open Remix Folder...") :
+                                          tr("Open Remix Folder for This Game..."));
+  open_folder->setToolTip(
+      tr("Opens the folder holding this game's Remix settings, mods, captures and runtime log, "
+         "creating it if it does not exist yet. Point the RTX Remix Toolkit's project wizard at "
+         "the rtx-remix folder inside it.\n\nDo not move or rename it afterwards: the Toolkit "
+         "links a mod project to it with symbolic links, which a rename breaks."));
+  connect(open_folder, &QPushButton::clicked, this, &RemixWidget::OnOpenFolder);
+
+  auto* const top_row = new QHBoxLayout;
+  top_row->addWidget(m_filter, 1);
+  top_row->addWidget(open_folder);
+
   // Everything below the status line lives in one container, so the whole tab
   // can be disabled in one call when another backend is selected.
   m_content = new QWidget;
   auto* const content_layout = new QVBoxLayout{m_content};
   content_layout->setContentsMargins(0, 0, 0, 0);
-  content_layout->addWidget(m_filter);
+  content_layout->addLayout(top_row);
 
   const std::span<const Config::RemixSettingMeta> settings = Config::GetRemixSettingsMetadata();
 
@@ -261,6 +290,50 @@ void RemixWidget::AddSetting(QGroupBox* box, QFormLayout* form,
   // The filter matches the key too, so someone reading a log line or an existing
   // GFX.ini can paste "RemixSkyEmissive" straight in and land on the option.
   m_rows.push_back({form, box, label, control, &meta, (key + text + tooltip).toLower(), true});
+}
+
+void RemixWidget::OnOpenFolder()
+{
+  // In the per-game Properties dialog the game is known outright. In the global
+  // dialog, the running game is the only sensible answer; with nothing running,
+  // open the root so every game's folder is one level down.
+  std::string game_id = m_game_id;
+  if (game_id.empty())
+    game_id = SConfig::GetInstance().GetGameID();
+
+  std::string target = RemixPaths::GetRoot();
+  if (!game_id.empty() && !Config::Get(Config::GFX_REMIX_PER_GAME_PATHS))
+  {
+    // Opening a per-game folder while the option is off would suggest the game
+    // reads from it, which it does not.
+    ModalMessageBox::information(
+        this, tr("Remix"),
+        tr("Per-game Remix files are turned off, so every game shares the files next to "
+           "Dolphin.exe. Opening the folder that would hold the per-game ones instead."));
+  }
+  else if (!game_id.empty())
+  {
+    const RemixPaths::GamePaths paths = RemixPaths::ForGame(game_id);
+    if (!paths.game_dir.empty())
+    {
+      RemixPaths::CreateDirectories(paths);
+      // So the folder opens with its rtx.conf and user.conf already in it,
+      // rather than looking empty until the game has been run once. Only
+      // seeds what is missing, so opening the folder never overwrites
+      // anything.
+      RemixPaths::SeedFromGlobals(paths);
+      target = paths.game_dir;
+    }
+  }
+
+  if (!File::CreateFullPath(target + DIR_SEP))
+  {
+    ModalMessageBox::warning(this, tr("Remix"),
+                             tr("Could not create %1.").arg(QString::fromStdString(target)));
+    return;
+  }
+
+  QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(target)));
 }
 
 void RemixWidget::OnBackendChanged(const QString& backend_name)

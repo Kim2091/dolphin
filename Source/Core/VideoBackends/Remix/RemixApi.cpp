@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cwchar>
 #include <exception>
 #include <iterator>
@@ -19,12 +20,16 @@
 #include <fmt/format.h>
 #include <xxhash.h>
 
+#include "Common/CommonPaths.h"
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
 #include "Common/StringUtil.h"
 #include "Common/WindowSystemInfo.h"
 
 #include "Core/Config/RemixSettings.h"
+// For the running game's ID and the per-game folder layout it selects.
+#include "Core/ConfigManager.h"
+#include "Core/RemixPaths.h"
 
 #include "VideoBackends/Remix/RemixTexture.h"
 // For RemixEFBInterface::DrainAccessCounters and the shared store's colour
@@ -570,6 +575,346 @@ void ParseHashList(const std::string& text, std::unordered_set<u64>& out)
     i += std::max<size_t>(consumed, 1);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Per-game runtime files.
+//
+// The Remix runtime reads its whole file-system layout out of four environment
+// variables, once, from inside Direct3DCreate9. Setting them just before the
+// runtime DLL is loaded is the entire mechanism behind giving each game its own
+// config, mods, captures and log - the runtime itself needed no change.
+//
+// The two config variables are the interesting ones: each takes a
+// COMMA-SEPARATED list of files, lowest priority first, and the runtime
+// designates the LAST entry as the layer its dev menu saves into. Passing
+// "<global>,<per-game>" therefore buys both halves at once - the shared settings
+// apply underneath, and anything edited in-game is written to the game's own
+// file rather than to the file every other game reads.
+//
+// user.conf matters more than rtx.conf here, even though it looks like the
+// afterthought: every edit made through the Remix dev menu targets the USER
+// layer, so that is where a texture tagged in-game actually lands.
+// DXVK_USER_CONFIG_FILE is a fork addition (rtx_option_layer.cpp step 6) - it
+// was the one layer with no environment variable, which left the whole
+// separation defeated at the exact moment someone used it.
+// ---------------------------------------------------------------------------
+constexpr const wchar_t* ENV_RTX_CONFIG_FILE = L"DXVK_RTX_CONFIG_FILE";
+constexpr const wchar_t* ENV_USER_CONFIG_FILE = L"DXVK_USER_CONFIG_FILE";
+constexpr const wchar_t* ENV_MODS_DIR = L"DEFAULT_MODS_DIR";
+constexpr const wchar_t* ENV_CAPTURE_PATH = L"DXVK_CAPTURE_PATH";
+constexpr const wchar_t* ENV_LOG_PATH = L"DXVK_LOG_PATH";
+
+constexpr const wchar_t* REMIX_ENV_VARS[] = {ENV_RTX_CONFIG_FILE, ENV_USER_CONFIG_FILE,
+                                             ENV_MODS_DIR, ENV_CAPTURE_PATH, ENV_LOG_PATH};
+constexpr size_t REMIX_ENV_VAR_COUNT = std::size(REMIX_ENV_VARS);
+
+// Indices into REMIX_ENV_VARS, so the calls below read as names.
+enum RemixEnvVar : size_t
+{
+  ENV_INDEX_RTX_CONFIG = 0,
+  ENV_INDEX_USER_CONFIG = 1,
+  ENV_INDEX_MODS = 2,
+  ENV_INDEX_CAPTURES = 3,
+  ENV_INDEX_LOGS = 4,
+};
+
+// Every one of these is read into a MAX_PATH buffer on the runtime side
+// (util_env.cpp's getEnvVar, util_filesys.cpp's own copy of it). An over-long
+// value does not arrive truncated: the read fails and yields an EMPTY string, so
+// the runtime silently falls back to its defaults. Refusing to set one is the
+// same outcome with a log line attached.
+constexpr size_t MAX_ENV_VALUE_LENGTH = MAX_PATH - 1;
+
+// Whether each variable already carried a value before Dolphin touched it, and
+// whether we have set any of them in this process. An externally-set value is
+// left alone - someone who exports DXVK_LOG_PATH before launching Dolphin means
+// it - and a variable we set is cleared again if the option is later turned off,
+// so a second game cannot inherit the first game's folders.
+bool s_env_probed = false;
+bool s_env_external[REMIX_ENV_VAR_COUNT] = {};
+bool s_env_applied = false;
+
+std::string EnvVarName(size_t index)
+{
+  return WStringToUTF8(REMIX_ENV_VARS[index]);
+}
+
+bool EnvValueFits(const std::string& value)
+{
+  return value.size() <= MAX_ENV_VALUE_LENGTH &&
+         UTF8ToWString(value).size() <= MAX_ENV_VALUE_LENGTH;
+}
+
+void ProbeEnvironmentOnce()
+{
+  if (s_env_probed)
+    return;
+  s_env_probed = true;
+
+  for (size_t i = 0; i < REMIX_ENV_VAR_COUNT; ++i)
+  {
+    // With no buffer, the return is the size the value would need INCLUDING its
+    // terminator, so 1 means present but empty and 0 means absent. Empty counts
+    // as absent here because that is what it means to the runtime too - its own
+    // reader falls straight through to the default path on an empty string.
+    s_env_external[i] = GetEnvironmentVariableW(REMIX_ENV_VARS[i], nullptr, 0) > 1;
+    if (s_env_external[i])
+    {
+      INFO_LOG_FMT(VIDEO,
+                   "Remix: {} was already set before Dolphin started; leaving it alone, so this "
+                   "game's own Remix folder is not used for it",
+                   EnvVarName(i));
+    }
+  }
+}
+
+// Sets one of the four, unless it came from outside this process. Returns false
+// without setting anything if the value cannot survive the runtime's MAX_PATH
+// read, since a silent fallback to the shared files is exactly what this whole
+// feature exists to prevent.
+bool SetRuntimeEnvVar(size_t index, const std::string& value)
+{
+  if (s_env_external[index])
+    return false;
+
+  if (!EnvValueFits(value))
+  {
+    ERROR_LOG_FMT(VIDEO,
+                  "Remix: '{}' is {} characters, over the {}-character limit the runtime reads "
+                  "{} with; leaving that path at its default",
+                  value, value.size(), MAX_ENV_VALUE_LENGTH, EnvVarName(index));
+    return false;
+  }
+
+  if (SetEnvironmentVariableW(REMIX_ENV_VARS[index], UTF8ToWString(value).c_str()) == 0)
+  {
+    ERROR_LOG_FMT(VIDEO, "Remix: could not set {} (error {})", EnvVarName(index), GetLastError());
+    return false;
+  }
+
+  INFO_LOG_FMT(VIDEO, "Remix: {} = {}", EnvVarName(index), value);
+  s_env_applied = true;
+  return true;
+}
+
+// Sets one of the two config variables to the game's own file - and only that
+// file.
+//
+// The globals are TEMPLATES that were copied into the game's folder when it was
+// set up, not layers that keep applying underneath, so nothing else belongs in
+// this list. That is what makes a game's config genuinely its own: deleting
+// something from it actually deletes it, rather than being re-supplied from a
+// layer below on the next boot. It also means the file the runtime saves into -
+// the last entry, here the only one - is the game's.
+void SetConfigEnvVar(size_t index, const std::string& path)
+{
+  if (path.find(',') != std::string::npos)
+  {
+    ERROR_LOG_FMT(VIDEO,
+                  "Remix: '{}' contains a comma, which is the separator in {}; this game falls "
+                  "back to the shared file",
+                  path, EnvVarName(index));
+    return;
+  }
+
+  SetRuntimeEnvVar(index, path);
+}
+
+// Counts texture/mesh hash entries in a config file.
+//
+// Used on the TEMPLATE, and only when a game has just been seeded from it. A
+// hash means something only in the game it was tagged in, so hashes sitting in
+// the template get stamped into every new game folder from then on - which is
+// worth saying out loud at the moment it happens, and only then. Nothing can fix
+// it automatically: only a human knows which game each one came from.
+size_t CountHashListEntries(const std::string& conf_path, size_t& lists_out)
+{
+  // The runtime's cross-game category lists, as written by the dev menu's
+  // texture tagging. Keys are matched at the start of a line, so a commented-out
+  // entry does not count.
+  static constexpr const char* HASH_LIST_KEYS[] = {
+      "rtx.skyBoxTextures",   "rtx.ignoreTextures",       "rtx.hideInstanceTextures",
+      "rtx.lightmapTextures", "rtx.ignoreLights",         "rtx.particleTextures",
+      "rtx.decalTextures",    "rtx.terrainTextures",      "rtx.worldSpaceUiTextures",
+  };
+
+  lists_out = 0;
+
+  std::ifstream file(conf_path);
+  if (!file)
+    return 0;
+
+  size_t entries = 0;
+  size_t keys = 0;
+  std::string line;
+  while (std::getline(file, line))
+  {
+    const size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos)
+      continue;
+
+    for (const char* const key : HASH_LIST_KEYS)
+    {
+      if (line.compare(first, std::strlen(key), key) != 0)
+        continue;
+
+      ++keys;
+      // One more entry than separators, and an empty list has neither.
+      const size_t equals = line.find('=');
+      if (equals != std::string::npos && line.find_first_not_of(" \t", equals + 1) !=
+                                             std::string::npos)
+      {
+        entries += 1 + static_cast<size_t>(std::count(line.begin() + equals, line.end(), ','));
+      }
+      break;
+    }
+  }
+
+  lists_out = keys;
+  return entries;
+}
+
+void ClearRuntimeEnvVars()
+{
+  for (size_t i = 0; i < REMIX_ENV_VAR_COUNT; ++i)
+  {
+    if (!s_env_external[i])
+      SetEnvironmentVariableW(REMIX_ENV_VARS[i], nullptr);
+  }
+  s_env_applied = false;
+}
+
+// Which runtime file to load.
+//
+// The default name is deliberately NOT d3d9.dll - see the comment on
+// GFX_REMIX_DLL_PATH; a runtime under that name is dragged into the process by
+// Qt's platform plugin at startup and has already fixed its config and file
+// paths by the time any of this runs. Installs predating the rename still have
+// it as d3d9.dll though, so fall back to that rather than failing to start, and
+// name the consequence.
+std::string ResolveRuntimeDllPath()
+{
+  const std::string configured = Config::Get(Config::GFX_REMIX_DLL_PATH);
+
+  // Only for the untouched default, and only for a bare filename: an explicit
+  // setting is an instruction, not a guess to second-guess.
+  if (configured != Config::GFX_REMIX_DLL_PATH.GetDefaultValue() ||
+      configured.find_first_of("/\\") != std::string::npos)
+  {
+    return configured;
+  }
+
+  const std::string next_to_exe = File::GetExeDirectory() + DIR_SEP + configured;
+  if (File::Exists(next_to_exe))
+    return configured;
+
+  const std::string legacy_name = "d3d9.dll";
+  if (!File::Exists(File::GetExeDirectory() + DIR_SEP + legacy_name))
+    return configured;  // Neither is there; let the load fail and report normally.
+
+  WARN_LOG_FMT(VIDEO,
+               "Remix: using the runtime at '{}' because '{}' is not there. Rename it to '{}' when "
+               "convenient: Qt's platform plugin imports the name 'd3d9.dll', so Windows loads "
+               "that file while Dolphin is still starting up, which fixes the runtime's config and "
+               "folder paths before a game is even chosen - and that makes per-game Remix files "
+               "(RemixPerGamePaths) impossible. Renaming also keeps a 242 MB path tracer out of "
+               "every Dolphin process that is not using this backend.",
+               legacy_name, configured, configured);
+  return legacy_name;
+}
+
+// Points the runtime at this game's own files. MUST run before the runtime DLL
+// is loaded.
+void ConfigureRuntimePaths()
+{
+  ProbeEnvironmentOnce();
+
+  if (!Config::Get(Config::GFX_REMIX_PER_GAME_PATHS))
+  {
+    // Booting one game with separation on and then another with it off would
+    // otherwise leave the second game reading the first game's folders: these
+    // variables are process-wide and outlive a game.
+    if (s_env_applied)
+    {
+      ClearRuntimeEnvVars();
+      INFO_LOG_FMT(VIDEO, "Remix: per-game files are off; runtime paths reset to the shared ones "
+                          "next to Dolphin.exe");
+    }
+    return;
+  }
+
+  // Drop whatever a previous game in this session left set, BEFORE working this
+  // game's paths out. Any of the early returns below would otherwise leave the
+  // previous game's folders in place for this one - which is the exact failure
+  // this feature exists to prevent, arrived at from the other direction.
+  if (s_env_applied)
+    ClearRuntimeEnvVars();
+
+  const std::string game_id = SConfig::GetInstance().GetGameID();
+  const RemixPaths::GamePaths paths = RemixPaths::ForGame(game_id);
+  if (paths.game_dir.empty())
+  {
+    WARN_LOG_FMT(VIDEO,
+                 "Remix: the running title has no usable game ID ('{}'), so it uses the shared "
+                 "Remix files this boot",
+                 game_id);
+    return;
+  }
+
+  // Eagerly, and before anything is pointed at them: the Remix Toolkit's project
+  // wizard has to be able to SELECT this folder, which means it has to exist
+  // before the game has ever been played.
+  RemixPaths::CreateDirectories(paths);
+  if (!File::IsDirectory(paths.game_dir))
+  {
+    ERROR_LOG_FMT(VIDEO,
+                  "Remix: '{}' could not be created, so this game uses the shared Remix files",
+                  paths.game_dir);
+    return;
+  }
+
+  // Give a brand-new game folder a starting point, copied from the templates
+  // next to Dolphin.exe. Only files the game does not already have are written,
+  // so this is safe on every boot - re-copying would wipe out everything tagged
+  // in-game since.
+  if (RemixPaths::SeedFromGlobals(paths) != 0)
+  {
+    // Said only at the moment it propagates. A hash means something only in the
+    // game it was tagged in, so any sitting in the template have just been
+    // stamped into a game they have nothing to do with.
+    size_t lists = 0;
+    const size_t entries = CountHashListEntries(RemixPaths::GlobalRtxConf(), lists);
+    if (entries != 0)
+    {
+      WARN_LOG_FMT(VIDEO,
+                   "Remix: the template '{}' carries {} texture/mesh hash entr(ies) across {} "
+                   "list(s), and they have just been copied into '{}'. A hash tagged for one game "
+                   "means nothing in another, or matches the wrong thing - worth clearing out of "
+                   "the template so later games start clean, and out of this game's copy now.",
+                   RemixPaths::GlobalRtxConf(), entries, lists, paths.rtx_conf);
+    }
+  }
+
+  // The game's own files, and only those: the templates were copied in above,
+  // they are not layered underneath.
+  SetConfigEnvVar(ENV_INDEX_RTX_CONFIG, paths.rtx_conf);
+  SetConfigEnvVar(ENV_INDEX_USER_CONFIG, paths.user_conf);
+
+  // One mods directory is all the runtime takes, so this is a choice between the
+  // per-game folder and the shared one rather than a search order. Set either
+  // way, so that turning the option off does not leave the previous game's
+  // folder behind.
+  const bool per_game_mods = Config::Get(Config::GFX_REMIX_PER_GAME_MODS);
+  SetRuntimeEnvVar(ENV_INDEX_MODS, per_game_mods ? paths.mods : RemixPaths::GlobalModsDir());
+  SetRuntimeEnvVar(ENV_INDEX_CAPTURES, paths.captures);
+  SetRuntimeEnvVar(ENV_INDEX_LOGS, paths.logs);
+
+  INFO_LOG_FMT(VIDEO,
+               "Remix: game '{}' uses '{}'. The runtime writes its own log to "
+               "'{}\\remix-dxvk.log' - that is where [RTX-API-Cat] and the rest of the runtime's "
+               "output goes, not dolphin.log.",
+               game_id, paths.game_dir, paths.logs);
+}
 }  // namespace
 
 RemixApi::RemixApi() = default;
@@ -659,8 +1004,43 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   }
   m_light_scale = Config::Get(Config::GFX_REMIX_LIGHT_SCALE);
 
-  const std::string dll_path_utf8 = Config::Get(Config::GFX_REMIX_DLL_PATH);
+  const std::string dll_path_utf8 = ResolveRuntimeDllPath();
   const std::wstring dll_path = UTF8ToWString(dll_path_utf8);
+
+  // Before the load, and only before it: the runtime resolves its file system
+  // from the environment inside Direct3DCreate9, under a ONCE(), and then
+  // refuses to re-initialize it.
+  ConfigureRuntimePaths();
+
+  // Which is also why a runtime that is ALREADY resident ignores everything set
+  // above: it resolves its config layers and file paths once, on load, and
+  // refuses to redo them. Two ways that happens, and the log has to distinguish
+  // them because the fixes differ:
+  //
+  //  - The file is named d3d9.dll, so Qt's platform plugin pulled it in at
+  //    startup. Permanent, affects every boot, fixed by renaming the file.
+  //  - It stayed resident from an earlier game in this session because something
+  //    holds a reference past Shutdown's FreeLibrary. Fixed by restarting.
+  //
+  // Either way per-game files silently do not apply, which is exactly the bug
+  // this feature exists to prevent, so it must not pass quietly.
+  if (s_env_applied)
+  {
+    const HMODULE resident = GetModuleHandleW(dll_path.c_str());
+    if (resident != nullptr)
+    {
+      wchar_t resident_path[MAX_PATH] = {};
+      GetModuleFileNameW(resident, resident_path, static_cast<DWORD>(std::size(resident_path)));
+
+      WARN_LOG_FMT(VIDEO,
+                   "Remix: '{}' was already loaded before this game started, so the per-game "
+                   "folders set up above are NOT in effect - the runtime is still using whatever "
+                   "it resolved at load time. If that file is named d3d9.dll, Qt's platform plugin "
+                   "loaded it during startup and renaming it is the fix; otherwise it survived a "
+                   "previous game in this session and restarting Dolphin is.",
+                   WStringToUTF8(resident_path));
+    }
+  }
 
   remixapi_ErrorCode status =
       remixapi_lib_loadRemixDllAndInitialize(dll_path.c_str(), &m_interface, &m_dll);

@@ -205,7 +205,7 @@ void GameConfigWidget::CreateWidgets()
   auto* tab_widget = new QTabWidget;
   tab_widget->addTab(general_widget, tr("General"));
 
-  auto* const gfx_widget = new GraphicsPane{nullptr, m_layer.get()};
+  auto* const gfx_widget = new GraphicsPane{nullptr, m_layer.get(), m_game_id};
   tab_widget->addTab(gfx_widget, tr("Graphics"));
 
   const int editor_index = tab_widget->addTab(advanced_widget, tr("Editor"));

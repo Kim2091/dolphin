@@ -5,6 +5,8 @@
 
 #include <QDialogButtonBox>
 #include <QEvent>
+
+#include <utility>
 #include <QGroupBox>
 #include <QLabel>
 #include <QTabWidget>
@@ -24,8 +26,9 @@
 
 #include "VideoCommon/VideoBackendBase.h"
 
-GraphicsPane::GraphicsPane(MainWindow* main_window, Config::Layer* config_layer)
-    : m_main_window(main_window), m_config_layer{config_layer}
+GraphicsPane::GraphicsPane(MainWindow* main_window, Config::Layer* config_layer,
+                           std::string game_id)
+    : m_main_window(main_window), m_config_layer{config_layer}, m_game_id{std::move(game_id)}
 {
   CreateMainLayout();
 

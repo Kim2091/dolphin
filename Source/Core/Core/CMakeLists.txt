@@ -571,6 +571,8 @@ add_library(core
   PowerPC/SignatureDB/MEGASignatureDB.h
   PowerPC/SignatureDB/SignatureDB.cpp
   PowerPC/SignatureDB/SignatureDB.h
+  RemixPaths.cpp
+  RemixPaths.h
   State.cpp
   State.h
   SyncIdentifier.h

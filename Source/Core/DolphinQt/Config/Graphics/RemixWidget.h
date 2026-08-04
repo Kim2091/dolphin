@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include <QString>
@@ -51,6 +52,11 @@ private:
 
   void CreateWidgets();
   void AddSetting(QGroupBox* box, QFormLayout* form, const Config::RemixSettingMeta& meta);
+  // Creates this game's Remix folder if it does not exist yet and shows it in
+  // the file manager. Creating is the point as much as opening is: the Remix
+  // Toolkit's project wizard has to be pointed at the folder, so it has to exist
+  // before the game has ever been played.
+  void OnOpenFolder();
 
   void OnBackendChanged(const QString& backend_name);
   void OnEmulationStateChanged(bool running);
@@ -61,6 +67,9 @@ private:
   void ApplyLiveness();
 
   Config::Layer* m_game_layer = nullptr;
+  // Empty in the global dialog, where the button falls back to the game that is
+  // running, and then to the root folder holding all of them.
+  std::string m_game_id;
   QWidget* m_content = nullptr;
   QLineEdit* m_filter = nullptr;
   QGroupBox* m_diagnostics_box = nullptr;

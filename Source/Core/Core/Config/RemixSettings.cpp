@@ -11,7 +11,26 @@ namespace Config
 // bare name resolves next to Dolphin.exe; RemixSceneScale is pushed to the
 // runtime as rtx.sceneScale (centimetres per GC world unit) and RemixLightScale
 // multiplies the radiance derived from XF lights.
-const Info<std::string> GFX_REMIX_DLL_PATH{{System::GFX, "Settings", "RemixDllPath"}, "d3d9.dll"};
+//
+// ⚠ THE FILENAME IS LOAD-BEARING AND MUST NOT BE `d3d9.dll`. Qt's Windows
+// platform plugin (QtPlugins\platforms\qwindows.dll) has a real import on
+// d3d9.dll, and Windows resolves an implicit import out of the APPLICATION
+// directory first - so a Remix runtime named d3d9.dll next to Dolphin.exe is
+// loaded and fully self-initialized while Qt is starting up, before any game is
+// chosen. Measured: the runtime parsed its config layers 1.8 seconds before the
+// video backend ran. Nothing set afterwards can reach it, which silently
+// disables per-game files (RemixPerGamePaths) altogether.
+//
+// Any other name is fine - the backend loads it explicitly and calls it through
+// its remixapi_* exports, so nothing depends on it being a d3d9 stand-in. Doing
+// this also stops a 242 MB path tracer from being loaded into every Dolphin
+// process regardless of which backend is selected.
+//
+// A runtime still named d3d9.dll is found anyway (RemixApi::Initialize falls
+// back to it and says so), so an existing install keeps working - it just cannot
+// have per-game files until the file is renamed.
+const Info<std::string> GFX_REMIX_DLL_PATH{{System::GFX, "Settings", "RemixDllPath"},
+                                           "d3d9-remix.dll"};
 const Info<float> GFX_REMIX_SCENE_SCALE{{System::GFX, "Settings", "RemixSceneScale"}, 1.0f};
 const Info<float> GFX_REMIX_LIGHT_SCALE{{System::GFX, "Settings", "RemixLightScale"}, 1.0f};
 const Info<bool> GFX_REMIX_LOG_STATS{{System::GFX, "Settings", "RemixLogStats"}, true};
@@ -734,6 +753,61 @@ const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT{
 // RemixGxLightDropDistant already implies this off - dropping the game's suns
 // and then inserting our own would cancel out.
 const Info<bool> GFX_REMIX_FALLBACK_LIGHT{{System::GFX, "Settings", "RemixFallbackLight"}, true};
+// Give every game its own rtx.conf, mods folder, captures folder and runtime
+// log, under <Dolphin.exe dir>/Remix/<GameID>/.
+//
+// Without this every title shares the single rtx.conf next to Dolphin.exe, and
+// that file holds mesh and texture hashes: a skybox or ignore tag written while
+// playing one game is read back while playing another, where the hash means
+// something else entirely or nothing at all. That is not hypothetical - a stale
+// skybox tag from one title deleted another title's sky, silently, and cost a
+// day to find.
+//
+// The mechanism is the runtime's own: the paths are handed over in five
+// environment variables it reads at load time (DXVK_RTX_CONFIG_FILE,
+// DXVK_USER_CONFIG_FILE, DEFAULT_MODS_DIR, DXVK_CAPTURE_PATH, DXVK_LOG_PATH).
+//
+// The rtx.conf and user.conf next to Dolphin.exe are TEMPLATES. A game's folder
+// is seeded from them the first time it is set up and the game then owns its
+// copies outright - they are not layered underneath it afterwards, and nothing
+// ever writes back to them. So a game's config is genuinely its own: deleting
+// something from it deletes it, rather than being re-supplied from below on the
+// next boot. The trade is deliberate - a later improvement to a template does
+// not reach games that already exist.
+//
+// DXVK_USER_CONFIG_FILE is a fork addition and is the load-bearing one: every
+// dev-menu edit targets the USER layer, so without it a texture tagged in one
+// game is read back in every other game, which is the failure this exists to
+// stop. A stock runtime ignores it.
+//
+// False restores the single shared set of files exactly.
+const Info<bool> GFX_REMIX_PER_GAME_PATHS{{System::GFX, "Settings", "RemixPerGamePaths"}, true};
+// Where the per-game folders live. Empty means `Remix` next to Dolphin.exe,
+// falling back to the Dolphin user directory when the executable's own directory
+// cannot be written to.
+//
+// It is a setting rather than a constant for two reasons. A development build
+// runs out of a build output directory, and cleaning that directory would delete
+// mod projects. And the RTX Remix Toolkit binds a project to one of these
+// folders with a SYMLINK PAIR, so once a project exists the folder cannot be
+// moved or renamed without breaking it - which makes "choose the location before
+// you start" worth offering, and makes changing it afterwards something to do
+// deliberately.
+const Info<std::string> GFX_REMIX_PER_GAME_ROOT{{System::GFX, "Settings", "RemixPerGameRoot"}, ""};
+// Whether the per-game folder supplies the runtime's mods directory too.
+//
+// The runtime takes exactly ONE mods directory, so this is a straight choice
+// rather than a preference: on, the game reads <root>/<GameID>/rtx-remix/mods
+// and the shared rtx-remix/mods next to Dolphin.exe is not searched at all; off,
+// every game shares that one folder and per-game mods are not possible. Per-game
+// is the useful default because a GameCube mod is authored against one title's
+// meshes and textures, and the Toolkit's project wizard expects a folder per
+// project.
+//
+// Turn it off if you have mods in the shared folder that you want every game to
+// see. The rest of the separation - config, captures, log - is unaffected either
+// way.
+const Info<bool> GFX_REMIX_PER_GAME_MODS{{System::GFX, "Settings", "RemixPerGameMods"}, true};
 
 // The GUI's view of everything above. Rows are in README section order; the
 // tooltips are the comments above rewritten for someone who has never read this
@@ -810,8 +884,11 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
     // Runtime and scale.
     Text(&GFX_REMIX_DLL_PATH, "Runtime DLL",
          "Filename or path of the Remix runtime DLL to load. It is passed straight to LoadLibrary, "
-         "so the bare name 'd3d9.dll' resolves next to Dolphin.exe. Point it elsewhere to try a "
-         "different Remix build without moving files around.",
+         "so a bare name resolves next to Dolphin.exe. Point it elsewhere to try a different Remix "
+         "build without moving files around.<br><br>Do not call the file 'd3d9.dll': Qt's Windows "
+         "plugin imports that name, so Windows would load the runtime while Dolphin is still "
+         "starting up - before a game is picked, which makes per-game Remix files impossible. A "
+         "runtime still named d3d9.dll is loaded anyway, with a warning.",
          Group::RuntimeScale),
     Real(&GFX_REMIX_SCENE_SCALE, "World scale (cm per game unit)",
          "Centimetres per GameCube world unit, handed to the runtime as rtx.sceneScale. It drives "
@@ -829,6 +906,29 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
          "GameCube lights can be configured with no distance falloff at all, and the brightness "
          "conversion borrowed from Direct3D needs a range; this stands in for it.",
          Group::RuntimeScale, 1.0f, 100000.0f, 100.0f),
+
+    // Files and per-game folders.
+    Toggle(&GFX_REMIX_PER_GAME_PATHS, "Separate Remix files per game",
+           "Give each game its own settings, mods, captures and runtime log, under "
+           "Remix\\<GameID>\\ next to Dolphin.exe. Otherwise every game shares one rtx.conf - and "
+           "that file holds mesh and texture hashes, so a skybox or ignore tag saved while playing "
+           "one game is read back while playing another, where it means something else.<br><br>The "
+           "rtx.conf and user.conf next to Dolphin.exe act as templates: a new game's folder is "
+           "copied from them once, and after that the game is completely independent. They are "
+           "never edited by Dolphin or by the Remix menu, so they stay a clean starting point.",
+           Group::Files),
+    Text(&GFX_REMIX_PER_GAME_ROOT, "Per-game folder location",
+         "Where those per-game folders live. Empty means a Remix folder next to Dolphin.exe, or "
+         "the Dolphin user folder if that cannot be written to. Worth setting deliberately: the "
+         "RTX Remix Toolkit links a mod project to one of these folders, and moving or renaming it "
+         "afterwards breaks that link.",
+         Group::Files),
+    Toggle(&GFX_REMIX_PER_GAME_MODS, "Per-game mods folder",
+           "Load mods from the game's own folder rather than from the shared rtx-remix\\mods next "
+           "to Dolphin.exe. The runtime accepts only one mods folder, so this is a choice between "
+           "the two, not an addition: with this on the shared folder is not searched at all. Turn "
+           "it off if you have mods there that every game should see.",
+           Group::Files),
 
     // Camera recovery.
     Toggle(&GFX_REMIX_CAMERA_RECOVERY, "Camera recovery",

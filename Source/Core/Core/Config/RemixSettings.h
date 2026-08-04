@@ -70,11 +70,14 @@ extern const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX;
 extern const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD_BLANK;
 extern const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT;
 extern const Info<bool> GFX_REMIX_FALLBACK_LIGHT;
+extern const Info<bool> GFX_REMIX_PER_GAME_PATHS;
+extern const Info<std::string> GFX_REMIX_PER_GAME_ROOT;
+extern const Info<bool> GFX_REMIX_PER_GAME_MODS;
 
 // Must equal the number of extern Info<> declarations above. The metadata table
 // in RemixSettings.cpp static_asserts against this; if you add a knob, add its
 // table row or the build breaks.
-inline constexpr size_t kRemixSettingCount = 57;
+inline constexpr size_t kRemixSettingCount = 60;
 
 // One row per knob: how to edit it, where it belongs, whether it can be changed
 // while a game is running, and what it is for in plain language.
@@ -90,6 +93,7 @@ struct RemixSettingMeta
   enum class Group
   {
     RuntimeScale,
+    Files,
     CameraRecovery,
     Sky,
     GxSemantics,

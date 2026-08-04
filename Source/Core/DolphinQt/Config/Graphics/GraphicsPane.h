@@ -5,6 +5,8 @@
 
 #include <QWidget>
 
+#include <string>
+
 class MainWindow;
 
 namespace Config
@@ -16,9 +18,13 @@ class GraphicsPane final : public QWidget
 {
   Q_OBJECT
 public:
-  explicit GraphicsPane(MainWindow* main_window, Config::Layer* config_layer);
+  // game_id is set only when the pane is the per-game one in a game's Properties
+  // dialog; empty in the global Graphics window.
+  explicit GraphicsPane(MainWindow* main_window, Config::Layer* config_layer,
+                        std::string game_id = {});
 
   Config::Layer* GetConfigLayer();
+  const std::string& GetGameId() const { return m_game_id; }
 
 signals:
   void BackendChanged(const QString& backend);
@@ -31,4 +37,5 @@ private:
 
   MainWindow* const m_main_window;
   Config::Layer* const m_config_layer;
+  const std::string m_game_id;
 };
