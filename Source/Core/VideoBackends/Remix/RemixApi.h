@@ -1101,6 +1101,13 @@ private:
   static constexpr u32 MAX_VIEW_CONSENSUS_REQUIRED = 6;
 
   void OnAfterFrame();
+  // Re-reads the handful of knobs that are allowed to change while a game is
+  // running. Everything else is read once in Initialize and then baked into
+  // meshes, materials, lights and classification state, so re-reading it would
+  // be a lie; see the Liveness column of the metadata table in
+  // Core/Config/RemixSettings.cpp, which is what the settings GUI greys out on.
+  // Called at the very end of OnAfterFrame so a frame never straddles an edit.
+  void RefreshLiveConfig();
   void LogProjectionVariants();
   // Union of every projection variant's depth range this frame. Shared by
   // SetupCamera and the sky classifier's size gate so the two cannot disagree

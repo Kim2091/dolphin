@@ -111,6 +111,8 @@ add_executable(dolphin-emu
   Config/Graphics/ColorCorrectionConfigWindow.h
   Config/Graphics/PostProcessingConfigWindow.cpp
   Config/Graphics/PostProcessingConfigWindow.h
+  Config/Graphics/RemixWidget.cpp
+  Config/Graphics/RemixWidget.h
   Config/GraphicsModListWidget.cpp
   Config/GraphicsModListWidget.h
   Config/GraphicsModWarningWidget.cpp

@@ -4179,6 +4179,32 @@ void RemixApi::OnAfterFrame()
   m_efb_copies.clear();
   m_ui_footprints.clear();
   ++m_frame_index;
+
+  // Last, so this frame ran on one consistent set of values and the next frame
+  // picks up any edit made in the meantime.
+  RefreshLiveConfig();
+}
+
+void RemixApi::RefreshLiveConfig()
+{
+  // Exactly the knobs nothing bakes: UI mode is routing consumed per draw, and
+  // the rest gate log lines. Adding a knob here means proving that nothing
+  // built at Initialize time - a mesh, a material, a light, the overlay surface
+  // size - was derived from it. The settings GUI greys out every other knob
+  // while a game runs, so this list and the metadata table's Liveness column
+  // have to agree.
+  m_ui_mode = Config::Get(Config::GFX_REMIX_UI_MODE);
+  m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
+  m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
+  m_trace_modelviews = Config::Get(Config::GFX_REMIX_TRACE_MODELVIEWS);
+  m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
+  m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
+  m_ui_dump_frame = Config::Get(Config::GFX_REMIX_UI_DUMP_FRAME);
+  // Same coupling as Initialize: the histogram is what the camera is read out
+  // of, so turning the trace off must not be able to take the camera down with
+  // it.
+  if (m_camera_from_modelview)
+    m_trace_modelviews = true;
 }
 
 }  // namespace Remix

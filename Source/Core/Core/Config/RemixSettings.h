@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <cstddef>
+#include <span>
 #include <string>
+#include <variant>
 
 #include "Common/Config/Config.h"
 
@@ -67,5 +70,78 @@ extern const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX;
 extern const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD_BLANK;
 extern const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT;
 extern const Info<bool> GFX_REMIX_FALLBACK_LIGHT;
+
+// Must equal the number of extern Info<> declarations above. The metadata table
+// in RemixSettings.cpp static_asserts against this; if you add a knob, add its
+// table row or the build breaks.
+inline constexpr size_t kRemixSettingCount = 57;
+
+// One row per knob: how to edit it, where it belongs, whether it can be changed
+// while a game is running, and what it is for in plain language.
+//
+// It lives in Core rather than in DolphinQt so that the settings and their
+// descriptions stay one thing. The GUI walks this table and emits a control per
+// row, so a knob that is declared but has no row is a build failure rather than
+// a silently unreachable option.
+struct RemixSettingMeta
+{
+  // The sections of Source/Core/VideoBackends/Remix/README.md, in the order the
+  // GUI shows them.
+  enum class Group
+  {
+    RuntimeScale,
+    CameraRecovery,
+    Sky,
+    GxSemantics,
+    ProjectionViewport,
+    UiOverlay,
+    Efb,
+    Diagnostics,
+  };
+
+  // Whether the backend ever re-reads the value. RequiresRestart knobs are read
+  // once when the backend starts and are then baked into meshes, materials,
+  // lights and classification state, so editing one mid-game does nothing;
+  // Live knobs are re-read at every frame boundary
+  // (RemixApi::RefreshLiveConfig).
+  enum class Liveness
+  {
+    Live,
+    RequiresRestart,
+  };
+
+  enum class Maturity
+  {
+    Stable,
+    Experimental,
+    Diagnostic,
+  };
+
+  // Which setting this row describes. The engaged alternative also decides
+  // which control the GUI emits: bool -> checkbox, int -> spin box or combo box
+  // (combo when `choices` is non-empty), float -> slider, string -> line edit.
+  std::variant<const Info<bool>*, const Info<int>*, const Info<float>*, const Info<std::string>*>
+      setting;
+  // Plain, untranslated help text. Knob names are INI identifiers that must not
+  // be translated, and Core strings cannot go through Qt's translation
+  // pipeline, so the whole tab is deliberately English-only.
+  const char* tooltip;
+  Group group;
+  Liveness liveness;
+  Maturity maturity;
+  // Range and granularity of the numeric control. Where RemixApi::Initialize
+  // clamps the value these match that clamp exactly, so the GUI cannot offer a
+  // value the backend would refuse; elsewhere they are merely generous. Unused
+  // on bool and string rows.
+  float min;
+  float max;
+  float step;
+  // Non-empty only on int rows that should be a combo box. The stored value is
+  // the combo INDEX, so entry n must describe value n.
+  std::span<const char* const> choices;
+};
+
+// The table itself, in GUI display order. Exactly kRemixSettingCount rows.
+std::span<const RemixSettingMeta> GetRemixSettingsMetadata();
 
 }  // namespace Config

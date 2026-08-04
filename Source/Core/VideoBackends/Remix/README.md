@@ -101,18 +101,35 @@ must go in `GFX.ini`.
 
 ## Configuration
 
-Options live in `%APPDATA%\Dolphin Emulator\Config\GFX.ini` under `[Settings]`.
-Every knob is declared in `Source/Core/Core/Config/GraphicsSettings.cpp` with a
-comment explaining what it is for and why its default is what it is; the tables
-below are a summary, and that file is the authority.
+Every knob is editable in the GUI: **Options → Graphics → Remix**. Labels there
+are the exact INI key names used below, and each carries a plain-language
+tooltip.
+
+The same tab appears under **right-click a game → Properties → Game Config →
+Graphics → Remix**, which scopes any of these to one title. Per-game values land
+in `User\GameSettings\<GameID>.ini` under `[Video_Settings]`, are shown in bold,
+and are cleared by right-clicking the control. Editing that file by hand works
+just as well.
+
+Global values live in `%APPDATA%\Dolphin Emulator\Config\GFX.ini` under
+`[Settings]`. All 57 knobs are declared in
+`Source/Core/Core/Config/RemixSettings.cpp` with a comment explaining what each
+is for and why its default is what it is; the tables below are a summary, and
+that file is the authority. The metadata table at the bottom of the same file is
+what generates the GUI tab, so a knob cannot exist without being editable.
 
 Two conventions hold throughout:
 
 - **Most of these are correctness fixes whose `False` position is exactly the
   behaviour before the fix existed.** That is deliberate, so any of them can be
   A/B tested cleanly against a bug without building anything.
-- **Changes take effect at backend init**, i.e. when emulation starts. Nothing
-  here is live; restart the game after editing.
+- **Changes take effect at backend init**, i.e. when emulation starts. Restart
+  the game after editing. The exceptions are seven knobs that are re-read at
+  every frame boundary (`RemixApi::RefreshLiveConfig`) and can therefore be
+  changed mid-game: `RemixUiMode`, `RemixLogStats`, `RemixTraceProjections`,
+  `RemixTraceModelviews`, `RemixTraceColors`, `RemixTraceEfbCopies` and
+  `RemixUiDumpFrame`. Everything else is baked into meshes, materials, lights or
+  classification state and the GUI greys it out while a game is running.
 
 ### Not optional in practice
 
@@ -182,6 +199,8 @@ All default on; `False` is the pre-fix behaviour in every case.
 | `RemixGxBlend` | `True` | Translate GX blend factors to Vulkan ones for the runtime's own classifier, rather than leaving everything opaque. |
 | `RemixGxLightFix` | `True` | XF light kinds by attenuation function, calibrated radiance, and the spot cone axis/angle. |
 | `RemixGxLightNoFalloffDistant` | `True` | Route a Spot whose distance **and** angular attenuation are both constant to a *distant* light. GX has no directional type, so a sun is an ordinary light parked far away with falloff off; as a sphere it takes a 1/r² the console never applied, contributes nothing, and still suppresses `rtx.fallbackLightMode`. |
+| `RemixGxLightDropDistant` | `False` | Drop the game's *directional* lights so an atmosphere mod owns the key light — two suns double up and the game's flat white fights the mod's. Positional lights are kept. Default off, because with no sky mod loaded this removes the scene's only key light. Watch the frame line's `dropped` count. |
+| `RemixFallbackLight` | `True` | The backend's own single distant light, drawn only on frames where the scene submitted **no** lights at all — many GC titles bake lighting into vertex colours and enable none. **Not** the runtime's `rtx.fallbackLightMode`; that is a third, separate mechanism in `rtx.conf`. Turn it off whenever a sky mod provides the light; `RemixGxLightDropDistant` already implies off. |
 | `RemixWorldScissorSkip` | `True` | Skip world draws whose scissor result is empty. Only the all-or-nothing case — a path tracer has no screen-space clip. |
 
 ### Projection and viewport
@@ -201,6 +220,7 @@ All default on; `False` is the pre-fix behaviour in every case.
 | `RemixUiRasChannel` | bool | `True` | The per-stage RAS-channel rule applied to ortho draws. **This is what removes Wind Waker's leaked title-screen HUD.** |
 | `RemixUiDropDstAlpha` | bool | `True` | Skip UI draws whose colour blend factor is `DST_ALPHA`/`ONE_MINUS_DST_ALPHA`. A screen overlay composites at present time, so there is no EFB alpha for the factor to read — the draw is not representable, and falling through to `Over` at full weight produces an opaque wash. |
 | `RemixUiDropEfbCopyTextures` | bool | `False` | Filter UI draws textured from EFB-copy RAM. Measured a no-op on Wind Waker (0 of 691,200 pixels), hence off. |
+| `RemixUiDropPreWorldBlank` | bool | `True` | Drop **untextured** 2D draws that arrive before any world geometry this frame. Those are EFB clears and scratch fills, not UI: the console draws the scene over them, but this backend composites 2D *on top* of the traced image, so they paint the screen flat. The SpongeBob white-box fix. Real 2D is textured. Counter: `preworld`. |
 | `RemixWorldUiDistance` | float | `2.0` | Mode `2` only: distance of the UI plane, in near-plane units. The plane scales with distance so apparent size is unchanged. |
 | `RemixWorldUiFlipY` | bool | `False` | Mode `2` only: flip the plane vertically. |
 
