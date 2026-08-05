@@ -150,12 +150,13 @@ Two conventions hold throughout:
   behaviour before the fix existed.** That is deliberate, so any of them can be
   A/B tested cleanly against a bug without building anything.
 - **Changes take effect at backend init**, i.e. when emulation starts. Restart
-  the game after editing. The exceptions are seven knobs that are re-read at
+  the game after editing. The exceptions are eight knobs that are re-read at
   every frame boundary (`RemixApi::RefreshLiveConfig`) and can therefore be
-  changed mid-game: `RemixUiMode`, `RemixLogStats`, `RemixTraceProjections`,
-  `RemixTraceModelviews`, `RemixTraceColors`, `RemixTraceEfbCopies` and
-  `RemixUiDumpFrame`. Everything else is baked into meshes, materials, lights or
-  classification state and the GUI greys it out while a game is running.
+  changed mid-game: `RemixUiMode`, `RemixSkipMinorFrames`, `RemixLogStats`,
+  `RemixTraceProjections`, `RemixTraceModelviews`, `RemixTraceColors`,
+  `RemixTraceEfbCopies` and `RemixUiDumpFrame`. Everything else is baked into
+  meshes, materials, lights or classification state and the GUI greys it out
+  while a game is running.
 
 ### Not optional in practice
 
@@ -352,6 +353,7 @@ All default on; `False` is the pre-fix behaviour in every case.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `RemixUiMode` | int | `1` | `0` drop the game's 2D layer entirely, `1` software-rasterize it into a screen overlay, `2` place it as world-space geometry. Mode `2` is a look experiment — it is genuinely path-traced and swims when the camera moves. |
+| `RemixSkipMinorFrames` | bool | `False` | Drop presents that carry only the 2D layer between full world frames (no instances, no lights, no Present — the runtime keeps showing the last full frame). Skylanders alternates ~900 world instances with 34 perspective-projected HUD quads every other frame; traced as a scene, that strobes the world at half rate and the denoiser never settles. Judged against the recent instance-count peak, so menus (where a few quads *are* the scene) present normally. Live; validated on Skylanders only. |
 | `RemixUiOverlayScale` | float | `1.0` | Fraction of the window the overlay is rasterized at. **The main performance lever** — the overlay is CPU-rasterized and fill-rate bound, so `0.5` quarters its cost. GC UI is authored for 640×528, so there is little real detail to lose on a large window. |
 | `RemixUiScaleToXfb` | bool | `True` | Map the overlay onto the region the console *presents* (the XFB copy's source rect) instead of the EFB's full 640×528. Wind Waker presents 480 rows, so the old mapping put every element ~9% too high. |
 | `RemixUiRasChannel` | bool | `True` | The per-stage RAS-channel rule applied to ortho draws. **This is what removes Wind Waker's leaked title-screen HUD.** |

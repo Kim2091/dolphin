@@ -852,6 +852,23 @@ const Info<bool> GFX_REMIX_GPU_SKINNING{{System::GFX, "Settings", "RemixGpuSkinn
 const Info<bool> GFX_REMIX_DYNAMIC_MESH_IDENTITY{
     {System::GFX, "Settings", "RemixDynamicMeshIdentity"}, true};
 
+// Some games split one rendered frame across two presents: a full world pass,
+// then a present carrying only the 2D layer. Skylanders alternates ~900 world
+// instances with 34 HUD quads (drawn through the world path, with a
+// perspective projection and a screen-pixel modelview, so no ortho rule can
+// catch them) and zero lights. Handing that second present to the path tracer
+// as a scene strobes the world at half rate and resets the denoiser's history
+// every frame - the world never accumulates and only the sky reads. This knob
+// drops such minor frames whole: no camera update, no instances, no lights, no
+// Present, so the runtime keeps showing the last full frame and consecutive
+// full frames become adjacent for the temporal stack (which is also what lets
+// the camera estimator match deltas again - the alternation starved it to 2
+// matched samples). A frame is minor only relative to the recent peak, so all-
+// 2D stretches (menus, loads) never trip it: there the small count IS the
+// scene. Validated on Skylanders only, so it ships off; enable per game.
+const Info<bool> GFX_REMIX_SKIP_MINOR_FRAMES{
+    {System::GFX, "Settings", "RemixSkipMinorFrames"}, false};
+
 // The GUI's view of everything above. Rows are in README section order; the
 // tooltips are the comments above rewritten for someone who has never read this
 // file. See RemixSettingMeta in the header for what each column means.
@@ -1178,6 +1195,13 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "traced world, where it is genuinely lit and denoised - a look experiment that swims "
            "whenever the camera moves.",
            Group::UiOverlay, UI_MODE_CHOICES, Liveness::Live),
+    Toggle(&GFX_REMIX_SKIP_MINOR_FRAMES, "Drop 2D-only frames",
+           "Some games present twice per rendered frame: the full world, then a frame holding "
+           "only the 2D layer. Tracing that second frame as a scene makes the world strobe at "
+           "half rate and the denoiser never settles - Skylanders shows only sky without this. "
+           "Dropping the minor frame shows each full frame twice as long instead. Menus are "
+           "unaffected: a frame only counts as minor while recent frames held a real scene.",
+           Group::UiOverlay, Liveness::Live, Maturity::Experimental),
     Real(&GFX_REMIX_UI_OVERLAY_SCALE, "Overlay resolution",
          "Fraction of the window the 2D overlay is drawn at. The main UI performance lever: the "
          "overlay is rasterized on the CPU and is fill-rate bound, so 0.5 quarters its cost. At "

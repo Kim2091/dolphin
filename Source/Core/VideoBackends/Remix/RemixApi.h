@@ -1227,6 +1227,12 @@ private:
   static constexpr u32 MAX_VIEW_CONSENSUS_REQUIRED = 6;
 
   void OnAfterFrame();
+  // The tail OnAfterFrame runs whether the frame was presented or dropped as
+  // minor: per-frame state resets, the sample-history roll, the frame counter
+  // and the live-config refresh. Minor frames discard their view samples
+  // instead of rolling them, so the next full frame's deltas are measured
+  // against the previous full frame and not against a 2D pass.
+  void FinishFrame(bool minor_frame);
   // Re-reads the handful of knobs that are allowed to change while a game is
   // running. Everything else is read once in Initialize and then baked into
   // meshes, materials, lights and classification state, so re-reading it would
@@ -1402,6 +1408,12 @@ private:
   int m_ui_mode = 1;
   float m_world_ui_distance = 2.0f;
   bool m_world_ui_flip_y = false;
+  // Drop presents that carry only the 2D layer between full world frames; see
+  // GFX_REMIX_SKIP_MINOR_FRAMES for the whole story. The ring holds the last
+  // few frames' pending-instance counts (stored pre-drop) so "minor" is judged
+  // against what a real scene here recently looked like.
+  bool m_skip_minor_frames = false;
+  std::array<u32, 4> m_recent_pending{};
   // Screen overlay. Sized to the swapchain, cleared at the first UI draw of each
   // frame and handed to the runtime just before Present.
   UiRasterizer m_ui_raster;

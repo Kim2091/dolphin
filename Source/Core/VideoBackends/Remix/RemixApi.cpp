@@ -288,7 +288,30 @@ bool BucketOutranks(const ModelviewBucket& a, const ModelviewBucket& b)
 // How often the histogram prints. Tighter than the 60-frame stats cadence
 // because the window in which a game is actually rendering 3D can be short -
 // Wind Waker's title screen is over in a few hundred frames.
-constexpr u64 MODELVIEW_LOG_INTERVAL = 30;
+// Deliberately odd (as are the other report intervals): an even interval
+// samples only one parity of frame, and a game that alternates its content
+// between even and odd frames (Skylanders submits the world pass and the 2D
+// pass on alternating frames) is then invisible to every periodic report at
+// once.
+constexpr u64 MODELVIEW_LOG_INTERVAL = 31;
+
+// A frame is "minor" (a 2D-only present between full world frames) when the
+// recent peak proves a real scene exists here and this frame holds under
+// 1/MINOR_FRAME_RATIO of it. The floor keeps all-2D stretches presenting
+// normally - in a menu the few dozen quads ARE the scene.
+//
+// The ratio is "under half", not something stricter, because the 2D pass is
+// not always small: Skylanders' HUD pass is 34 instances against a ~900-
+// instance world, but its Wiimote tutorial popup is 98 instances (panels plus
+// a LIT 3D remote model - the pass even carries the scene's 3 XF lights)
+// against a 715-instance world, which a 1/8 ratio missed by a hair and the
+// strobing returned for exactly those popups. Nothing lights-based can
+// discriminate that pass; relative size is the signal that survives. The cost
+// of the loose ratio is bounded by the ring: a genuine world frame under half
+// its own recent peak (a hard cutscene cut into a sparse shot) is dropped for
+// at most the ring length (~4 frames) before the peak adapts.
+constexpr u32 MINOR_FRAME_FLOOR = 200;
+constexpr u32 MINOR_FRAME_RATIO = 2;
 
 // Do two transforms agree? Rotation and translation are tested separately - see
 // the epsilon comments above for why one combined norm silently trades one
@@ -946,6 +969,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_ui_dump_frame = Config::Get(Config::GFX_REMIX_UI_DUMP_FRAME);
   m_world_ui_distance = Config::Get(Config::GFX_REMIX_WORLD_UI_DISTANCE);
   m_world_ui_flip_y = Config::Get(Config::GFX_REMIX_WORLD_UI_FLIP_Y);
+  m_skip_minor_frames = Config::Get(Config::GFX_REMIX_SKIP_MINOR_FRAMES);
   // The histogram is what the camera is read out of, so the mode cannot run
   // without it. Forcing it on beats silently falling back to the estimator.
   if (m_camera_from_modelview)
@@ -1492,7 +1516,7 @@ void RemixApi::LogProjectionVariants()
   const bool interesting = m_projection_variant_count > 1 || m_stats.projection_oblique > 0 ||
                            m_stats.projection_overflow > 0 ||
                            m_stats.projection_uncorrectable > 0 || viewport_interesting;
-  if (!m_trace_projections && (!interesting || (m_frame_index % 60) != 0))
+  if (!m_trace_projections && (!interesting || (m_frame_index % 61) != 0))
     return;
 
   INFO_LOG_FMT(VIDEO,
@@ -3796,7 +3820,7 @@ void RemixApi::ClassifySky(u64 geometry_hash, u64 mesh_hash, const Affine& world
 
 void RemixApi::LogCameraRecovery()
 {
-  if (!m_log_stats || !m_camera_recovery || (m_frame_index % 60) != 0)
+  if (!m_log_stats || !m_camera_recovery || (m_frame_index % 61) != 0)
     return;
 
   const Affine& v = m_view;
@@ -4767,6 +4791,50 @@ void RemixApi::OnAfterFrame()
   if (!m_valid)
     return;
 
+  // CPU-thread counters, moved into this frame's stats. Drained every frame -
+  // including dropped minor frames - so one frame's accesses can never leak
+  // into the next frame's numbers.
+  RemixEFBInterface::DrainAccessCounters(m_stats.efb_peeks, m_stats.efb_pokes);
+
+  // Some games present a frame that carries only the 2D layer between full
+  // world frames (Skylanders alternates ~900 world instances with 34 HUD
+  // quads and zero lights, every other frame). Traced as a scene, that second
+  // present strobes the world at half rate and resets the denoiser's history
+  // on every frame. Judged against the recent peak, never absolutely: in a
+  // menu the few dozen quads ARE the scene and the floor keeps it presenting.
+  // The peak is read before this frame's count is stored, so the reference is
+  // strictly "the frames before this one".
+  u32 recent_peak = 0;
+  for (const u32 count : m_recent_pending)
+    recent_peak = std::max(recent_peak, count);
+  const u32 pending_count = static_cast<u32>(m_pending_instances.size());
+  m_recent_pending[m_frame_index % m_recent_pending.size()] = pending_count;
+  const bool minor_frame = m_skip_minor_frames && recent_peak >= MINOR_FRAME_FLOOR &&
+                           pending_count * MINOR_FRAME_RATIO < recent_peak;
+  if (minor_frame)
+  {
+    // Dropped whole: no camera work, no instances, no lights, no Present. The
+    // runtime keeps displaying the last full frame, and consecutive full
+    // frames become adjacent for its temporal stack. The modelview histogram
+    // is cleared here WITHOUT rolling its previous-frame state (and
+    // FinishFrame discards this frame's view samples the same way), so the
+    // next full frame's deltas pair with the previous full frame - the
+    // alternation is exactly what starved the estimator to 2 matched deltas.
+    m_pending_instances.clear();
+    m_modelviews.clear();
+    m_modelview_overflow = 0;
+    if (m_log_stats)
+    {
+      INFO_LOG_FMT(VIDEO,
+                   "Remix frame {} MINOR dropped: draws {} pending inst {} orthoskip {} | "
+                   "copies {} | recent peak {}",
+                   m_frame_index, m_stats.draws_seen, pending_count, m_stats.skipped_ortho,
+                   m_stats.efb_copies, recent_peak);
+    }
+    FinishFrame(true);
+    return;
+  }
+
   // Order matters: the camera has to be known before any instance can be placed
   // relative to it, and the estimate needs the whole frame's draws. So the
   // frame runs estimate -> camera -> instances rather than emitting instances
@@ -4797,12 +4865,25 @@ void RemixApi::OnAfterFrame()
   present_info.hwndOverride = nullptr;
   CallGuarded("Present", [&] { m_interface.Present(&present_info); });
 
-  // CPU-thread counters, moved into this frame's stats. Drained every frame
-  // rather than only on logging frames, so the line reports one frame's accesses
-  // and not sixty frames' worth.
-  RemixEFBInterface::DrainAccessCounters(m_stats.efb_peeks, m_stats.efb_pokes);
+  // One line EVERY frame, not sampled. The periodic reports below cannot see a
+  // game that alternates its content between even and odd frames: their
+  // even intervals land on one parity forever. The dominant modelview's |t| is
+  // the cheap content classifier - a view matrix carries a translation of
+  // camera order (~1e2 here) while a screen-pixel 2D matrix carries half-screen
+  // offsets and a far push (~1e3), so the value alone names the pass.
+  if (m_log_stats)
+  {
+    INFO_LOG_FMT(VIDEO,
+                 "Remix frame {} brief: draws {} inst {} orthoskip {} | xfb {} of {} copies | "
+                 "lights {} | top {} meshes rigid {} |t| {:.1f}",
+                 m_frame_index, m_stats.draws_seen, m_stats.instances_drawn,
+                 m_stats.skipped_ortho, m_stats.efb_copies_xfb, m_stats.efb_copies,
+                 m_stats.lights_distant, m_modelview_top_valid ? m_modelview_top_meshes : 0,
+                 !m_modelview_top_valid ? "-" : (AffineIsRigid(m_modelview_top) ? "yes" : "NO"),
+                 m_modelview_top_valid ? AffineTranslationLength(m_modelview_top) : 0.0f);
+  }
 
-  if (m_log_stats && (m_frame_index % 60) == 0)
+  if (m_log_stats && (m_frame_index % 61) == 0)
   {
     INFO_LOG_FMT(VIDEO,
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} efbdisc {} empty {} "
@@ -4872,6 +4953,11 @@ void RemixApi::OnAfterFrame()
   // and before this frame's samples become last frame's.
   LogModelviewHistogram();
 
+  FinishFrame(false);
+}
+
+void RemixApi::FinishFrame(bool minor_frame)
+{
   m_stats = {};
   m_frame_light_mask = 0;
   m_frame_light_color_mask = 0;
@@ -4887,9 +4973,19 @@ void RemixApi::OnAfterFrame()
   m_viewport_variants = {};
   m_viewport_variant_count = 0;
   // This frame's samples become next frame's history; reuse the old map's
-  // storage rather than reallocating a few hundred entries every frame.
-  m_view_samples.swap(m_view_samples_previous);
-  m_view_samples.clear();
+  // storage rather than reallocating a few hundred entries every frame. A
+  // dropped minor frame's samples are discarded instead of rolled: its 2D
+  // matrices must not become the history the next full frame's deltas are
+  // measured against.
+  if (minor_frame)
+  {
+    m_view_samples.clear();
+  }
+  else
+  {
+    m_view_samples.swap(m_view_samples_previous);
+    m_view_samples.clear();
+  }
   m_view_duplicate_hashes.clear();
   m_ui_frame_begun = false;
   // The EFB-space recorder, same discipline. Anything recorded but never folded
@@ -4948,6 +5044,10 @@ void RemixApi::RefreshLiveConfig()
   // while a game runs, so this list and the metadata table's Liveness column
   // have to agree.
   m_ui_mode = Config::Get(Config::GFX_REMIX_UI_MODE);
+  // Consumed once per frame at the present decision; nothing built at
+  // Initialize time depends on it, so it is safe to flip mid-game - which is
+  // also the intended A/B for diagnosing a strobing world.
+  m_skip_minor_frames = Config::Get(Config::GFX_REMIX_SKIP_MINOR_FRAMES);
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_trace_modelviews = Config::Get(Config::GFX_REMIX_TRACE_MODELVIEWS);
