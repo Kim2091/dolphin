@@ -310,6 +310,31 @@ struct FrameStats
   u32 ui_dropped_preworld = 0;
   u32 ui_dropped_fullscreen = 0;
   u32 ui_overlay_tex_registered = 0;
+  // The perspective arm of tag routing - a HUD the game draws through the 3D
+  // frustum rather than as 2D. Same one-counter-per-decision-path rule as above.
+  //
+  // `ui_tagged_persp`    - perspective draws diverted into the screen overlay by
+  //   a UI tag. Counts the DIVERT DECISION, in draws, not in tagged textures:
+  //   one tagged texture drawn eight times reads 8, consistently with every
+  //   other counter in this group. Zero while anything in the chain is off (the
+  //   knob, the routing master, mode != 1) or while the dev menu is open, and
+  //   zero on any game that has tagged nothing - which is what makes this group
+  //   the regression floor for the perspective path too. A diverted draw is also
+  //   counted in ui_placed, deliberately: it IS an overlay draw now, and the
+  //   overlay's raster/upload timings include it.
+  // `ui_persp_refused_w` - diverted draws handed BACK to the world because a
+  //   vertex sat at or behind the eye plane, where the perspective divide has no
+  //   answer. Should read zero forever: a quad parked in front of the camera
+  //   never reaches the eye. Non-zero says the tagged element is not actually
+  //   screen-parked, so the tag is on the wrong texture - the draw is not lost,
+  //   it renders as world geometry as before.
+  // `ui_persp_skinned`   - UI-tagged perspective draws kept world-side because
+  //   they are GPU-skinned. Their vertices are bone-local and the pose lives in
+  //   a palette the runtime applies, so there is no single modelview the overlay
+  //   could place them with. Non-zero means someone tagged a skinned object.
+  u32 ui_tagged_persp = 0;
+  u32 ui_persp_refused_w = 0;
+  u32 ui_persp_skinned = 0;
   // EFB copies the game triggered this frame, and the subset that could hide a
   // UI draw: not the XFB copy, and carrying the clear bit, so the region it
   // took is wiped off the EFB before anything reaches the screen. A frame whose
@@ -922,6 +947,23 @@ public:
                                  u8 alpha_test_type, u8 alpha_reference, bool emissive,
                                  u32 emissive_rgb);
 
+  // THE mesh identity: geometry bytes folded with the material hash, de-zeroed.
+  //
+  // Not an implementation detail of SubmitMesh - it is the value the runtime
+  // sees as the mesh HANDLE (SubmitMesh mints the mesh with
+  // `info.hash = ComputeMeshHash(...)`), which is in turn the key the dev menu's
+  // click-to-tag popup records for an UNTEXTURED API draw (rtx_fork_submit.cpp's
+  // keyIsMeshHash path). Every place that has to reproduce that key - the ortho
+  // tag lookup, the perspective one - therefore has to compute it the same way,
+  // from the same inputs, forever.
+  //
+  // One function rather than the expression repeated at each site, because the
+  // requirement is not "these agree today" but "these cannot be made to
+  // disagree". Skinning and sky-emissive folds need no mention here: both are
+  // already inside `geometry_hash` and `material_hash` respectively by the time
+  // anyone calls this.
+  static u64 ComputeMeshHash(u64 geometry_hash, u64 material_hash);
+
   // Whether a geometry hash has been classified as sky. Keyed on geometry rather
   // than on the mesh hash precisely so that asking this question cannot be
   // perturbed by the answer - see MeshEntry::geometry_hash.
@@ -994,6 +1036,16 @@ public:
   // grid registration.
   bool UiTagRoutingEnabled() const { return m_ui_tag_routing; }
 
+  // Whether a UI tag also diverts PERSPECTIVE draws into the screen overlay.
+  // Subordinate to UiTagRoutingEnabled - the divert requires both - so the
+  // routing master switch still kills everything tag-driven, while this one
+  // alone restores exactly the ortho-only behaviour that preceded it.
+  //
+  // Only the UI tag is involved. Ignore and World Space UI on a perspective
+  // draw are applied by the runtime's own category hook (it gets a real API
+  // draw for those), and duplicating that here would double-apply.
+  bool UiTagPerspectiveEnabled() const { return m_ui_tag_perspective; }
+
   // True while the runtime's dev menu is open. Every 2D draw is routed
   // world-side for the duration, because that is the only way the runtime's
   // click-to-tag picker can reach one - an overlay draw is finished pixels by
@@ -1037,25 +1089,48 @@ public:
                          const std::vector<u32>& indices, u8 filter_mode, u8 wrap_mode_u,
                          u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference);
 
-  // Rasterizes one orthographic draw into the screen overlay. Vertices are the
-  // decoded remixapi ones; `modelview` is the draw's GX modelview, or null when
-  // the vertices have already been baked into view space. `viewport` is the
-  // draw's viewport as an EFB-space rect (x, y, width, height) - a game is free
-  // to put its HUD in a sub-rect and a full-screen assumption would misplace it.
-  // `clip` is the draw's scissor rect (left, top, right, bottom) in EFB space,
-  // from the same ComputeScissorRects every other backend uses.
+  // Rasterizes one draw into the screen overlay. Vertices are the decoded
+  // remixapi ones; `modelview` is the draw's GX modelview, or null when the
+  // vertices have already been baked into view space. `raw_projection` is the
+  // draw's own untouched xfmem projection - read with ORTHO semantics by
+  // default, and with PERSPECTIVE semantics when `perspective` is set.
+  // `viewport` is the draw's viewport as an EFB-space rect (x, y, width,
+  // height) - a game is free to put its HUD in a sub-rect and a full-screen
+  // assumption would misplace it. `clip` is the draw's scissor rect (left, top,
+  // right, bottom) in EFB space, from the same ComputeScissorRects every other
+  // backend uses.
   //
   // `tag_bypass` marks a draw the user explicitly tagged "UI Texture". Such a
   // draw skips every drop heuristic - that tag IS the rescue lever, so an
   // automated rule must not be able to overrule it - and is marked in the
   // recorded call so the flush-time pre-world filter passes over it too. The
   // write-mask early-out is NOT bypassed: it is algebra, not a heuristic.
-  void SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
+  //
+  // `perspective` is for a HUD the game draws through the ordinary 3D frustum
+  // and parks in front of the camera - only ever reached by an explicit UI tag,
+  // never by a heuristic. It switches the View->NDC step to the GX perspective
+  // convention and adds a w guard. Its standing assumption: the rasterizer
+  // interpolates u/v/colour AFFINELY in screen space (RemixUiRaster::Vertex
+  // carries no w), which is exact only while w is effectively constant across
+  // the primitive - true of a screen-parked HUD quad, which is the only class
+  // this is for. Violated, the tell is texture skew on the tagged element,
+  // bending at the quad's diagonal; the remedy is to remove the tag.
+  //
+  // Returns whether the overlay TOOK the draw. False means "not consumed - the
+  // caller decides what happens to it", and is returned in exactly two cases:
+  // the overlay is structurally unavailable (wrong UI mode, no runtime entry
+  // point, empty geometry), or a perspective draw had a vertex at or behind the
+  // eye plane. Both leave the caller free to submit the draw as world geometry
+  // instead. A draw refused by a POLICY rule returns true: that draw was
+  // consumed and deliberately discarded, and re-submitting it world-side would
+  // undo the policy.
+  bool SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                     const std::vector<u32>& indices, const float* modelview,
-                    const std::array<float, 6>& ortho_projection,
+                    const std::array<float, 6>& raw_projection,
                     const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
                     const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
-                    const DrawBlendState& blend, bool tag_bypass = false);
+                    const DrawBlendState& blend, bool tag_bypass = false,
+                    bool perspective = false);
 
   // Records which XF lights a draw switched on, and what each one MEANS to that
   // draw - GX puts the attenuation function on the referencing channel, not on
@@ -1614,13 +1689,15 @@ private:
   bool m_ui_drop_dst_alpha = true;
   bool m_ui_drop_efb_copy_textures = false;
 
-  // Tag-driven 2D routing. All four are Live (RefreshLiveConfig re-reads them
+  // Tag-driven 2D routing. All five are Live (RefreshLiveConfig re-reads them
   // every frame boundary): they gate per-draw routing decisions and nothing
   // built at Initialize time - mesh, material, light, overlay surface - is
   // derived from any of them, which is the bar RefreshLiveConfig's comment
   // sets. RemixUiStrict being live is the point of it: it is the A/B lever for
-  // finding out which 2D elements are worth keeping.
+  // finding out which 2D elements are worth keeping, and the perspective knob
+  // is the A/B lever for "is this element better as a HUD or as world geometry".
   bool m_ui_tag_routing = true;
+  bool m_ui_tag_perspective = true;
   bool m_ui_drop_pre_world = false;
   bool m_ui_drop_fullscreen_opaque = false;
   bool m_ui_strict = false;

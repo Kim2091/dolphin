@@ -150,12 +150,13 @@ Two conventions hold throughout:
   behaviour before the fix existed.** That is deliberate, so any of them can be
   A/B tested cleanly against a bug without building anything.
 - **Changes take effect at backend init**, i.e. when emulation starts. Restart
-  the game after editing. The exceptions are twelve knobs that are re-read at
+  the game after editing. The exceptions are thirteen knobs that are re-read at
   every frame boundary (`RemixApi::RefreshLiveConfig`) and can therefore be
   changed mid-game: `RemixUiMode`, `RemixSkipMinorFrames`, `RemixLogStats`,
   `RemixTraceProjections`, `RemixTraceModelviews`, `RemixTraceColors`,
   `RemixTraceEfbCopies`, `RemixUiDumpFrame`, `RemixUiTagRouting`,
-  `RemixUiDropPreWorld`, `RemixUiDropFullScreenOpaque` and `RemixUiStrict`.
+  `RemixUiTagPerspective`, `RemixUiDropPreWorld`, `RemixUiDropFullScreenOpaque`
+  and `RemixUiStrict`.
   Everything else is baked into meshes, materials, lights or classification
   state and the GUI greys it out while a game is running.
 
@@ -361,7 +362,8 @@ All default on; `False` is the pre-fix behaviour in every case.
 | `RemixUiDropDstAlpha` | bool | `True` | Skip UI draws whose colour blend factor is `DST_ALPHA`/`ONE_MINUS_DST_ALPHA`. A screen overlay composites at present time, so there is no EFB alpha for the factor to read — the draw is not representable, and falling through to `Over` at full weight produces an opaque wash. |
 | `RemixUiDropEfbCopyTextures` | bool | `False` | Filter UI draws textured from EFB-copy RAM. Measured a no-op on Wind Waker (0 of 691,200 pixels), hence off. |
 | `RemixUiDropPreWorldBlank` | bool | `True` | Drop **untextured** 2D draws that arrive before any world geometry this frame. Those are EFB clears and scratch fills, not UI: the console draws the scene over them, but this backend composites 2D *on top* of the traced image, so they paint the screen flat. The SpongeBob white-box fix. Real 2D is textured. Counter: `preworld` (in the `UI (...)` group). |
-| `RemixUiTagRouting` | bool | `True` | Route each 2D draw by the Remix dev menu's texture category: **UI Texture** composites it and bypasses every drop heuristic, **Ignore** discards it, **World Space UI** sends it through the mode-`2` world plane. While the dev menu is open, *every* 2D draw is temporarily routed world-side so it can be clicked and tagged — which is the only way to reach an untextured white box, since it has no grid thumbnail. Textured 2D draws are registered into the runtime's texture grid so they *do* get a thumbnail. Inert until something is tagged, so on by default. Live. Tags are polled, so they apply ~2 frames late. Counters: `ui-tags ui/ign/world/tagmode`, `tex-reg`, `tagsets`, `uistate`. |
+| `RemixUiTagRouting` | bool | `True` | Route each 2D draw by the Remix dev menu's texture category: **UI Texture** composites it and bypasses every drop heuristic, **Ignore** discards it, **World Space UI** sends it through the mode-`2` world plane. While the dev menu is open, *every* 2D draw is temporarily routed world-side so it can be clicked and tagged — which is the only way to reach an untextured white box, since it has no grid thumbnail. Textured 2D draws are registered into the runtime's texture grid so they *do* get a thumbnail. Inert until something is tagged, so on by default. Live. Tags are polled, so they apply ~2 frames late. Counters: `ui-tags ui/ign/world/tagmode/persp/wref/pskin`, `tex-reg`, `tagsets`, `uistate`. |
+| `RemixUiTagPerspective` | bool | `True` | Extend the **UI Texture** tag to draws the game submits with a *perspective* projection. Not every HUD is 2D: Resident Evil 4 parks its health ring, ammo counter and nameplates a short way in front of the camera and draws them through the ordinary 3D frustum, so tagging them did nothing at all (measured: seven UI tags, zero matching draws). With this on, a tagged 3D draw is diverted into the same screen overlay the 2D layer uses, mapped through the game's own perspective matrix. Tagging works exactly as it does in 2D — per texture, or per mesh identity for an untextured draw. **Only the UI tag acts here**: `Ignore` and `World Space UI` on a 3D draw are already applied by Remix itself, which sees a real draw call for them, so this side deliberately leaves them alone. `RemixUiStrict` also stays 2D-only — applied to untagged 3D draws it would delete the world. While the dev menu is open a tagged element returns to the world so it stays clickable and the tag can be removed. **Caveat: the overlay has no depth.** A tagged element the game relied on being occluded by world geometry will draw over everything; the remedy is to remove the tag. Subordinate to `RemixUiTagRouting` — the divert requires both. Live, which is what makes "HUD or world geometry?" an A/B rather than a rebuild. Counters: `persp` (draws diverted), `wref` (handed back to the world for straddling the eye plane — expect 0), `pskin` (kept world-side because the draw is GPU-skinned). |
 | `RemixUiDropPreWorld` | bool | `False` | The textured-inclusive sibling of `RemixUiDropPreWorldBlank`: drop **every** 2D draw recorded before the frame's first world draw, texture or no texture. For games that wash the screen with a textured quad. Riskier — a real 2D background drawn before the world disappears — so off by default, per-game. The EFB-copy compose is deliberately *not* filtered: a mid-frame copy genuinely did contain the wash on console. Live. Counter: `preworld` (in the `ui-heur` group). |
 | `RemixUiDropFullScreenOpaque` | bool | `False` | Drop opaque 2D draws whose painted area covers ≥ 95% of the presented region, on a frame that already has world geometry. Such a draw hides the traced scene outright, so it is almost always a screen-space fake the console drew underneath. Off by default — a genuine full-screen 2D background on a world frame would vanish; a `UI Texture` tag rescues any specific victim. Live. Counter: `fullscr`. |
 | `RemixUiStrict` | bool | `False` | Keep only 2D draws tagged **UI Texture**; drop every untagged one. The inverse policy to the heuristics, for a game whose 2D layer is mostly washes with a few keepers. Explicit `Ignore` / `World Space UI` tags are still honoured. Needs `RemixUiTagRouting`. Live, which is what makes it usable as an A/B lever for finding the keepers. Counter: `strict`. |
@@ -390,6 +392,16 @@ misclassified copy can never look worse than the previous build.
 | **Intensity** | luminance destination format | purpose inferred | discard | Bloom/glow luminance tap, usually riding with `half`. The runtime does its own bloom; a flat clear-luminance only washes the screen. |
 | **Scene** | colour copy, ≥1 perspective draw already this frame | **heuristic** | discard | The rect very likely holds world pixels, which this backend never rasterizes — executing paints a flat clear-coloured rectangle where the console had the scene. |
 | **Composed2D** | colour copy, **zero** perspective draws so far this frame | yes, by construction | **execute** | With no world draw yet, the console's EFB held clear colour + 2D draws + pokes — exactly what this EFB holds. Render-to-texture menus, title screens, composed text windows. |
+
+"Perspective draw" here means one that reached `SubmitMesh`, so a HUD draw
+diverted by `RemixUiTagPerspective` does not count as one — correctly, by that
+signal's own definition: its pixels now land in the 2D layer, including the
+EFB-compose pass this classification feeds. The consequence to know about is that
+a frame whose *only* perspective draws are diverted HUD reads zero world draws,
+so a colour copy there classifies **Composed2D** (execute) rather than **Scene**
+(discard). Alongside hundreds of real world draws — the RE4 case — nothing moves.
+The `efb copies ... scene {} 2d {}` fields expose any shift, and the per-game
+knob is the containment if a game regresses.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

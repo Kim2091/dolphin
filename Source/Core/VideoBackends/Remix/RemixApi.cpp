@@ -1805,6 +1805,18 @@ u64 RemixApi::ComputeMaterialHash(u64 texture_hash, u8 filter_mode, u8 wrap_mode
   return NonZeroHash(material_hash);
 }
 
+u64 RemixApi::ComputeMeshHash(u64 geometry_hash, u64 material_hash)
+{
+  // The material has to participate: Remix handles ARE hashes and a mesh bakes
+  // its surface material at create time, so two material variants of the same
+  // geometry must not collapse onto one handle (whichever registered first would
+  // decide the other's appearance).
+  //
+  // De-zeroed because the runtime rejects a zero handle value, and because a
+  // key of zero would alias the "untracked" sentinels elsewhere in this file.
+  return NonZeroHash(FoldHash(geometry_hash, material_hash));
+}
+
 u64 RemixApi::UntexturedOrthoKey(const std::vector<remixapi_HardcodedVertex>& vertices,
                                  const std::vector<u32>& indices, u8 filter_mode, u8 wrap_mode_u,
                                  u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference)
@@ -1813,10 +1825,10 @@ u64 RemixApi::UntexturedOrthoKey(const std::vector<remixapi_HardcodedVertex>& ve
   // would have supplied for this draw. See the contract in the header: an ortho
   // draw is never skinned and never sky-emissive, so there is no skinning fold
   // and emissive is false - which leaves the geometry hash and the material
-  // hash, folded and de-zeroed the same way.
+  // hash, handed to the one function that defines how the two combine.
   const u64 material_hash = ComputeMaterialHash(0, filter_mode, wrap_mode_u, wrap_mode_v,
                                                 alpha_test_type, alpha_reference, false, 0);
-  return NonZeroHash(FoldHash(GeometryHash(vertices, indices), material_hash));
+  return ComputeMeshHash(GeometryHash(vertices, indices), material_hash);
 }
 
 MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
@@ -2027,11 +2039,12 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
   if (world_ui_projection == nullptr)
     ++m_frame_world_draws;
 
-  // Mesh identity = geometry bytes folded with the material hash. The material
-  // has to participate: Remix handles ARE hashes and a mesh bakes its surface
-  // material at create time, so two material variants of the same geometry must
-  // not collapse onto one handle (whichever registered first would win).
-  const u64 mesh_hash = NonZeroHash(FoldHash(geometry_hash, material.hash));
+  // Mesh identity = geometry bytes folded with the material hash, through the
+  // one function that defines that fold (see ComputeMeshHash's contract in the
+  // header). This value becomes the mesh handle, and the dev menu records it as
+  // the tag key for an untextured draw, so every other site that has to
+  // reproduce it calls the same function rather than repeating the expression.
+  const u64 mesh_hash = ComputeMeshHash(geometry_hash, material.hash);
 
   // Decided once, before anything acts on it, so that the mesh created on the
   // first submission and the bones attached on every later one cannot disagree
@@ -2681,17 +2694,22 @@ bool RemixApi::EfbDestinationDiscarded(u32 addr) const
                    addr) != m_efb_discarded_destinations.end();
 }
 
-void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
+bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                             const std::vector<u32>& indices, const float* modelview,
-                            const std::array<float, 6>& ortho_projection,
+                            const std::array<float, 6>& raw_projection,
                             const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
                             const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                            u8 wrap_mode_v, const DrawBlendState& blend, bool tag_bypass)
+                            u8 wrap_mode_v, const DrawBlendState& blend, bool tag_bypass,
+                            bool perspective)
 {
+  // The only exits that report "NOT consumed". Nothing about this draw was
+  // decided here - the overlay simply does not exist to take it - so a caller
+  // with a world path available must be free to use it rather than lose the
+  // draw. Every exit below this point returns true: those are decisions.
   if (!m_valid || m_ui_mode != 1 || vertices.empty() || indices.empty())
-    return;
+    return false;
   if (m_interface.DrawScreenOverlay == nullptr)
-    return;
+    return false;
 
   // Draws this compositing model cannot represent, refused before anything else
   // happens - ahead of Begin(), so a frame whose ONLY UI draws are these still
@@ -2721,7 +2739,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
        blend.dst_color_factor == 8 || blend.dst_color_factor == 9))
   {
     ++m_stats.ui_skipped_dst_alpha;
-    return;
+    return true;
   }
 
   // Textured from an EFB copy's destination. Nothing writes that memory on this
@@ -2745,7 +2763,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
                 blend.texture_addr) != m_efb_copy_destinations.end())
   {
     ++m_stats.ui_skipped_efb_copy_tex;
-    return;
+    return true;
   }
 
   // The overlay is sized to the swapchain. Cleared here, at the frame's first UI
@@ -2793,7 +2811,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     if (m_frame_world_draws == 0)
     {
       ++m_stats.ui_dropped_pre_world;
-      return;
+      return true;
     }
 
     // The mid-frame scratch case is NOT tested here. It has to be decided on
@@ -2821,8 +2839,12 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // The write mask is computed by ResolveBlend and was then ignored here. A draw
   // that writes no colour contributes nothing on console; one that writes no
   // alpha must not be allowed to reduce the overlay's coverage.
+  //
+  // Consumed, not refused: this draw paints nothing anywhere, so handing it back
+  // to a caller that would then render it as world geometry would resurrect
+  // pixels the console never showed.
   if ((blend.write_mask & 0x7) == 0)
-    return;
+    return true;
   // The raw GX alpha test, both comparators - not the And-only decomposition the
   // material path uses, which has to surrender to Always on any other logic op.
   call.alpha_compare = blend.raw_alpha_compare0;
@@ -2872,6 +2894,16 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   float footprint_right = std::numeric_limits<float>::lowest();
   float footprint_bottom = std::numeric_limits<float>::lowest();
 
+  // Set when a perspective draw has a vertex at or behind the eye plane, where
+  // the perspective divide has no answer. Decided across the WHOLE draw before
+  // anything acts on it: refusing only the offending vertices would tear the
+  // primitive, which is a worse outcome than handing the draw back.
+  bool behind_eye = false;
+  // Small enough that no plausible screen-parked HUD is near it, large enough
+  // that the reciprocal below stays finite. The comparison is written negated so
+  // that a NaN w - which compares false against everything - is refused too.
+  constexpr float kMinW = 1e-6f;
+
   m_ui_vertices.clear();
   m_ui_vertices.reserve(vertices.size());
   for (const remixapi_HardcodedVertex& source : vertices)
@@ -2890,10 +2922,44 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     }
 
     UiRasterizer::Vertex vertex;
-    // View -> NDC. w is 1 for an orthographic projection, which is what lets the
-    // rasterizer interpolate affinely and still be exact.
-    vertex.x = ortho_projection[0] * view[0] + ortho_projection[1];
-    vertex.y = ortho_projection[2] * view[1] + ortho_projection[3];
+    if (perspective)
+    {
+      // View -> clip -> NDC, the GX perspective convention verbatim:
+      //   clip.x = raw[0]*x + raw[1]*z, clip.y = raw[2]*y + raw[3]*z, clip.w = -z
+      // (Software/TransformUnit.cpp:64-71), divided the way Clipper.cpp:552-554
+      // divides it. raw[1] and raw[3] are the off-centre terms and are carried
+      // rather than dropped, so a game rendering its HUD through an off-axis
+      // frustum still lands where it drew it.
+      //
+      // The interpolation caveat lives here: u/v/colour are then interpolated
+      // affinely in screen space, which is exact only while w barely varies
+      // across the primitive. That is the defining property of a screen-parked
+      // HUD quad, and this path exists for nothing else - see the header.
+      const float w = -view[2];
+      if (!(w > kMinW))
+      {
+        // At or behind the eye, or NaN. Recorded and dealt with after the loop,
+        // because the verdict is a property of the whole primitive.
+        behind_eye = true;
+        // Keep the vertex finite so nothing downstream sees an infinity if this
+        // draw is somehow still read; it is discarded either way.
+        vertex.x = 0.0f;
+        vertex.y = 0.0f;
+      }
+      else
+      {
+        const float inv_w = 1.0f / w;
+        vertex.x = (raw_projection[0] * view[0] + raw_projection[1] * view[2]) * inv_w;
+        vertex.y = (raw_projection[2] * view[1] + raw_projection[3] * view[2]) * inv_w;
+      }
+    }
+    else
+    {
+      // View -> NDC. w is 1 for an orthographic projection, which is what lets
+      // the rasterizer interpolate affinely and still be exact.
+      vertex.x = raw_projection[0] * view[0] + raw_projection[1];
+      vertex.y = raw_projection[2] * view[1] + raw_projection[3];
+    }
     vertex.u = source.texcoord[0];
     vertex.v = source.texcoord[1];
     // remixapi_HardcodedVertex::color is packed B,G,R,A in memory - see
@@ -2918,6 +2984,21 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     footprint_bottom = std::max(footprint_bottom, efb_y);
   }
 
+  // Handed back to the caller rather than dropped, and before either rasterizer
+  // records anything, so the draw is untouched by the time the caller sees the
+  // false: a HUD element that straddles the eye plane is not a HUD element this
+  // overlay can place, but it is still geometry the game drew, and rendering it
+  // as world geometry is a far better failure than deleting it.
+  //
+  // Expected to read zero forever - a quad parked in front of the camera does
+  // not reach the eye - so a non-zero `wref` means the tagged element is not
+  // actually screen-parked and the tag is on the wrong texture.
+  if (perspective && behind_eye)
+  {
+    ++m_stats.ui_persp_refused_w;
+    return false;
+  }
+
   // What the draw actually covers: its geometry, cut down by its own scissor.
   const MathUtil::Rectangle<int> painted{
       std::max(static_cast<int>(std::floor(footprint_left)), static_cast<int>(clip[0])),
@@ -2938,7 +3019,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
           m_efb_discarded_rects.end())
   {
     ++m_stats.ui_dropped_pre_world;
-    return;
+    return true;
   }
 
   // A full-screen opaque 2D draw arriving AFTER world geometry.
@@ -2976,7 +3057,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     if (opaque && painted_area >= 0.95f * screen_w * screen_h)
     {
       ++m_stats.ui_dropped_fullscreen;
-      return;
+      return true;
     }
   }
 
@@ -3071,6 +3152,8 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
                    m_frame_world_draws);
     }
   }
+
+  return true;
 }
 
 void RemixApi::FoldUiIntoEfb()
@@ -5147,7 +5230,8 @@ void RemixApi::OnAfterFrame()
                  "unplaceable, {} preworld, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} "
                  "dstalpha + {} "
                  "efbcopytex, raster {} us, upload {} us) | "
-                 "ui-tags ui {} ign {} world {} tagmode {} strict {} | ui-heur preworld {} "
+                 "ui-tags ui {} ign {} world {} tagmode {} strict {} persp {} wref {} pskin {} | "
+                 "ui-heur preworld {} "
                  "fullscr {} | tex-reg {} | tagsets {}/{}/{} uistate {} | "
                  "efb copies {} ({} non-xfb+clear | xfb {} depth {} int {} scene {} 2d {} | "
                  "exec {} disc {}, {} us, {} folds) | efb peeks {} pokes {}"
@@ -5188,8 +5272,15 @@ void RemixApi::OnAfterFrame()
                  // and the 2D path is byte-identical to the pre-feature build -
                  // which is what makes this group the regression floor as well
                  // as the diagnostic.
+                 //
+                 // The same holds one layer down for the perspective arm: with
+                 // RemixUiTagPerspective off, `persp`, `wref` and `pskin` all
+                 // read zero and routing is byte-identical to the ortho-only
+                 // build, so that knob's off position is checkable from this
+                 // line alone.
                  m_stats.ui_tagged_ui, m_stats.ui_tagged_ignore, m_stats.ui_tagged_world,
-                 m_stats.ui_tagmode_world, m_stats.ui_dropped_strict,
+                 m_stats.ui_tagmode_world, m_stats.ui_dropped_strict, m_stats.ui_tagged_persp,
+                 m_stats.ui_persp_refused_w, m_stats.ui_persp_skinned,
                  m_stats.ui_dropped_preworld, m_stats.ui_dropped_fullscreen,
                  m_stats.ui_overlay_tex_registered, m_tag_ui.size(), m_tag_ignore.size(),
                  m_tag_world_ui.size(), m_runtime_ui_state,
@@ -5322,13 +5413,16 @@ void RemixApi::RefreshLiveConfig()
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
   m_ui_dump_frame = Config::Get(Config::GFX_REMIX_UI_DUMP_FRAME);
-  // Tag-driven 2D routing and its three policies. All four qualify under the
-  // rule above: they are consumed per draw at classification time, and nothing
-  // built at Initialize - mesh, material, light, overlay surface - is derived
-  // from any of them. RemixUiStrict being live is the whole point of it: it is
-  // the lever for finding out which 2D elements are worth keeping, and an A/B
-  // that needs a restart is an A/B nobody runs.
+  // Tag-driven routing and its policies. All five qualify under the rule above:
+  // they are consumed per draw at classification time, and nothing built at
+  // Initialize - mesh, material, light, overlay surface - is derived from any of
+  // them. RemixUiStrict being live is the whole point of it: it is the lever for
+  // finding out which 2D elements are worth keeping, and an A/B that needs a
+  // restart is an A/B nobody runs. RemixUiTagPerspective is live for the same
+  // reason: flipping it off mid-game is how a tagged 3D element is compared
+  // against itself as ordinary world geometry.
   m_ui_tag_routing = Config::Get(Config::GFX_REMIX_UI_TAG_ROUTING);
+  m_ui_tag_perspective = Config::Get(Config::GFX_REMIX_UI_TAG_PERSPECTIVE);
   m_ui_drop_pre_world = Config::Get(Config::GFX_REMIX_UI_DROP_PRE_WORLD);
   m_ui_drop_fullscreen_opaque = Config::Get(Config::GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE);
   m_ui_strict = Config::Get(Config::GFX_REMIX_UI_STRICT);

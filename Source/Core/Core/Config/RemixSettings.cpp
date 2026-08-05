@@ -901,6 +901,39 @@ const Info<bool> GFX_REMIX_SKIP_MINOR_FRAMES{
 const Info<bool> GFX_REMIX_UI_TAG_ROUTING{
     {System::GFX, "Settings", "RemixUiTagRouting"}, true};
 
+// Extend the "UI Texture" tag to draws the game submits with a PERSPECTIVE
+// projection.
+//
+// Not every HUD is orthographic. A GameCube game is free to park its HUD quads a
+// short distance in front of the camera and draw them through the ordinary 3D
+// frustum, and Resident Evil 4 does exactly that: tagging its health ring or
+// ammo counter "UI Texture" moved nothing, because the routing above only ever
+// looked at ortho draws. Measured on RE4: seven UI tags matching zero draws.
+// With this on, a perspective draw whose texture (or mesh identity, when it has
+// no texture) carries a UI tag is diverted into the same screen overlay the 2D
+// layer uses, transformed through the game's own perspective matrix instead of
+// the ortho one.
+//
+// Deliberately a knob of its own rather than a widening of RemixUiTagRouting:
+// the A/B that matters is "this behaviour off, 2D tag routing intact", which a
+// shared knob cannot express. It is subordinate - the divert requires BOTH, so
+// RemixUiTagRouting remains the master switch over everything tag-driven.
+//
+// Only the UI tag acts here. Ignore and World Space UI on a perspective draw are
+// already applied by the runtime itself (it sees a real API draw and its own
+// category hook handles those two); acting on them from this side as well would
+// double-apply. RemixUiStrict stays ortho-only for the obvious reason - applied
+// to untagged perspective draws it would delete the world.
+//
+// While the dev menu is open the divert is skipped, so a tagged element goes
+// back to being a clickable world object and the tag can be removed again.
+//
+// On by default because, like the routing knob itself, it is inert until
+// something is tagged. Counters: `persp`, `wref` and `pskin` in the frame line's
+// `ui-tags` group.
+const Info<bool> GFX_REMIX_UI_TAG_PERSPECTIVE{
+    {System::GFX, "Settings", "RemixUiTagPerspective"}, true};
+
 // Drop every 2D draw that arrived before any world geometry this frame, textured
 // or not.
 //
@@ -1331,6 +1364,15 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "have no thumbnail to find. Inert until something is tagged, and tags take about two "
            "frames to apply.",
            Group::UiOverlay, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_TAG_PERSPECTIVE, "Route 3D-drawn HUD by Remix texture tags",
+           "Extend the 'UI Texture' tag to elements the game draws in 3D. Not every HUD is flat 2D "
+           "- Resident Evil 4 parks its health ring and ammo counter just in front of the camera "
+           "and draws them through the ordinary 3D view, so tagging them did nothing. With this on, "
+           "a tagged 3D element is composited into the same screen overlay the 2D layer uses. Only "
+           "the 'UI Texture' tag acts here; 'Ignore' and 'World Space UI' on 3D draws are already "
+           "handled by Remix itself. Needs 'Route 2D draws by Remix texture tags'. Watch the "
+           "'persp' counter in the log.",
+           Group::UiOverlay, Liveness::Live, Maturity::Experimental),
     Toggle(&GFX_REMIX_UI_DROP_PRE_WORLD, "Drop all 2D drawn before the world",
            "Drop every 2D draw that arrives before any world geometry this frame, textured or not. "
            "The wider version of 'Drop framebuffer-clear rectangles', for games that wash the "

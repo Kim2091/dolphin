@@ -1464,6 +1464,47 @@ void ApplyProjectionCorrection(const ProjectionCorrection& c, remixapi_Transform
     transform.matrix[1][j] = c.y_scale * transform.matrix[1][j] + c.y_shear * row2;
   }
 }
+
+// Where a draw lands on the EFB, as the overlay path needs it: the viewport as
+// (x, y, width, height) and the scissor as (left, top, right, bottom), both in
+// EFB units.
+struct UiPlacement
+{
+  std::array<float, 4> viewport = {};
+  std::array<float, 4> clip = {};
+};
+
+// Viewport AND scissor, derived exactly the way BPFunctions does it for every
+// other backend - same ComputeScissorRects, same Best() rectangle, so the
+// offsets can never disagree with what the game intended.
+//
+// The scissor is not optional decoration here. GX games clip UI with it
+// constantly - sliding panels, wipes, text windows, and banks of elements that
+// are all drawn but scissored down to whichever one is showing. Without it every
+// one of them appears at once.
+//
+// Projection-agnostic on purpose, and that is a property of GX rather than an
+// assumption: this reads only viewport and scissor state, and the console
+// applies both identically whichever projection produced the NDC.
+// Clipper.cpp:547-556 maps perspective NDC through the very same
+// xfmem.viewport wd/ht/xOrig/yOrig fields an ortho draw goes through, so one
+// derivation serves the ortho overlay block and the perspective divert both.
+UiPlacement ComputeUiPlacement()
+{
+  const BPFunctions::ScissorResult scissor = BPFunctions::ComputeScissorRects(
+      bpmem.scissorTL, bpmem.scissorBR, bpmem.scissorOffset, xfmem.viewport);
+  const BPFunctions::ScissorRect native_rc = scissor.Best();
+
+  UiPlacement placement;
+  placement.viewport = {
+      (xfmem.viewport.xOrig - static_cast<float>(native_rc.x_off)) - xfmem.viewport.wd,
+      (xfmem.viewport.yOrig - static_cast<float>(native_rc.y_off)) + xfmem.viewport.ht,
+      2.0f * xfmem.viewport.wd, -2.0f * xfmem.viewport.ht};
+  placement.clip = {
+      static_cast<float>(native_rc.rect.left), static_cast<float>(native_rc.rect.top),
+      static_cast<float>(native_rc.rect.right), static_cast<float>(native_rc.rect.bottom)};
+  return placement;
+}
 }  // namespace
 
 VertexManager::VertexManager() = default;
@@ -2728,6 +2769,13 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // Mode 1 only. Mode 0 drops everything by definition, and mode 2 already
   // sends every ortho draw world-side, where the runtime applies Ignore and
   // World Space UI itself.
+  //
+  // ORTHO draws only, and that is the first of three routing sites in this
+  // function. The second is the mode-2 / world-route fall-through below. The
+  // third is the PERSPECTIVE divert near the end (after EnsureMaterial), which
+  // handles a HUD the game draws through the 3D frustum; it acts on the UI tag
+  // alone, because for a perspective draw the runtime does see a real API draw
+  // and applies Ignore and World Space UI to it itself.
   bool tag_bypass = false;
   bool route_world = false;
   if (is_ortho && ui_mode == 1 && g_remix_api->UiTagRoutingEnabled())
@@ -2806,24 +2854,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // rasterized to pixels and composited after the frame is traced, which is
     // the only way UI comes out looking like UI.
     //
-    // Viewport AND scissor, derived exactly the way BPFunctions does it for
-    // every other backend - same ComputeScissorRects, same Best() rectangle, so
-    // the offsets can never disagree with what the game intended.
-    //
-    // The scissor is not optional decoration here. GX games clip UI with it
-    // constantly - sliding panels, wipes, text windows, and banks of elements
-    // that are all drawn but scissored down to whichever one is showing. Without
-    // it every one of them appears at once.
-    const BPFunctions::ScissorResult scissor = BPFunctions::ComputeScissorRects(
-        bpmem.scissorTL, bpmem.scissorBR, bpmem.scissorOffset, xfmem.viewport);
-    const BPFunctions::ScissorRect native_rc = scissor.Best();
-    const std::array<float, 4> viewport = {
-        (xfmem.viewport.xOrig - static_cast<float>(native_rc.x_off)) - xfmem.viewport.wd,
-        (xfmem.viewport.yOrig - static_cast<float>(native_rc.y_off)) + xfmem.viewport.ht,
-        2.0f * xfmem.viewport.wd, -2.0f * xfmem.viewport.ht};
-    const std::array<float, 4> clip = {
-        static_cast<float>(native_rc.rect.left), static_cast<float>(native_rc.rect.top),
-        static_cast<float>(native_rc.rect.right), static_cast<float>(native_rc.rect.bottom)};
+    // Where it lands on the EFB, derived the way every other backend derives it.
+    // Shared with the perspective divert further down, which needs the identical
+    // placement: see ComputeUiPlacement for why one derivation serves both.
+    const UiPlacement placement = ComputeUiPlacement();
+    const std::array<float, 4>& viewport = placement.viewport;
+    const std::array<float, 4>& clip = placement.clip;
 
     // One frame's worth of the state that decides whether a UI draw is visible
     // on console. The backend reads final alpha from stage 0's texture only,
@@ -3015,6 +3051,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // no reference-projection latch, no histogram entry, no sky test), and it is
   // the path the runtime's picker can see.
   //
+  // Perspective draws also arrive here, as they always have. The third routing
+  // site - the UI-tag divert for a HUD drawn in 3D - sits further down, after
+  // EnsureMaterial, because the key it looks up is built out of the material.
+  //
   // An ortho draw hands over its raw projection and a NULL modelview:
   // the first is what maps its screen-space vertices onto the UI plane, the
   // second keeps it out of the camera histogram and the estimator both.
@@ -3050,6 +3090,80 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                                   alpha_reference, sky_emissive, blend.tfactor & 0x00FFFFFFu);
   if (material.handle == nullptr)
     return;
+
+  // ---- Tag-driven routing for PERSPECTIVE draws ----------------------------
+  //
+  // Not every HUD is 2D. A game is free to park its HUD quads a short distance
+  // in front of the camera and draw them through the ordinary 3D frustum, and
+  // Resident Evil 4 does exactly that - so a "UI Texture" tag on its health ring
+  // moved nothing, because the block above only ever looks at ortho draws.
+  // This is the third routing site (ortho overlay, ortho world-route, and now
+  // this one), and the only one that can act on a perspective draw.
+  //
+  // It sits HERE, after EnsureMaterial, and that placement is the whole reason
+  // the untextured key below is trustworthy rather than hopeful: geometry_hash
+  // (skinning fold included), material.hash (upload outcome and sky fold
+  // included) are at this point the exact two values SubmitMesh would fold into
+  // the mesh handle, which is the value the dev menu records when the user
+  // clicks an untextured object. Computing the key earlier, from re-derived
+  // inputs, is how the two drift apart.
+  //
+  // ONLY the UI tag acts. Ignore and World Space UI on a perspective draw are
+  // applied by the runtime's own category hook - it receives a real API draw and
+  // handles those two itself - so doing it here as well would double-apply.
+  // RemixUiStrict is likewise ortho-only: a policy over UNTAGGED draws, applied
+  // to perspective geometry, would delete the world.
+  if (!is_ortho && ui_mode == 1 && g_remix_api->UiTagRoutingEnabled() &&
+      g_remix_api->UiTagPerspectiveEnabled() && !g_remix_api->UiTaggingModeActive())
+  {
+    // Mode 1 is required because the overlay only exists in mode 1; diverting in
+    // mode 0 or 2 would vanish the draw rather than move it. The tagging-mode
+    // check is the mirror of the ortho block's: while the dev menu is open the
+    // element stays a world draw, because overlay pixels have no object for the
+    // click-to-tag picker to hit and a tag that cannot be removed is a trap.
+    // Neither needs a counter - nothing about the draw changed.
+    const bool textured = albedo != nullptr && albedo->HasData();
+    const u64 tag_key = textured ? albedo->GetContentHash() :
+                                   RemixApi::ComputeMeshHash(geometry_hash, material.hash);
+
+    if (g_remix_api->ClassifyUiDraw(tag_key) == RemixApi::UiTagClass::Ui)
+    {
+      if (draw_skinning != nullptr)
+      {
+        // GPU-skinned: the vertices are bone-local and the pose lives entirely
+        // in the palette the runtime applies, so there is no single modelview
+        // the overlay could place them with. Kept world-side and counted.
+        // (A CPU-baked matrix-palette draw is fine and does not land here - it
+        // passes a null raw_modelview with vertices already in view space, which
+        // is exactly SubmitUiDraw's null-modelview contract.)
+        ++stats.ui_persp_skinned;
+      }
+      else
+      {
+        // This draw's OWN projection and the RAW modelview, not the reference
+        // projection and not the folded `transform`. The projection-fold
+        // correction exists to render a foreign-frustum draw through the frame's
+        // reference camera; the overlay wants the game's own screen mapping,
+        // which is the raw pair. The fold only ever touches `transform`, so
+        // there is nothing to undo here.
+        const UiPlacement placement = ComputeUiPlacement();
+        const std::array<float, 6> persp_raw = xfmem.projection.rawProjection;
+        if (g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview, persp_raw,
+                                      placement.viewport, placement.clip, albedo, filter_mode,
+                                      wrap_mode_u, wrap_mode_v, blend, /*tag_bypass=*/true,
+                                      /*perspective=*/true))
+        {
+          ++stats.ui_tagged_persp;
+          return;
+        }
+        // False means the overlay did not take it: either it is structurally
+        // unavailable, or a vertex sat at or behind the eye plane. Fall through
+        // and submit it as world geometry, which is what it was a moment ago -
+        // a non-destructive failure either way.
+      }
+    }
+  }
+
   if (sky_emissive)
     ++stats.sky_emissive;
 
