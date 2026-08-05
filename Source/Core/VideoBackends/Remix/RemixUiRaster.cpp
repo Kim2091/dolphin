@@ -95,6 +95,9 @@ void UiRasterizer::Begin(u32 width, u32 height)
   m_height = height;
   m_touched.store(false, std::memory_order_relaxed);
   m_draw_count = 0;
+  // Per-frame like everything else here: the caller re-decides it before each
+  // Flush, from that frame's own world-draw count.
+  m_pre_world_filter = false;
   const size_t needed = static_cast<size_t>(width) * height;
   // The buffer has to come back fully transparent every frame or last frame's
   // HUD ghosts under this one's. resize + fill rather than assign so the
@@ -142,6 +145,11 @@ void UiRasterizer::RasterizeBand(int min_y, int max_y)
   {
     const RecordedDraw& draw = m_draws[i];
     if (draw.max_y < min_y || draw.min_y > max_y)
+      continue;
+    // Pre-world wash, on a frame that turned out to have world content, with no
+    // UI tag rescuing it. Skipped rather than removed, so the recorded draw
+    // keeps its storage - see SetPreWorldFilter.
+    if (m_pre_world_filter && draw.call.world_draws_at_submit == 0 && !draw.call.tag_protected)
       continue;
     const size_t triangles = draw.indices.size() / 3;
     for (size_t t = 0; t < triangles; ++t)

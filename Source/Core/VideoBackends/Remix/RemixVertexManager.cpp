@@ -2717,7 +2717,90 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   if (!is_ortho)
     g_remix_api->NoteProjectionUse(projection_slot, static_cast<u32>(out_vertices->size()));
 
-  if (is_ortho && ui_mode == 1)
+  // ---- Tag-driven 2D routing -----------------------------------------------
+  //
+  // The Remix dev menu's texture grid can categorize any texture the runtime
+  // knows about, but a category set on a 2D draw had no effect here: this
+  // backend's overlay path never produces a runtime draw call at all - it hands
+  // over finished pixels - so the runtime never gets to apply its own routing.
+  // This block applies it from our side instead, before the overlay path runs.
+  //
+  // Mode 1 only. Mode 0 drops everything by definition, and mode 2 already
+  // sends every ortho draw world-side, where the runtime applies Ignore and
+  // World Space UI itself.
+  bool tag_bypass = false;
+  bool route_world = false;
+  if (is_ortho && ui_mode == 1 && g_remix_api->UiTagRoutingEnabled())
+  {
+    // The key the runtime records for THIS draw. A textured draw is identified
+    // by its albedo's content hash - which is the hash we hand CreateTexture,
+    // and the one the grid is keyed on. An untextured draw has no texture to
+    // identify, so the runtime falls back to the mesh handle; ours is a fold of
+    // geometry and material, reproduced exactly by UntexturedOrthoKey (see the
+    // contract on that function - the two must never be allowed to drift).
+    const bool textured = albedo != nullptr && albedo->HasData();
+    const u64 tag_key =
+        textured ? albedo->GetContentHash() :
+                   g_remix_api->UntexturedOrthoKey(*out_vertices, *out_indices, filter_mode,
+                                                   wrap_mode_u, wrap_mode_v, alpha_test_type,
+                                                   alpha_reference);
+
+    // Before any drop decision, so that even a draw about to be discarded still
+    // earns a thumbnail in the grid. Otherwise the elements most in need of an
+    // explicit tag - the ones a heuristic is eating - would be exactly the ones
+    // with no way to tag them.
+    if (textured)
+      g_remix_api->RegisterOverlayTexture(albedo);
+
+    const RemixApi::UiTagClass tag = g_remix_api->ClassifyUiDraw(tag_key);
+
+    if (g_remix_api->UiTaggingModeActive())
+    {
+      // The dev menu is open. Send EVERY 2D draw through the world path for the
+      // duration: an overlay draw is finished pixels by the time the runtime
+      // sees it, so it has no object for the click-to-tag picker to hit. World
+      // draws do, including untextured white boxes - which are precisely the
+      // ones with no grid thumbnail to reach them by.
+      //
+      // All ortho draws rather than only the untagged ones, so what is on screen
+      // while tagging is predictable: the whole 2D layer, in one place, in one
+      // form.
+      route_world = true;
+      ++stats.ui_tagmode_world;
+    }
+    else
+    {
+      switch (tag)
+      {
+      case RemixApi::UiTagClass::Ui:
+        // Explicitly kept. Beats every drop rule below, including Ignore - this
+        // tag is the user's rescue lever and an automated rule must not be able
+        // to overrule it.
+        tag_bypass = true;
+        ++stats.ui_tagged_ui;
+        break;
+      case RemixApi::UiTagClass::Ignore:
+        ++stats.ui_tagged_ignore;
+        return;
+      case RemixApi::UiTagClass::WorldUi:
+        route_world = true;
+        ++stats.ui_tagged_world;
+        break;
+      case RemixApi::UiTagClass::None:
+        // Strict mode is a policy over UNTAGGED draws only, which is why it is
+        // tested here and not above: an explicit tag of any kind has already
+        // been honoured by this point.
+        if (g_remix_api->UiStrictEnabled())
+        {
+          ++stats.ui_dropped_strict;
+          return;
+        }
+        break;
+      }
+    }
+  }
+
+  if (is_ortho && ui_mode == 1 && !route_world)
   {
     // Screen overlay. This draw never becomes a mesh or an instance - it is
     // rasterized to pixels and composited after the frame is traced, which is
@@ -2921,11 +3004,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
     std::array<float, 6> ortho_raw = xfmem.projection.rawProjection;
     g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview, ortho_raw, viewport, clip,
-                              albedo, filter_mode, wrap_mode_u, wrap_mode_v, blend);
+                              albedo, filter_mode, wrap_mode_u, wrap_mode_v, blend, tag_bypass);
     return;
   }
 
-  // Mode 2. An ortho draw hands over its raw projection and a NULL modelview:
+  // Mode 2 - and, since tag routing landed, mode 1's world-routed draws: a
+  // "World Space UI" tag, or every 2D draw while the dev menu is open. Nothing
+  // below needs to distinguish them; the mode-2 path already does exactly what
+  // a world-routed ortho draw needs (raw projection handed over, null modelview,
+  // no reference-projection latch, no histogram entry, no sky test), and it is
+  // the path the runtime's picker can see.
+  //
+  // An ortho draw hands over its raw projection and a NULL modelview:
   // the first is what maps its screen-space vertices onto the UI plane, the
   // second keeps it out of the camera histogram and the estimator both.
   const std::array<float, 6>* world_ui_projection = nullptr;

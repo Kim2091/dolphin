@@ -76,11 +76,15 @@ extern const Info<bool> GFX_REMIX_PER_GAME_MODS;
 extern const Info<bool> GFX_REMIX_GPU_SKINNING;
 extern const Info<bool> GFX_REMIX_DYNAMIC_MESH_IDENTITY;
 extern const Info<bool> GFX_REMIX_SKIP_MINOR_FRAMES;
+extern const Info<bool> GFX_REMIX_UI_TAG_ROUTING;
+extern const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD;
+extern const Info<bool> GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE;
+extern const Info<bool> GFX_REMIX_UI_STRICT;
 
 // Must equal the number of extern Info<> declarations above. The metadata table
 // in RemixSettings.cpp static_asserts against this; if you add a knob, add its
 // table row or the build breaks.
-inline constexpr size_t kRemixSettingCount = 63;
+inline constexpr size_t kRemixSettingCount = 67;
 
 // One row per knob: how to edit it, where it belongs, whether it can be changed
 // while a game is running, and what it is for in plain language.

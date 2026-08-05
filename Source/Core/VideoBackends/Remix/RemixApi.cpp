@@ -1610,6 +1610,121 @@ bool RemixApi::UploadTexture(const RemixTexture& texture)
   return true;
 }
 
+void RemixApi::RegisterOverlayTexture(const RemixTexture* texture)
+{
+  if (!m_valid || texture == nullptr || !texture->HasData())
+    return;
+
+  const u64 hash = texture->GetContentHash();
+
+  // Already a material's texture. Leave it alone entirely: it is in the grid
+  // already, and adding it to the overlay-tracking map would make the idle
+  // sweep a candidate for destroying a texture the scene still samples.
+  if (m_textures.count(hash) != 0 && m_overlay_texture_frames.count(hash) == 0)
+    return;
+
+  // UploadTexture is a no-op past the first sighting (it deduplicates on the
+  // content hash), so this is a map lookup on every frame after the first.
+  if (!UploadTexture(*texture))
+    return;
+
+  const auto [it, inserted] = m_overlay_texture_frames.insert_or_assign(hash, m_frame_index);
+  (void)it;
+  if (inserted)
+    ++m_stats.ui_overlay_tex_registered;
+}
+
+RemixApi::UiTagClass RemixApi::ClassifyUiDraw(u64 key) const
+{
+  // UI first, deliberately. A hash carrying two tags is a mistake the user made
+  // in the grid, and of the possible readings the one that keeps the element on
+  // screen is the recoverable one - an Ignore that wins silently looks exactly
+  // like the feature being broken.
+  if (m_tag_ui.count(key) != 0)
+    return UiTagClass::Ui;
+  if (m_tag_ignore.count(key) != 0)
+    return UiTagClass::Ignore;
+  if (m_tag_world_ui.count(key) != 0)
+    return UiTagClass::WorldUi;
+  return UiTagClass::None;
+}
+
+bool RemixApi::PollTagSet(const char* option_name, std::unordered_set<u64>& out)
+{
+  // 256 covers any plausible hand-tagged category; the retry below is what makes
+  // that a starting size rather than a limit.
+  constexpr u32 INITIAL_CAPACITY = 256;
+  if (m_tag_poll_buffer.size() < INITIAL_CAPACITY)
+    m_tag_poll_buffer.resize(INITIAL_CAPACITY);
+
+  u32 count = 0;
+  remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  const int guard = CallGuarded("GetTextureHashList", [&] {
+    status = m_interface.GetTextureHashList(
+        option_name, m_tag_poll_buffer.data(), static_cast<u32>(m_tag_poll_buffer.size()), &count);
+  });
+  if (guard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS)
+    return false;
+
+  // Truncated: the runtime wrote the true size but no data. Grow to it and ask
+  // again. Once - a set that grew between two calls one microsecond apart will
+  // be caught by next frame's poll, and looping here would hand a misbehaving
+  // runtime the frame.
+  if (count > m_tag_poll_buffer.size())
+  {
+    m_tag_poll_buffer.resize(count);
+    const int retry_guard = CallGuarded("GetTextureHashList(retry)", [&] {
+      status = m_interface.GetTextureHashList(option_name, m_tag_poll_buffer.data(),
+                                              static_cast<u32>(m_tag_poll_buffer.size()), &count);
+    });
+    if (retry_guard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS ||
+        count > m_tag_poll_buffer.size())
+    {
+      return false;
+    }
+  }
+
+  out.clear();
+  for (u32 i = 0; i < count; ++i)
+    out.insert(m_tag_poll_buffer[i]);
+  return true;
+}
+
+void RemixApi::PollRuntimeTagState()
+{
+  if (!m_valid || !m_ui_tag_routing)
+    return;
+
+  // A runtime older than the GetTextureHashList slot cannot answer, so the
+  // feature degrades to "nothing is ever tagged" - which is exactly its off
+  // position - rather than failing. Said once, because a silent degrade here
+  // looks identical to the user never having tagged anything.
+  if (m_interface.GetTextureHashList == nullptr)
+  {
+    if (!m_tag_list_warned)
+    {
+      WARN_LOG_FMT(VIDEO,
+                   "Remix: RemixUiTagRouting is on, but the loaded runtime is too old to support "
+                   "it (no GetTextureHashList entry point). Texture tags set in the dev menu will "
+                   "not route 2D draws this session; deploy a newer d3d9-remix.dll to get them.");
+      m_tag_list_warned = true;
+    }
+    return;
+  }
+
+  PollTagSet("rtx.uiTextures", m_tag_ui);
+  PollTagSet("rtx.ignoreTextures", m_tag_ignore);
+  PollTagSet("rtx.worldSpaceUiTextures", m_tag_world_ui);
+
+  // Non-zero = the dev menu is open, which is what switches 2D draws to the
+  // world path so they can be picked and tagged. Optional slot: an older
+  // runtime just never enters tagging mode, which is harmless.
+  int ui_state = 0;
+  if (m_interface.GetUIState != nullptr)
+    CallGuarded("GetUIState", [&] { ui_state = static_cast<int>(m_interface.GetUIState()); });
+  m_runtime_ui_state = ui_state;
+}
+
 u64 RemixApi::GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
                            const std::vector<u32>& indices)
 {
@@ -1661,18 +1776,10 @@ u64 RemixApi::TopologyHash(const std::vector<remixapi_HardcodedVertex>& vertices
   return NonZeroHash(key);
 }
 
-MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                                     u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
-                                     bool emissive, u32 emissive_rgb)
+u64 RemixApi::ComputeMaterialHash(u64 texture_hash, u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
+                                  u8 alpha_test_type, u8 alpha_reference, bool emissive,
+                                  u32 emissive_rgb)
 {
-  MaterialRef result;
-  if (!m_valid)
-    return result;
-
-  u64 texture_hash = 0;
-  if (texture != nullptr && texture->HasData() && UploadTexture(*texture))
-    texture_hash = texture->GetContentHash();
-
   // Sampler AND alpha-test state participate in material identity because Remix
   // bakes both into the material, and the same texture is legitimately sampled
   // with different wrap modes - or cut out at a different alpha threshold - by
@@ -1695,7 +1802,45 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   // and the knob's off position is byte-identical to the pre-feature build.
   if (emissive)
     material_hash = FoldHash(material_hash, 0x5B10C0DEull ^ (emissive_rgb & 0x00FFFFFFu));
-  material_hash = NonZeroHash(material_hash);
+  return NonZeroHash(material_hash);
+}
+
+u64 RemixApi::UntexturedOrthoKey(const std::vector<remixapi_HardcodedVertex>& vertices,
+                                 const std::vector<u32>& indices, u8 filter_mode, u8 wrap_mode_u,
+                                 u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference)
+{
+  // The exact fold SubmitMesh performs, from the exact arguments the world path
+  // would have supplied for this draw. See the contract in the header: an ortho
+  // draw is never skinned and never sky-emissive, so there is no skinning fold
+  // and emissive is false - which leaves the geometry hash and the material
+  // hash, folded and de-zeroed the same way.
+  const u64 material_hash = ComputeMaterialHash(0, filter_mode, wrap_mode_u, wrap_mode_v,
+                                                alpha_test_type, alpha_reference, false, 0);
+  return NonZeroHash(FoldHash(GeometryHash(vertices, indices), material_hash));
+}
+
+MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
+                                     u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
+                                     bool emissive, u32 emissive_rgb)
+{
+  MaterialRef result;
+  if (!m_valid)
+    return result;
+
+  u64 texture_hash = 0;
+  if (texture != nullptr && texture->HasData() && UploadTexture(*texture))
+  {
+    texture_hash = texture->GetContentHash();
+    // This texture is now referenced by a material, so it must never be reaped
+    // as an idle overlay thumbnail: the overlay sweep would destroy a texture
+    // the scene is still sampling. Cheap - the map is empty unless tag routing
+    // has actually registered something.
+    m_overlay_texture_frames.erase(texture_hash);
+  }
+
+  const u64 material_hash = ComputeMaterialHash(texture_hash, filter_mode, wrap_mode_u, wrap_mode_v,
+                                                alpha_test_type, alpha_reference, emissive,
+                                                emissive_rgb);
 
   if (const auto it = m_materials.find(material_hash); it != m_materials.end())
   {
@@ -2541,7 +2686,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
                             const std::array<float, 6>& ortho_projection,
                             const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
                             const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
-                            u8 wrap_mode_v, const DrawBlendState& blend)
+                            u8 wrap_mode_v, const DrawBlendState& blend, bool tag_bypass)
 {
   if (!m_valid || m_ui_mode != 1 || vertices.empty() || indices.empty())
     return;
@@ -2566,7 +2711,12 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // Colour factors only. The alpha equation's factors decide the destination
   // ALPHA, which on the overlay is coverage rather than a colour anyone sees, and
   // widening the rule to them would refuse draws whose visible output is fine.
-  if (m_ui_drop_dst_alpha && blend.blend_enabled &&
+  //
+  // Every drop rule from here down is skipped for a draw the user explicitly
+  // tagged "UI Texture". The tag is the escape hatch these rules are documented
+  // as having, so an automated rule that could still overrule it would make the
+  // escape hatch a lie.
+  if (!tag_bypass && m_ui_drop_dst_alpha && blend.blend_enabled &&
       (blend.src_color_factor == 8 || blend.src_color_factor == 9 ||
        blend.dst_color_factor == 8 || blend.dst_color_factor == 9))
   {
@@ -2589,7 +2739,8 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // quad reads src 0x0065ff20, which is exactly the destination the copy
   // recorder saw one draw earlier, and no other draw in the frame is anywhere
   // near it.
-  if (m_ui_drop_efb_copy_textures && texture != nullptr && blend.texture_addr != 0 &&
+  if (!tag_bypass && m_ui_drop_efb_copy_textures && texture != nullptr &&
+      blend.texture_addr != 0 &&
       std::find(m_efb_copy_destinations.begin(), m_efb_copy_destinations.end(),
                 blend.texture_addr) != m_efb_copy_destinations.end())
   {
@@ -2637,7 +2788,7 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // Untextured is load-bearing: real 2D content is textured, so this cannot
   // swallow a menu or a HUD element. The pre-world test is what separates a
   // clear from a legitimate 2D layer drawn after the scene.
-  if (m_ui_drop_pre_world_blank && call.texture.pixels == nullptr)
+  if (!tag_bypass && m_ui_drop_pre_world_blank && call.texture.pixels == nullptr)
   {
     if (m_frame_world_draws == 0)
     {
@@ -2782,13 +2933,61 @@ void RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   //
   // Exact match against a rect we discard a copy of, and untextured, for the
   // same reason as before: it is the tightest test that catches the case.
-  if (m_ui_drop_pre_world_blank && call.texture.pixels == nullptr &&
+  if (!tag_bypass && m_ui_drop_pre_world_blank && call.texture.pixels == nullptr &&
       std::find(m_efb_discarded_rects.begin(), m_efb_discarded_rects.end(), painted) !=
           m_efb_discarded_rects.end())
   {
     ++m_stats.ui_dropped_pre_world;
     return;
   }
+
+  // A full-screen opaque 2D draw arriving AFTER world geometry.
+  //
+  // Composited over the traced image, such a draw hides the scene outright -
+  // there is nothing left of the frame to see. On console it is almost always
+  // either a screen-space fake drawn underneath everything, or a fade this
+  // compositing model has no way to express. Three conditions, each doing real
+  // work:
+  //
+  //   world draws > 0 - before any world geometry this is a clear, which the
+  //     pre-world rules already own; after it, the scene exists and is being
+  //     covered.
+  //   opaque         - a blended full-screen quad is an ordinary fade and stays.
+  //     The two accepted forms are exactly the mapping to BlendMode::Opaque
+  //     above: blending off, or One/Zero.
+  //   >= 95% of the presented region - measured on `painted`, i.e. geometry cut
+  //     down by the draw's own scissor, not on the scissor alone. A quad
+  //     scissored to the whole screen that covers one corner is not this.
+  //
+  // Placed here, after `painted` and before either rasterizer records, so the
+  // EFB compose sees the same 2D layer the overlay does - the same rule every
+  // other drop above follows.
+  if (!tag_bypass && m_ui_drop_fullscreen_opaque && m_frame_world_draws > 0)
+  {
+    const bool opaque = !blend.blend_enabled ||
+                        (blend.src_color_factor == 1 && blend.dst_color_factor == 0);
+    // The presented region in EFB units, which is the space `painted` is in.
+    const float screen_w = m_presented_width != 0 ? static_cast<float>(m_presented_width) :
+                                                    static_cast<float>(EFB_WIDTH);
+    const float screen_h = m_presented_height != 0 ? static_cast<float>(m_presented_height) :
+                                                     static_cast<float>(EFB_HEIGHT);
+    const float painted_area = static_cast<float>(std::max(0, painted.GetWidth())) *
+                               static_cast<float>(std::max(0, painted.GetHeight()));
+    if (opaque && painted_area >= 0.95f * screen_w * screen_h)
+    {
+      ++m_stats.ui_dropped_fullscreen;
+      return;
+    }
+  }
+
+  // Both stamps are decided here, at record time, because both facts are only
+  // true here: how much world geometry the frame had so far, and whether the
+  // user tagged this draw. The verdict that consumes them is taken at flush
+  // time, when the frame's total world-draw count is finally known.
+  call.world_draws_at_submit = m_frame_world_draws;
+  call.tag_protected = tag_bypass;
+  if (m_frame_world_draws == 0 && !tag_bypass)
+    ++m_frame_preworld_unprotected;
 
   m_ui_raster.Draw(call, m_ui_vertices, indices);
   ++m_stats.ui_placed;
@@ -3058,6 +3257,22 @@ void RemixApi::SubmitScreenOverlay()
     return;
 
   AuditUiFootprints();
+
+  // The pre-world verdict, taken here because here is the first point at which
+  // it CAN be: whether the frame had any world geometry at all is not known
+  // until the frame is over. On an all-2D frame - a menu, a loading screen, a
+  // title card - m_frame_world_draws is zero and nothing is filtered, which is
+  // correct: there the 2D layer IS the frame.
+  //
+  // Deliberately NOT applied to m_efb_ui_raster. That one is folded into an EFB
+  // copy at execute time, mid-frame, when the console's EFB genuinely did
+  // contain the pre-world wash (it is drawn UNDER the copy on hardware, and
+  // reproducing that is the entire reason the compose exists) - and the fold may
+  // well have consumed the draws before this verdict is even available.
+  const bool pre_world_filter = m_ui_drop_pre_world && m_frame_world_draws > 0;
+  m_ui_raster.SetPreWorldFilter(pre_world_filter);
+  if (pre_world_filter)
+    m_stats.ui_dropped_preworld = m_frame_preworld_unprotected;
 
   // Replay the frame's recorded draws across the worker bands. This is where the
   // rasterization actually happens, so it is what the raster timing measures.
@@ -4784,6 +4999,36 @@ void RemixApi::ReapIdleMeshes()
     else
       ++it;
   }
+
+  // And the same rule again for textures that exist only as dev-menu
+  // thumbnails. A game's 2D layer is a succession of screens, so without this
+  // every menu and every loading screen ever visited would hold its textures in
+  // VRAM for the rest of the session, for a grid the user is probably no longer
+  // looking at. Only overlay-originated hashes are in this map at all - a
+  // material's texture was erased from it by EnsureMaterial - so this can never
+  // destroy a texture the scene still samples.
+  //
+  // A tag survives the reap: tags are hash-keyed configuration living in the
+  // runtime's option layers, not state on the texture, so the draw keeps being
+  // routed and regains its thumbnail on its next sighting.
+  if (m_interface.DestroyTexture != nullptr)
+  {
+    for (auto it = m_overlay_texture_frames.begin(); it != m_overlay_texture_frames.end();)
+    {
+      if (m_frame_index - it->second <= MESH_IDLE_FRAMES_BEFORE_DESTROY)
+      {
+        ++it;
+        continue;
+      }
+      if (const auto tex = m_textures.find(it->first); tex != m_textures.end())
+      {
+        remixapi_TextureHandle handle = tex->second;
+        CallGuarded("DestroyTexture(idle)", [&] { m_interface.DestroyTexture(handle); });
+        m_textures.erase(tex);
+      }
+      it = m_overlay_texture_frames.erase(it);
+    }
+  }
 }
 
 void RemixApi::OnAfterFrame()
@@ -4902,6 +5147,8 @@ void RemixApi::OnAfterFrame()
                  "unplaceable, {} preworld, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} "
                  "dstalpha + {} "
                  "efbcopytex, raster {} us, upload {} us) | "
+                 "ui-tags ui {} ign {} world {} tagmode {} strict {} | ui-heur preworld {} "
+                 "fullscr {} | tex-reg {} | tagsets {}/{}/{} uistate {} | "
                  "efb copies {} ({} non-xfb+clear | xfb {} depth {} int {} scene {} 2d {} | "
                  "exec {} disc {}, {} us, {} folds) | efb peeks {} pokes {}"
                  " | viewport changes {} (corrected {}, refused {}, "
@@ -4934,6 +5181,18 @@ void RemixApi::OnAfterFrame()
                  m_stats.ui_skipped_dst_alpha, m_stats.ui_skipped_efb_copy_tex,
                  m_stats.ui_raster_us,
                  m_stats.ui_upload_us,
+                 // Tag routing: one number per decision path, plus the two
+                 // inputs those paths read (how big the runtime says each tag
+                 // set is, and whether its dev menu is open). With all three
+                 // sets empty and the menu shut, every counter here reads zero
+                 // and the 2D path is byte-identical to the pre-feature build -
+                 // which is what makes this group the regression floor as well
+                 // as the diagnostic.
+                 m_stats.ui_tagged_ui, m_stats.ui_tagged_ignore, m_stats.ui_tagged_world,
+                 m_stats.ui_tagmode_world, m_stats.ui_dropped_strict,
+                 m_stats.ui_dropped_preworld, m_stats.ui_dropped_fullscreen,
+                 m_stats.ui_overlay_tex_registered, m_tag_ui.size(), m_tag_ignore.size(),
+                 m_tag_world_ui.size(), m_runtime_ui_state,
                  m_stats.efb_copies, m_stats.efb_copies_scratch, m_stats.efb_copies_xfb,
                  m_stats.efb_copies_depth, m_stats.efb_copies_intensity, m_stats.efb_copies_scene,
                  m_stats.efb_copies_composed2d, m_stats.efb_copies_executed,
@@ -5030,9 +5289,18 @@ void RemixApi::FinishFrame(bool minor_frame)
   m_ui_footprints.clear();
   ++m_frame_index;
 
+  // The Scene-vs-Composed2D signal's tag-routing counterpart: how many pre-world
+  // 2D draws this frame recorded without a UI tag. Frame-local by the same
+  // definition, so it resets with everything else.
+  m_frame_preworld_unprotected = 0;
+
   // Last, so this frame ran on one consistent set of values and the next frame
   // picks up any edit made in the meantime.
   RefreshLiveConfig();
+  // After RefreshLiveConfig, because whether to poll at all is one of the knobs
+  // it re-reads: flipping RemixUiTagRouting off must stop the polling on the
+  // same boundary it stops the routing.
+  PollRuntimeTagState();
 }
 
 void RemixApi::RefreshLiveConfig()
@@ -5054,6 +5322,16 @@ void RemixApi::RefreshLiveConfig()
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_trace_efb_copies = Config::Get(Config::GFX_REMIX_TRACE_EFB_COPIES);
   m_ui_dump_frame = Config::Get(Config::GFX_REMIX_UI_DUMP_FRAME);
+  // Tag-driven 2D routing and its three policies. All four qualify under the
+  // rule above: they are consumed per draw at classification time, and nothing
+  // built at Initialize - mesh, material, light, overlay surface - is derived
+  // from any of them. RemixUiStrict being live is the whole point of it: it is
+  // the lever for finding out which 2D elements are worth keeping, and an A/B
+  // that needs a restart is an A/B nobody runs.
+  m_ui_tag_routing = Config::Get(Config::GFX_REMIX_UI_TAG_ROUTING);
+  m_ui_drop_pre_world = Config::Get(Config::GFX_REMIX_UI_DROP_PRE_WORLD);
+  m_ui_drop_fullscreen_opaque = Config::Get(Config::GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE);
+  m_ui_strict = Config::Get(Config::GFX_REMIX_UI_STRICT);
   // Same coupling as Initialize: the histogram is what the camera is read out
   // of, so turning the trace off must not be able to take the camera down with
   // it.

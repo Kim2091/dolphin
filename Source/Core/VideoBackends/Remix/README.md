@@ -150,13 +150,14 @@ Two conventions hold throughout:
   behaviour before the fix existed.** That is deliberate, so any of them can be
   A/B tested cleanly against a bug without building anything.
 - **Changes take effect at backend init**, i.e. when emulation starts. Restart
-  the game after editing. The exceptions are eight knobs that are re-read at
+  the game after editing. The exceptions are twelve knobs that are re-read at
   every frame boundary (`RemixApi::RefreshLiveConfig`) and can therefore be
   changed mid-game: `RemixUiMode`, `RemixSkipMinorFrames`, `RemixLogStats`,
   `RemixTraceProjections`, `RemixTraceModelviews`, `RemixTraceColors`,
-  `RemixTraceEfbCopies` and `RemixUiDumpFrame`. Everything else is baked into
-  meshes, materials, lights or classification state and the GUI greys it out
-  while a game is running.
+  `RemixTraceEfbCopies`, `RemixUiDumpFrame`, `RemixUiTagRouting`,
+  `RemixUiDropPreWorld`, `RemixUiDropFullScreenOpaque` and `RemixUiStrict`.
+  Everything else is baked into meshes, materials, lights or classification
+  state and the GUI greys it out while a game is running.
 
 ### Not optional in practice
 
@@ -359,7 +360,11 @@ All default on; `False` is the pre-fix behaviour in every case.
 | `RemixUiRasChannel` | bool | `True` | The per-stage RAS-channel rule applied to ortho draws. **This is what removes Wind Waker's leaked title-screen HUD.** |
 | `RemixUiDropDstAlpha` | bool | `True` | Skip UI draws whose colour blend factor is `DST_ALPHA`/`ONE_MINUS_DST_ALPHA`. A screen overlay composites at present time, so there is no EFB alpha for the factor to read — the draw is not representable, and falling through to `Over` at full weight produces an opaque wash. |
 | `RemixUiDropEfbCopyTextures` | bool | `False` | Filter UI draws textured from EFB-copy RAM. Measured a no-op on Wind Waker (0 of 691,200 pixels), hence off. |
-| `RemixUiDropPreWorldBlank` | bool | `True` | Drop **untextured** 2D draws that arrive before any world geometry this frame. Those are EFB clears and scratch fills, not UI: the console draws the scene over them, but this backend composites 2D *on top* of the traced image, so they paint the screen flat. The SpongeBob white-box fix. Real 2D is textured. Counter: `preworld`. |
+| `RemixUiDropPreWorldBlank` | bool | `True` | Drop **untextured** 2D draws that arrive before any world geometry this frame. Those are EFB clears and scratch fills, not UI: the console draws the scene over them, but this backend composites 2D *on top* of the traced image, so they paint the screen flat. The SpongeBob white-box fix. Real 2D is textured. Counter: `preworld` (in the `UI (...)` group). |
+| `RemixUiTagRouting` | bool | `True` | Route each 2D draw by the Remix dev menu's texture category: **UI Texture** composites it and bypasses every drop heuristic, **Ignore** discards it, **World Space UI** sends it through the mode-`2` world plane. While the dev menu is open, *every* 2D draw is temporarily routed world-side so it can be clicked and tagged — which is the only way to reach an untextured white box, since it has no grid thumbnail. Textured 2D draws are registered into the runtime's texture grid so they *do* get a thumbnail. Inert until something is tagged, so on by default. Live. Tags are polled, so they apply ~2 frames late. Counters: `ui-tags ui/ign/world/tagmode`, `tex-reg`, `tagsets`, `uistate`. |
+| `RemixUiDropPreWorld` | bool | `False` | The textured-inclusive sibling of `RemixUiDropPreWorldBlank`: drop **every** 2D draw recorded before the frame's first world draw, texture or no texture. For games that wash the screen with a textured quad. Riskier — a real 2D background drawn before the world disappears — so off by default, per-game. The EFB-copy compose is deliberately *not* filtered: a mid-frame copy genuinely did contain the wash on console. Live. Counter: `preworld` (in the `ui-heur` group). |
+| `RemixUiDropFullScreenOpaque` | bool | `False` | Drop opaque 2D draws whose painted area covers ≥ 95% of the presented region, on a frame that already has world geometry. Such a draw hides the traced scene outright, so it is almost always a screen-space fake the console drew underneath. Off by default — a genuine full-screen 2D background on a world frame would vanish; a `UI Texture` tag rescues any specific victim. Live. Counter: `fullscr`. |
+| `RemixUiStrict` | bool | `False` | Keep only 2D draws tagged **UI Texture**; drop every untagged one. The inverse policy to the heuristics, for a game whose 2D layer is mostly washes with a few keepers. Explicit `Ignore` / `World Space UI` tags are still honoured. Needs `RemixUiTagRouting`. Live, which is what makes it usable as an A/B lever for finding the keepers. Counter: `strict`. |
 | `RemixWorldUiDistance` | float | `2.0` | Mode `2` only: distance of the UI plane, in near-plane units. The plane scales with distance so apparent size is unchanged. |
 | `RemixWorldUiFlipY` | bool | `False` | Mode `2` only: flip the plane vertically. |
 
@@ -395,7 +400,7 @@ misclassified copy can never look worse than the previous build.
 | `RemixEfbCopyIntensity` | bool | `False` | Execute the **Intensity** class, for a game using an intensity copy as a legitimate 2D mask. |
 | `RemixEfbXfbEncode` | bool | `False` | Execute the **Xfb** class. Does **not** wire Dolphin's screenshot/AV-dump pipeline to Remix frames. |
 | `RemixEfbUiCompose` | bool | `True` | Composite the frame's 2D layer into the EFB before an executed encode, via a second `UiRasterizer` running at 640×528. Without it an executed copy encodes bare clear colour. |
-| `RemixEfbSkipDiscardedTex` | bool | `True` | Skip draws whose stage-0 texture samples a **discarded** copy destination, so the game's screen-space fake is absent and the traced result behind it shows. Without it those draws render as blank rectangles over the scene — zero bytes decode into a valid texture, so nothing else refuses them. Confirmed on SpongeBob: Battle for Bikini Bottom (two 256×256 top-left copies per frame, drawn as a white box over a quarter of the screen). Counter: `efbdisc` in the frame line. |
+| `RemixEfbSkipDiscardedTex` | bool | `False` | Skip draws whose stage-0 texture samples a **discarded** copy destination, so the game's screen-space fake is absent and the traced result behind it shows. Without it those draws render as blank rectangles over the scene — zero bytes decode into a valid texture, so nothing else refuses them. **Ships off**: the SpongeBob white box that motivated it turned out to be fixed by `RemixUiDropPreWorldBlank` instead, so the benefit here was never actually measured, and a default-on drop rule that has not been shown to help is a default-on way to lose content. Available per game. Counter: `efbdisc` in the frame line. |
 
 Reading the result. The frame line carries
 `efb copies N (… | xfb A depth B int C scene D 2d E | exec F disc G, H us, I folds) | efb peeks J pokes K`,

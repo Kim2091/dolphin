@@ -115,6 +115,19 @@ public:
     int clip_top = 0;
     int clip_right = 0;
     int clip_bottom = 0;
+
+    // How many world draws the frame had already submitted when this draw was
+    // recorded. Zero means the draw arrived before any 3D geometry, which on
+    // console means the scene was drawn over it - and here means it would be
+    // composited over the scene instead. Stamped rather than decided at record
+    // time because the verdict ("does this frame have world content at all?")
+    // is not known until the frame is over: a frame that turns out to be all-2D
+    // is a menu, where these draws ARE the content.
+    u32 world_draws_at_submit = 0;
+    // Set when the user explicitly tagged this draw's texture "UI Texture".
+    // Exempts it from the pre-world filter below, for the same reason it is
+    // exempt from every drop rule at submit time: the tag is the rescue lever.
+    bool tag_protected = false;
   };
 
   UiRasterizer();
@@ -134,6 +147,20 @@ public:
   // costs 9-19 ms a frame on a busy screen, which is the entire frame budget.
   void Draw(const DrawCall& call, const std::vector<Vertex>& vertices,
             const std::vector<u32>& indices);
+
+  // Skip, at replay time, every recorded draw that arrived before the frame's
+  // first world draw and was not tagged "UI Texture". Set just before Flush, by
+  // which point the frame's world-draw count is final - which is the point of
+  // deciding here rather than at record time.
+  //
+  // A filter rather than a compaction: the recorded draws keep their slots and
+  // their reused vertex/index storage, so enabling this costs one comparison per
+  // draw per band and allocates nothing. If it filters everything, no pixel is
+  // ever touched and HasContent() stays false, which correctly makes the frame
+  // send no overlay at all instead of a transparent one.
+  //
+  // Reset to off by Begin, so it is per-frame state like everything else here.
+  void SetPreWorldFilter(bool enabled) { m_pre_world_filter = enabled; }
 
   // Replays everything recorded since Begin. Must be called before reading the
   // buffer; safe to call with nothing recorded.
@@ -186,6 +213,9 @@ private:
 
   std::vector<RecordedDraw> m_draws;
   size_t m_draw_count = 0;
+  // See SetPreWorldFilter. Read by every band worker during a Flush and written
+  // only between flushes, so it needs no synchronisation of its own.
+  bool m_pre_world_filter = false;
 
   // Worker pool. Started on the first Flush that has enough work to be worth it,
   // and joined in the destructor.

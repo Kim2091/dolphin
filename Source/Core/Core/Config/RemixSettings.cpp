@@ -699,8 +699,15 @@ const Info<bool> GFX_REMIX_EFB_UI_COMPOSE{{System::GFX, "Settings", "RemixEfbUiC
 // False = draw them anyway, blank texture and all - the behaviour before this
 // existed. Set it if skipping ever removes something a game genuinely needed;
 // the frame line's `efbdisc` counter says how many draws are affected.
+//
+// Ships FALSE. The benefit was never actually measured - the SpongeBob white box
+// that motivated it turned out to be fixed by the pre-world drop instead - and a
+// default-on drop rule that has not been shown to help is a default-on way to
+// lose content. It stays available per game, and its earlier draw-drop in the
+// vertex manager is unchanged, so turning it on restores the old behaviour
+// exactly.
 const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX{
-    {System::GFX, "Settings", "RemixEfbSkipDiscardedTex"}, true};
+    {System::GFX, "Settings", "RemixEfbSkipDiscardedTex"}, false};
 // Drop untextured 2D draws that arrive before any world geometry in the frame.
 //
 // Those are EFB clears and scratch-region fills, not UI. The console draws the
@@ -868,6 +875,81 @@ const Info<bool> GFX_REMIX_DYNAMIC_MESH_IDENTITY{
 // scene. Validated on Skylanders only, so it ships off; enable per game.
 const Info<bool> GFX_REMIX_SKIP_MINOR_FRAMES{
     {System::GFX, "Settings", "RemixSkipMinorFrames"}, false};
+
+// Let the Remix dev menu's texture categories decide what happens to a 2D draw.
+//
+// The runtime's texture grid already offers "UI Texture", "Ignore" and "World
+// Space UI" for every texture it knows about, but tagging one had no effect on
+// this backend: 2D draws never become runtime draw calls at all - they are
+// rasterized here and handed over as finished pixels - so the runtime never
+// gets the chance to apply its own categories to them. This knob closes that
+// loop from our side: the tag sets are polled back from the runtime once a
+// frame and each 2D draw is routed by the tag on its own texture (or, for an
+// untextured draw, on its mesh identity). UI = composite it and skip every drop
+// heuristic; Ignore = discard it; World Space UI = send it through the
+// world-space plane path instead.
+//
+// It also makes the tagging possible in the first place: while the dev menu is
+// open every 2D draw is temporarily routed world-side, so it becomes a real
+// clickable object in the runtime's picker - including untextured white boxes,
+// which have no texture to find in the grid.
+//
+// On by default because it is inert until something is actually tagged. Off is
+// the pre-feature behaviour exactly. Tags take about two frames to take effect
+// (they are polled, not pushed); the frame line's `ui-tags` group is what says
+// whether a tag is being seen.
+const Info<bool> GFX_REMIX_UI_TAG_ROUTING{
+    {System::GFX, "Settings", "RemixUiTagRouting"}, true};
+
+// Drop every 2D draw that arrived before any world geometry this frame, textured
+// or not.
+//
+// The wider sibling of RemixUiDropPreWorldBlank, which only catches UNTEXTURED
+// pre-world draws. Some games wash the framebuffer with a textured quad instead
+// - same intent, same wrongness here (the console draws the scene over it; we
+// composite 2D on top, so it covers everything), but the untextured test cannot
+// see it. This one ignores the texture and judges purely on ordering.
+//
+// Riskier for exactly that reason: a game whose legitimate 2D background is
+// drawn before the world loses that background. Off by default, enable per game,
+// and watch the frame line's `preworld` counter under `ui-heur`. A UI-Texture
+// tag rescues any specific draw this eats.
+//
+// The framebuffer-copy compose path is deliberately NOT filtered by this: a copy
+// executed mid-frame genuinely did contain the pre-world wash on console, and
+// reproducing that is the whole point of the compose.
+const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD{
+    {System::GFX, "Settings", "RemixUiDropPreWorld"}, false};
+
+// Drop opaque 2D draws that cover essentially the whole presented image on a
+// frame that already has world geometry.
+//
+// A full-screen opaque quad composited over the traced scene hides the scene
+// completely, so if one shows up after the world has been drawn it is almost
+// always a fake the console would have drawn UNDER everything, or a fade this
+// backend cannot express. "Essentially the whole image" is 95% of the presented
+// region's area, measured on what the draw actually paints rather than on its
+// scissor.
+//
+// Off by default: a game with a genuine full-screen 2D background on a frame
+// that also draws world geometry is unusual but not impossible, and it would
+// vanish. The frame line's `fullscr` counter says whether this is firing, and a
+// UI-Texture tag rescues any specific victim.
+const Info<bool> GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE{
+    {System::GFX, "Settings", "RemixUiDropFullScreenOpaque"}, false};
+
+// Show only 2D draws that were explicitly tagged "UI Texture", and drop the rest.
+//
+// The opposite policy to the heuristics: instead of guessing which 2D draws are
+// junk, assume all of them are and let the user name the keepers in the dev
+// menu. Useful on a game whose 2D layer is mostly washes and fakes with a few
+// elements worth keeping, and as the A/B lever for finding out which elements
+// those are - it is live, so it can be flipped while the game runs.
+//
+// Only untagged draws are affected. Explicit Ignore and World Space UI tags are
+// still honoured, and heuristics never get a say (there is nothing left for them
+// to judge). Requires RemixUiTagRouting.
+const Info<bool> GFX_REMIX_UI_STRICT{{System::GFX, "Settings", "RemixUiStrict"}, false};
 
 // The GUI's view of everything above. Rows are in README section order; the
 // tooltips are the comments above rewritten for someone who has never read this
@@ -1241,6 +1323,35 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "screen flat. This is the SpongeBob white-box fix. Genuine UI is textured, so it is "
            "unaffected.",
            Group::UiOverlay),
+    Toggle(&GFX_REMIX_UI_TAG_ROUTING, "Route 2D draws by Remix texture tags",
+           "Let the Remix dev menu decide what happens to each 2D draw. Tag a texture 'UI Texture' "
+           "and it is always composited; 'Ignore' and it disappears; 'World Space UI' and it is "
+           "drawn inside the traced world. While the dev menu is open every 2D draw is temporarily "
+           "sent world-side so it can be clicked and tagged - including untextured boxes, which "
+           "have no thumbnail to find. Inert until something is tagged, and tags take about two "
+           "frames to apply.",
+           Group::UiOverlay, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_DROP_PRE_WORLD, "Drop all 2D drawn before the world",
+           "Drop every 2D draw that arrives before any world geometry this frame, textured or not. "
+           "The wider version of 'Drop framebuffer-clear rectangles', for games that wash the "
+           "screen with a textured quad. Riskier: a game whose real 2D background is drawn before "
+           "the world loses that background. Off by default - enable per game and watch the "
+           "'preworld' counter in the log.",
+           Group::UiOverlay, Liveness::Live, Maturity::Experimental),
+    Toggle(&GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE, "Drop full-screen opaque 2D over the scene",
+           "Drop opaque 2D draws covering essentially the whole image on a frame that already has "
+           "world geometry. Such a draw hides the traced scene completely, so it is almost always "
+           "a screen-space fake the console would have drawn underneath. Off by default: a genuine "
+           "full-screen 2D background on a frame with world geometry would vanish. Watch the "
+           "'fullscr' counter in the log.",
+           Group::UiOverlay, Liveness::Live, Maturity::Experimental),
+    Toggle(&GFX_REMIX_UI_STRICT, "Show only tagged 2D draws",
+           "Assume the game's 2D layer is junk and keep only what has been tagged 'UI Texture' in "
+           "the Remix dev menu. The opposite policy to the drop heuristics, for a game whose 2D is "
+           "mostly washes and fakes with a few elements worth keeping. Can be flipped while the "
+           "game runs, which is how those elements get found. Needs 'Route 2D draws by Remix "
+           "texture tags'.",
+           Group::UiOverlay, Liveness::Live, Maturity::Experimental),
     Real(&GFX_REMIX_WORLD_UI_DISTANCE, "World-space HUD distance",
          "World-space UI mode only. How far in front of the camera the UI plane sits, in game "
          "units. Just past the near plane by default, so world geometry cannot poke through the "

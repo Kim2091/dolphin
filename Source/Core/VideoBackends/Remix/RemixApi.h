@@ -284,6 +284,32 @@ struct FrameStats
   //   this backend never writes, so the texels are stale memory.
   u32 ui_skipped_dst_alpha = 0;
   u32 ui_skipped_efb_copy_tex = 0;
+  // Tag-driven routing, one counter per decision path, so "the tag did not
+  // work" is a question the log answers rather than a thing to theorize about.
+  //
+  // `ui_tagged_ui`     - draws composited because the user tagged them UI, with
+  //   every drop heuristic bypassed.
+  // `ui_tagged_ignore` - draws discarded on an explicit Ignore tag.
+  // `ui_tagged_world`  - draws sent world-side on an explicit World Space UI tag.
+  // `ui_tagmode_world` - draws sent world-side only because the dev menu is
+  //   open. Non-zero ONLY while tagging; if it is non-zero with the menu shut,
+  //   the UI-state read is wrong.
+  // `ui_dropped_strict`     - untagged draws dropped by RemixUiStrict.
+  // `ui_dropped_preworld`   - draws dropped by RemixUiDropPreWorld (the
+  //   texture-agnostic pre-world filter). Distinct from ui_dropped_pre_world
+  //   above, which is the older untextured-only rule; the two coexist.
+  // `ui_dropped_fullscreen` - draws dropped by RemixUiDropFullScreenOpaque.
+  // `ui_overlay_tex_registered` - first-time uploads of an overlay-only texture
+  //   into the dev-menu grid. Rises on a new screen and then settles; if it
+  //   never leaves zero, nothing is taggable and the routing has no input.
+  u32 ui_tagged_ui = 0;
+  u32 ui_tagged_ignore = 0;
+  u32 ui_tagged_world = 0;
+  u32 ui_tagmode_world = 0;
+  u32 ui_dropped_strict = 0;
+  u32 ui_dropped_preworld = 0;
+  u32 ui_dropped_fullscreen = 0;
+  u32 ui_overlay_tex_registered = 0;
   // EFB copies the game triggered this frame, and the subset that could hide a
   // UI draw: not the XFB copy, and carrying the clear bit, so the region it
   // took is wiped off the EFB before anything reaches the screen. A frame whose
@@ -886,6 +912,16 @@ public:
   // stays in one file.
   static u64 FoldSkinningHash(u64 geometry_hash, const std::vector<u32>& blend_indices);
 
+  // Material identity from the state that Remix bakes into a material. Lifted
+  // out of EnsureMaterial so there is exactly ONE definition of the fold, and
+  // two callers that cannot drift apart: EnsureMaterial itself, and
+  // UntexturedOrthoKey, which has to reproduce a mesh hash the world path
+  // produced. `texture_hash` is the albedo's content hash, or 0 for an
+  // untextured draw (which folds the fallback material's hash instead).
+  static u64 ComputeMaterialHash(u64 texture_hash, u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
+                                 u8 alpha_test_type, u8 alpha_reference, bool emissive,
+                                 u32 emissive_rgb);
+
   // Whether a geometry hash has been classified as sky. Keyed on geometry rather
   // than on the mesh hash precisely so that asking this question cannot be
   // perturbed by the answer - see MeshEntry::geometry_hash.
@@ -941,6 +977,66 @@ public:
   // and moves with the camera. Mode 1 is what looks like a normal UI.
   int UiMode() const { return m_ui_mode; }
 
+  // What the user tagged a 2D draw as, in the Remix dev menu's texture grid.
+  // Mirrors the three texture-category hash sets the runtime keeps
+  // (rtx.uiTextures / rtx.ignoreTextures / rtx.worldSpaceUiTextures); `None` is
+  // the untagged majority, which the heuristics are then free to judge.
+  enum class UiTagClass
+  {
+    None,
+    Ui,
+    Ignore,
+    WorldUi,
+  };
+
+  // Whether tag-driven routing is switched on at all. Off is the pre-feature
+  // behaviour: no polling, no world-side detour while the menu is open, no
+  // grid registration.
+  bool UiTagRoutingEnabled() const { return m_ui_tag_routing; }
+
+  // True while the runtime's dev menu is open. Every 2D draw is routed
+  // world-side for the duration, because that is the only way the runtime's
+  // click-to-tag picker can reach one - an overlay draw is finished pixels by
+  // the time the runtime sees it and has no object to pick.
+  bool UiTaggingModeActive() const { return m_runtime_ui_state != 0; }
+
+  // "Keep only what was tagged UI." Consulted for untagged draws only; an
+  // explicit tag of any kind outranks it.
+  bool UiStrictEnabled() const { return m_ui_strict; }
+
+  // Looks a 2D draw's key up in the three polled tag sets. Precedence is
+  // UI > Ignore > World UI: a hash tagged twice is a user mistake, and the
+  // reading that keeps content on screen is the one to take.
+  UiTagClass ClassifyUiDraw(u64 key) const;
+
+  // Uploads a 2D draw's texture to the runtime purely so it appears in the
+  // dev-menu texture grid with a thumbnail - there is no material and no mesh
+  // behind it. Without this, a HUD element that only ever goes through the
+  // overlay path is untaggable: it is never in the grid, because nothing ever
+  // created a Remix texture for it.
+  //
+  // No-op for a null or empty texture, and cheap on repeat sightings (the
+  // upload itself is deduplicated by content hash in UploadTexture).
+  void RegisterOverlayTexture(const RemixTexture* texture);
+
+  // The lookup key for an UNTEXTURED 2D draw, and the reason this is a named
+  // helper rather than an expression at the call site.
+  //
+  // The runtime identifies an untextured API draw by its MESH HANDLE (see
+  // rtx_fork_submit.cpp's keyIsMeshHash path, and the dev menu's click-to-tag
+  // popup, which tags exactly that value). Our mesh handle IS
+  // NonZeroHash(FoldHash(geometry_hash, material.hash)) - SubmitMesh mints the
+  // mesh with `info.hash = mesh_hash`. So for the tag the user sets by clicking
+  // a white box in tagging mode to match the key we look up in normal mode,
+  // the two have to be computed the same way, from the same inputs, forever.
+  //
+  // They are: ortho draws are never skinned (skinning requires !is_ortho), and
+  // the world path passes sky_emissive = false for ortho draws with these same
+  // filter/wrap/alpha-test arguments. Hence emissive = false, 0 below.
+  u64 UntexturedOrthoKey(const std::vector<remixapi_HardcodedVertex>& vertices,
+                         const std::vector<u32>& indices, u8 filter_mode, u8 wrap_mode_u,
+                         u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference);
+
   // Rasterizes one orthographic draw into the screen overlay. Vertices are the
   // decoded remixapi ones; `modelview` is the draw's GX modelview, or null when
   // the vertices have already been baked into view space. `viewport` is the
@@ -948,12 +1044,18 @@ public:
   // to put its HUD in a sub-rect and a full-screen assumption would misplace it.
   // `clip` is the draw's scissor rect (left, top, right, bottom) in EFB space,
   // from the same ComputeScissorRects every other backend uses.
+  //
+  // `tag_bypass` marks a draw the user explicitly tagged "UI Texture". Such a
+  // draw skips every drop heuristic - that tag IS the rescue lever, so an
+  // automated rule must not be able to overrule it - and is marked in the
+  // recorded call so the flush-time pre-world filter passes over it too. The
+  // write-mask early-out is NOT bypassed: it is algebra, not a heuristic.
   void SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                     const std::vector<u32>& indices, const float* modelview,
                     const std::array<float, 6>& ortho_projection,
                     const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
                     const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
-                    const DrawBlendState& blend);
+                    const DrawBlendState& blend, bool tag_bypass = false);
 
   // Records which XF lights a draw switched on, and what each one MEANS to that
   // draw - GX puts the attenuation function on the referencing channel, not on
@@ -1240,6 +1342,16 @@ private:
   // Core/Config/RemixSettings.cpp, which is what the settings GUI greys out on.
   // Called at the very end of OnAfterFrame so a frame never straddles an edit.
   void RefreshLiveConfig();
+  // Re-reads the runtime's three texture-category sets and its dev-menu state
+  // into the members below, once per frame at the frame boundary. Polling
+  // rather than a callback because the runtime has no push channel for this;
+  // the cost is one API call per set and about two frames of latency between
+  // tagging something and seeing it take effect.
+  void PollRuntimeTagState();
+  // One set's worth of that. Returns false and leaves `out` untouched when the
+  // runtime refuses the read, so a transient failure cannot silently un-tag
+  // everything for a frame. Grows and retries once on truncation.
+  bool PollTagSet(const char* option_name, std::unordered_set<u64>& out);
   void LogProjectionVariants();
   // Union of every projection variant's depth range this frame. Shared by
   // SetupCamera and the sky classifier's size gate so the two cannot disagree
@@ -1291,6 +1403,15 @@ private:
   std::array<const RemixTexture*, 8> m_bound_textures = {};
 
   std::unordered_map<u64, remixapi_TextureHandle> m_textures;
+  // Textures that exist ONLY so the overlay path's draws are taggable, mapped
+  // to the frame each was last seen on. A material-backed texture is never in
+  // here: EnsureMaterial erases the hash on its way past, because a texture the
+  // scene actually references must outlive any 2D sighting of it. The sweep in
+  // ReapIdleMeshes destroys the rest on the same 300-frame idleness rule the
+  // meshes use, so a menu visited once does not hold its thumbnails forever. A
+  // reaped hash keeps its tag - tags are hash-keyed config, not texture state -
+  // and gets its thumbnail back the next time the draw appears.
+  std::unordered_map<u64, u64> m_overlay_texture_frames;
   std::unordered_map<u64, remixapi_MaterialHandle> m_materials;
   std::unordered_map<u64, MeshEntry> m_meshes;
   // Topology-keyed lineages for the dynamic-mesh-identity feature. Only draws
@@ -1492,6 +1613,40 @@ private:
   // the pre-change behaviour: the draw is classified and submitted as before.
   bool m_ui_drop_dst_alpha = true;
   bool m_ui_drop_efb_copy_textures = false;
+
+  // Tag-driven 2D routing. All four are Live (RefreshLiveConfig re-reads them
+  // every frame boundary): they gate per-draw routing decisions and nothing
+  // built at Initialize time - mesh, material, light, overlay surface - is
+  // derived from any of them, which is the bar RefreshLiveConfig's comment
+  // sets. RemixUiStrict being live is the point of it: it is the A/B lever for
+  // finding out which 2D elements are worth keeping.
+  bool m_ui_tag_routing = true;
+  bool m_ui_drop_pre_world = false;
+  bool m_ui_drop_fullscreen_opaque = false;
+  bool m_ui_strict = false;
+  // The runtime's three texture-category sets, re-read once a frame. Hashes are
+  // either a texture's content hash (textured draws) or a mesh hash (untextured
+  // ones) - the runtime's own two identities for an API draw, which is what
+  // lets one set serve both.
+  std::unordered_set<u64> m_tag_ui;
+  std::unordered_set<u64> m_tag_ignore;
+  std::unordered_set<u64> m_tag_world_ui;
+  // remixapi_UIState as of the last poll. Non-zero means the dev menu is open,
+  // which is what switches 2D draws to the world path so they can be clicked.
+  int m_runtime_ui_state = 0;
+  // Reused across polls so the three reads a frame never heap-allocate once the
+  // sets have settled.
+  std::vector<uint64_t> m_tag_poll_buffer;
+  // The "runtime is too old for GetTextureHashList" warning is worth saying
+  // once and never again.
+  bool m_tag_list_warned = false;
+  // Pre-world 2D draws recorded this frame that carry no UI tag, counted at
+  // record time because that is the only point where both facts are known. The
+  // frame-end filter turns this into the ui_dropped_preworld stat when it
+  // actually engages - the draws were recorded either way, so counting them at
+  // record time and reporting them at flush time is what makes the number mean
+  // "dropped" rather than "eligible".
+  u32 m_frame_preworld_unprotected = 0;
   // The EFB region the console actually presents, in EFB units. UI draw
   // coordinates are in EFB units and the overlay is the swapchain, so this is
   // the denominator that maps one onto the other; using EFB_WIDTH/EFB_HEIGHT
