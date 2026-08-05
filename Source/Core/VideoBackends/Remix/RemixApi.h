@@ -335,6 +335,12 @@ struct FrameStats
   u32 ui_tagged_persp = 0;
   u32 ui_persp_refused_w = 0;
   u32 ui_persp_skinned = 0;
+  // Overlay draws recorded with their z test enabled - the draws the depth
+  // plane exists for (RemixUiDepth). Zero on every ordinary 2D HUD measured so
+  // far; non-zero says this game's overlay genuinely resolves by depth and the
+  // plane is engaged. Counted at record time, whether or not any pixel of the
+  // draw survives.
+  u32 ui_depth_tested = 0;
   // EFB copies the game triggered this frame, and the subset that could hide a
   // UI draw: not the XFB copy, and carrying the clear bit, so the region it
   // took is wiped off the EFB before anything reaches the screen. A frame whose
@@ -743,12 +749,13 @@ struct DrawBlendState
   u8 alpha_blend_op = 0;
   u8 write_mask = 0xF;  // R | G | B | A
 
-  // bpmem.zmode, carried purely so the UI footprint audit can report it. The
-  // overlay rasterizer has no depth buffer by design (RemixUiRaster.h:34-37), so
-  // a UI draw that the console's Z test would have rejected is drawn here
-  // regardless - these two say whether that is even possible for a given draw.
-  // Nothing reads them to make a decision.
+  // bpmem.zmode. Originally carried purely for the UI footprint audit; since
+  // the overlay gained a depth plane (RemixUiDepth) these are what SubmitUiDraw
+  // stamps into the rasterizer's DrawCall, so a draw whose z test the console
+  // would honour is honoured here too. Every ordinary 2D HUD measured so far
+  // has the test off and never touches the plane.
   bool depth_test = false;
+  u8 depth_func = 7;  // CompareMode numbering, Never = 0 .. Always = 7.
   bool depth_write = false;
 
   // Where stage 0's texture came from in GC memory, and whether the cache calls
@@ -1124,10 +1131,13 @@ public:
   // instead. A draw refused by a POLICY rule returns true: that draw was
   // consumed and deliberately discarded, and re-submitting it world-side would
   // undo the policy.
+  // `viewport` is (x, y, width, height, zRange, farZ) in EFB units - the last
+  // two are the draw's own viewport z mapping, which is what turns ndc z into
+  // the console's screen z for the overlay's depth plane (RemixUiDepth).
   bool SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                     const std::vector<u32>& indices, const float* modelview,
                     const std::array<float, 6>& raw_projection,
-                    const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
+                    const std::array<float, 6>& viewport, const std::array<float, 4>& clip,
                     const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u, u8 wrap_mode_v,
                     const DrawBlendState& blend, bool tag_bypass = false,
                     bool perspective = false);
@@ -1701,6 +1711,10 @@ private:
   bool m_ui_drop_pre_world = false;
   bool m_ui_drop_fullscreen_opaque = false;
   bool m_ui_strict = false;
+  // Honour each 2D draw's real z mode in the overlay rasterizer (also Live,
+  // same argument). Off zeroes the depth fields in every recorded DrawCall, so
+  // the rasterizer runs the pure painter's algorithm it always ran.
+  bool m_ui_depth = true;
   // The runtime's three texture-category sets, re-read once a frame. Hashes are
   // either a texture's content hash (textured draws) or a mesh hash (untextured
   // ones) - the runtime's own two identities for an API draw, which is what

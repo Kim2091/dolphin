@@ -984,6 +984,24 @@ const Info<bool> GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE{
 // to judge). Requires RemixUiTagRouting.
 const Info<bool> GFX_REMIX_UI_STRICT{{System::GFX, "Settings", "RemixUiStrict"}, false};
 
+// Honour each 2D draw's real depth state in the overlay rasterizer.
+//
+// The overlay was a pure painter's algorithm: later draws paint over earlier
+// ones. Every 2D HUD measured so far draws with the depth test off, so order
+// was all they needed - but a HUD the game draws through the 3D frustum is
+// world geometry, and world geometry is free to rely on the depth buffer
+// instead. Resident Evil 4 submits its HUD background AFTER its text with the
+// text parked nearer the camera: the console's z test puts the text in front,
+// and submission order alone puts the background on top of it.
+//
+// With this on, a draw whose z test is enabled interpolates the console's own
+// screen-space z (the software renderer's exact viewport mapping) and tests
+// and writes a depth plane with the draw's own compare function, after the
+// alpha test, exactly as late z works on hardware. Draws with the test off -
+// which is every ordinary 2D HUD - never touch the plane and behave exactly
+// as before, so False here is the pre-fix painter's algorithm, byte for byte.
+const Info<bool> GFX_REMIX_UI_DEPTH{{System::GFX, "Settings", "RemixUiDepth"}, true};
+
 // The GUI's view of everything above. Rows are in README section order; the
 // tooltips are the comments above rewritten for someone who has never read this
 // file. See RemixSettingMeta in the header for what each column means.
@@ -1394,6 +1412,13 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "game runs, which is how those elements get found. Needs 'Route 2D draws by Remix "
            "texture tags'.",
            Group::UiOverlay, Liveness::Live, Maturity::Experimental),
+    Toggle(&GFX_REMIX_UI_DEPTH, "Depth-test 2D draws that ask for it",
+           "Give the 2D overlay a depth buffer for draws whose z test is enabled. A HUD drawn "
+           "through the 3D frustum can rely on depth instead of draw order - Resident Evil 4 "
+           "submits its HUD background after its text and lets the z test sort them, so without "
+           "this the background paints over the text. Ordinary 2D draws have the test off and are "
+           "untouched. Off restores the pure painter's algorithm.",
+           Group::UiOverlay, Liveness::Live),
     Real(&GFX_REMIX_WORLD_UI_DISTANCE, "World-space HUD distance",
          "World-space UI mode only. How far in front of the camera the UI plane sits, in game "
          "units. Just past the near plane by default, so world geometry cannot poke through the "

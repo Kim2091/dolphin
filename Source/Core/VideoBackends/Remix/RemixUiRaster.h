@@ -32,9 +32,12 @@ namespace Remix
 // every GC texture format to RGBA8 before Load() (see RemixTexture::GetPixels).
 //
 // Deliberately not a general rasterizer. Orthographic draws have w = 1, so there
-// is no perspective divide and affine interpolation is exact; UI is drawn in
-// submission order, so there is no depth buffer. Both assumptions are checked
-// where they are relied on rather than merely assumed.
+// is no perspective divide and affine interpolation is exact (the caller divides
+// perspective draws before recording them). Draws whose depth test is off - all
+// ordinary 2D - resolve purely by submission order; a draw whose depth test is
+// ON interpolates the console's screen-space z against a depth plane, because a
+// HUD drawn through the 3D frustum is free to rely on depth instead of order
+// and Resident Evil 4 actually does.
 class UiRasterizer
 {
 public:
@@ -77,6 +80,11 @@ public:
     float v = 0.0f;
     // Straight (non-premultiplied) RGBA, 0-1.
     std::array<float, 4> color = {1.0f, 1.0f, 1.0f, 1.0f};
+    // The console's screen-space z, 0..16777215: ndc z through the draw's own
+    // viewport mapping (z * zRange + farZ), the same formula the software
+    // renderer applies (Clipper.cpp PerspectiveDivide). Interpolated and
+    // compared only when the draw's depth test is on; 0 otherwise and unread.
+    float z = 0.0f;
   };
 
   struct DrawCall
@@ -128,6 +136,17 @@ public:
     // Exempts it from the pre-world filter below, for the same reason it is
     // exempt from every drop rule at submit time: the tag is the rescue lever.
     bool tag_protected = false;
+
+    // The draw's GX z mode, honoured per pixel AFTER the alpha test - the same
+    // late-z order as hardware (Software/Tev.cpp runs ZCompare after the alpha
+    // test kills the pixel). GX only updates z while the test is enabled, so
+    // depth_write is meaningful only alongside depth_test; the caller zeroes
+    // all three when the depth knob is off, which restores the pure painter's
+    // algorithm without the rasterizer knowing a knob exists.
+    bool depth_test = false;
+    // CompareMode numbering, Never = 0 .. Always = 7, same as the alpha test.
+    u8 depth_func = 7;
+    bool depth_write = false;
   };
 
   UiRasterizer();
@@ -207,6 +226,17 @@ private:
   void WorkerLoop();
 
   std::vector<u32> m_pixels;
+  // The depth plane, same layout as m_pixels, holding the console's 24-bit
+  // screen z. Allocated and cleared lazily in Flush, only on frames where some
+  // recorded draw actually depth-tests - most frames have none, and clearing
+  // 8 MB for nothing would be the overlay's single largest fixed cost. Cleared
+  // to the standard GX far value so a nearer-passes test against untouched
+  // background behaves as it does against a freshly cleared EFB. Bands own
+  // disjoint rows here exactly as they do in m_pixels, so no synchronisation.
+  std::vector<u32> m_depth;
+  // Whether any draw recorded since Begin carries an enabled depth test -
+  // the lazy-allocation signal for Flush.
+  bool m_depth_used = false;
   u32 m_width = 0;
   u32 m_height = 0;
   std::atomic<bool> m_touched{false};

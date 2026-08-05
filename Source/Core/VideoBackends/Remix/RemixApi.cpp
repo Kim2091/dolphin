@@ -2697,7 +2697,7 @@ bool RemixApi::EfbDestinationDiscarded(u32 addr) const
 bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertices,
                             const std::vector<u32>& indices, const float* modelview,
                             const std::array<float, 6>& raw_projection,
-                            const std::array<float, 4>& viewport, const std::array<float, 4>& clip,
+                            const std::array<float, 6>& viewport, const std::array<float, 4>& clip,
                             const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
                             u8 wrap_mode_v, const DrawBlendState& blend, bool tag_bypass,
                             bool perspective)
@@ -2903,6 +2903,17 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // that the reciprocal below stays finite. The comparison is written negated so
   // that a NaN w - which compares false against everything - is refused too.
   constexpr float kMinW = 1e-6f;
+  // The draw's depth spread, for the guard after the loop. Two failure modes
+  // hide in a wide spread and the ratio catches both: a vertex inside the
+  // eye-to-near zone blows 1/w up into a screen-filling smear (the console
+  // would have CLIPPED it at the near plane; this rasterizer has no clipper),
+  // and the affine u/v interpolation the rasterizer runs is only exact while w
+  // is near-constant across the primitive. A screen-parked HUD quad sits at one
+  // depth and passes trivially; anything genuinely 3D fails fast and visibly in
+  // the counter instead of failing as garbage on screen.
+  float min_w = std::numeric_limits<float>::max();
+  float max_w = 0.0f;
+  constexpr float kMaxWSpread = 1.2f;
 
   m_ui_vertices.clear();
   m_ui_vertices.reserve(vertices.size());
@@ -2948,9 +2959,17 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
       }
       else
       {
+        min_w = std::min(min_w, w);
+        max_w = std::max(max_w, w);
         const float inv_w = 1.0f / w;
         vertex.x = (raw_projection[0] * view[0] + raw_projection[1] * view[2]) * inv_w;
         vertex.y = (raw_projection[2] * view[1] + raw_projection[3] * view[2]) * inv_w;
+        // Clip z, with TransformUnit.cpp:69's own epsilon nudge, divided and
+        // mapped through the draw's viewport exactly as Clipper.cpp:555 does.
+        // This IS the value the console's z test compared for this vertex.
+        const float clip_z =
+            (raw_projection[4] * view[2] + raw_projection[5]) * (1.0f - 1e-7f);
+        vertex.z = clip_z * inv_w * viewport[4] + viewport[5];
       }
     }
     else
@@ -2959,6 +2978,8 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
       // the rasterizer interpolate affinely and still be exact.
       vertex.x = raw_projection[0] * view[0] + raw_projection[1];
       vertex.y = raw_projection[2] * view[1] + raw_projection[3];
+      // Same mapping at w = 1 (MultipleVec3Ortho carries no epsilon nudge).
+      vertex.z = (raw_projection[4] * view[2] + raw_projection[5]) * viewport[4] + viewport[5];
     }
     vertex.u = source.texcoord[0];
     vertex.v = source.texcoord[1];
@@ -2991,9 +3012,14 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // as world geometry is a far better failure than deleting it.
   //
   // Expected to read zero forever - a quad parked in front of the camera does
-  // not reach the eye - so a non-zero `wref` means the tagged element is not
-  // actually screen-parked and the tag is on the wrong texture.
-  if (perspective && behind_eye)
+  // not reach the eye and sits at effectively one depth - so a non-zero `wref`
+  // means the tagged element is not actually screen-parked and the tag is on
+  // the wrong texture. The spread arm is what keeps a mis-tag from failing as
+  // garbage: a vertex inside the eye-to-near zone (which the console would
+  // have clipped, and this rasterizer cannot) blows 1/w up into a
+  // screen-filling smear, and a genuinely tilted element breaks the affine
+  // interpolation this path is built on. Both read as depth spread.
+  if (perspective && (behind_eye || max_w > min_w * kMaxWSpread))
   {
     ++m_stats.ui_persp_refused_w;
     return false;
@@ -3069,6 +3095,18 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   call.tag_protected = tag_bypass;
   if (m_frame_world_draws == 0 && !tag_bypass)
     ++m_frame_preworld_unprotected;
+
+  // The draw's real z mode, honoured by the rasterizer's depth plane. Knob off
+  // leaves the fields at their zero defaults, which IS the painter's algorithm:
+  // the rasterizer never learns depth existed. GX only updates z while the
+  // test is enabled, so there is no test-off-write-on case to carry.
+  if (m_ui_depth && blend.depth_test)
+  {
+    call.depth_test = true;
+    call.depth_func = blend.depth_func;
+    call.depth_write = blend.depth_write;
+    ++m_stats.ui_depth_tested;
+  }
 
   m_ui_raster.Draw(call, m_ui_vertices, indices);
   ++m_stats.ui_placed;
@@ -5227,7 +5265,7 @@ void RemixApi::OnAfterFrame()
                  "falloff-free->distant, {} dropped), draws "
                  "enabled mask {:#04x} | lights rewritten {} conflicted {} alpha-only {} | "
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
-                 "unplaceable, {} preworld, {} tev-alpha, bail s{}/k{}/c{}/r{}, skipped {} "
+                 "unplaceable, {} preworld, {} tev-alpha, {} ztest, bail s{}/k{}/c{}/r{}, skipped {} "
                  "dstalpha + {} "
                  "efbcopytex, raster {} us, upload {} us) | "
                  "ui-tags ui {} ign {} world {} tagmode {} strict {} persp {} wref {} pskin {} | "
@@ -5260,7 +5298,7 @@ void RemixApi::OnAfterFrame()
                  m_stats.lights_diffuse_sign, m_stats.lights_spec,
                  m_stats.ambient_bright ? "bright" : "dim", m_stats.ui_placed,
                  m_stats.ui_unplaceable, m_stats.ui_dropped_pre_world, m_stats.ui_tev_alpha,
-                 m_stats.tev_bail_stages,
+                 m_stats.ui_depth_tested, m_stats.tev_bail_stages,
                  m_stats.tev_bail_konst, m_stats.tev_bail_compare, m_stats.tev_bail_rasterized,
                  m_stats.ui_skipped_dst_alpha, m_stats.ui_skipped_efb_copy_tex,
                  m_stats.ui_raster_us,
@@ -5426,6 +5464,10 @@ void RemixApi::RefreshLiveConfig()
   m_ui_drop_pre_world = Config::Get(Config::GFX_REMIX_UI_DROP_PRE_WORLD);
   m_ui_drop_fullscreen_opaque = Config::Get(Config::GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE);
   m_ui_strict = Config::Get(Config::GFX_REMIX_UI_STRICT);
+  // Also per-draw-consumed (the depth fields are stamped into each recorded
+  // DrawCall), so live for the same A/B reason: on-vs-off is how a wrong-order
+  // HUD is diagnosed without a restart.
+  m_ui_depth = Config::Get(Config::GFX_REMIX_UI_DEPTH);
   // Same coupling as Initialize: the histogram is what the camera is read out
   // of, so turning the trace off must not be able to take the camera down with
   // it.

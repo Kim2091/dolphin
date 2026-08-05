@@ -1466,11 +1466,13 @@ void ApplyProjectionCorrection(const ProjectionCorrection& c, remixapi_Transform
 }
 
 // Where a draw lands on the EFB, as the overlay path needs it: the viewport as
-// (x, y, width, height) and the scissor as (left, top, right, bottom), both in
-// EFB units.
+// (x, y, width, height, zRange, farZ) and the scissor as (left, top, right,
+// bottom), both in EFB units. The z pair is the draw's own viewport depth
+// mapping - what turns ndc z into the console's 24-bit screen z - carried so
+// the overlay's depth plane compares the same values the console compared.
 struct UiPlacement
 {
-  std::array<float, 4> viewport = {};
+  std::array<float, 6> viewport = {};
   std::array<float, 4> clip = {};
 };
 
@@ -1499,7 +1501,8 @@ UiPlacement ComputeUiPlacement()
   placement.viewport = {
       (xfmem.viewport.xOrig - static_cast<float>(native_rc.x_off)) - xfmem.viewport.wd,
       (xfmem.viewport.yOrig - static_cast<float>(native_rc.y_off)) + xfmem.viewport.ht,
-      2.0f * xfmem.viewport.wd, -2.0f * xfmem.viewport.ht};
+      2.0f * xfmem.viewport.wd, -2.0f * xfmem.viewport.ht,
+      xfmem.viewport.zRange, xfmem.viewport.farZ};
   placement.clip = {
       static_cast<float>(native_rc.rect.left), static_cast<float>(native_rc.rect.top),
       static_cast<float>(native_rc.rect.right), static_cast<float>(native_rc.rect.bottom)};
@@ -2750,9 +2753,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   diagnostics.position_matrix = position_matrix_slot;
 
   // The UI path submits a DrawBlendState rather than a DrawDiagnostics, so the
-  // depth state rides along there too. Reported by the EFB-copy audit, read by
-  // nothing.
+  // depth state rides along there too. Once audit-only; now what the overlay's
+  // depth plane honours (RemixUiDepth).
   blend.depth_test = bpmem.zmode.test_enable;
+  blend.depth_func = static_cast<u8>(bpmem.zmode.func.Value());
   blend.depth_write = bpmem.zmode.update_enable;
 
   if (!is_ortho)
@@ -2858,7 +2862,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // Shared with the perspective divert further down, which needs the identical
     // placement: see ComputeUiPlacement for why one derivation serves both.
     const UiPlacement placement = ComputeUiPlacement();
-    const std::array<float, 4>& viewport = placement.viewport;
+    const std::array<float, 6>& viewport = placement.viewport;
     const std::array<float, 4>& clip = placement.clip;
 
     // One frame's worth of the state that decides whether a UI draw is visible

@@ -71,6 +71,36 @@ bool AlphaPasses(u8 compare0, u32 reference0, u8 compare1, u32 reference1, u8 lo
     return first == second;
   }
 }
+
+// The GX z compare, on 24-bit screen z, in the same CompareMode numbering as
+// the alpha test above - the exact switch SWEfbInterface::ZCompare runs.
+bool DepthPasses(u8 func, u32 z, u32 stored)
+{
+  switch (func)
+  {
+  case 0:
+    return false;  // Never
+  case 1:
+    return z < stored;
+  case 2:
+    return z == stored;
+  case 3:
+    return z <= stored;
+  case 4:
+    return z > stored;
+  case 5:
+    return z != stored;
+  case 6:
+    return z >= stored;
+  default:
+    return true;  // Always
+  }
+}
+
+// The console's z clear value: the far plane of a 24-bit depth buffer, which is
+// what games overwhelmingly clear to. The overlay has no game-controlled clear,
+// so this is the fixed background every depth-tested frame starts from.
+constexpr u32 kDepthClear = 0x00FFFFFFu;
 }  // namespace
 
 UiRasterizer::UiRasterizer() = default;
@@ -98,6 +128,9 @@ void UiRasterizer::Begin(u32 width, u32 height)
   // Per-frame like everything else here: the caller re-decides it before each
   // Flush, from that frame's own world-draw count.
   m_pre_world_filter = false;
+  // Re-decided per frame from the draws actually recorded; the plane itself is
+  // only touched in Flush, and only when this comes up true.
+  m_depth_used = false;
   const size_t needed = static_cast<size_t>(width) * height;
   // The buffer has to come back fully transparent every frame or last frame's
   // HUD ghosts under this one's. resize + fill rather than assign so the
@@ -169,6 +202,15 @@ void UiRasterizer::Flush()
 {
   if (m_draw_count == 0 || m_width == 0 || m_height == 0)
     return;
+
+  // The depth plane exists only on frames that need it. Prepared here, before
+  // any band starts, because the bands write disjoint rows of it but all of
+  // them read the clear value.
+  if (m_depth_used)
+  {
+    m_depth.resize(static_cast<size_t>(m_width) * m_height);
+    std::fill(m_depth.begin(), m_depth.end(), kDepthClear);
+  }
 
   // Bands are sized so that every worker gets one and the calling thread takes
   // the last. Below this much work the handoff costs more than it saves.
@@ -355,11 +397,18 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
   const u32 alpha_reference1 =
       static_cast<u32>(std::clamp(call.alpha_reference1, 0.0f, 1.0f) * 255.0f + 0.5f);
 
+  // Depth participation. GX only updates z while the test is enabled, so one
+  // flag decides both; the plane is guaranteed allocated by Flush whenever any
+  // recorded draw set it.
+  const bool depth_active = call.depth_test;
+
   // A flat, opaque, untextured span is a fade, a letterbox bar or a solid panel,
   // and every pixel in it is the same value - so it becomes a fill rather than a
   // per-pixel blend. This is the single biggest saving on the draws that hurt,
-  // because those are exactly the ones covering the whole screen.
-  const bool flat_fill = !textured && flat_color &&
+  // because those are exactly the ones covering the whole screen. A depth-tested
+  // draw cannot take it - each pixel's verdict is its own - but no ordinary 2D
+  // fade tests depth, so the fast path keeps its whole audience.
+  const bool flat_fill = !textured && flat_color && !depth_active &&
                          (call.blend == BlendMode::Opaque ||
                           (call.blend == BlendMode::Over && flat_a == 255));
   const u32 flat_texel = flat_r | (flat_g << 8) | (flat_b << 16) | 0xFF000000u;
@@ -401,6 +450,8 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
       continue;
 
     u32* const scanline = m_pixels.data() + static_cast<size_t>(y) * m_width;
+    u32* const depth_scanline =
+        depth_active ? m_depth.data() + static_cast<size_t>(y) * m_width : nullptr;
 
     if (flat_fill)
     {
@@ -475,6 +526,22 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
       if (!AlphaPasses(call.alpha_compare, alpha_reference, call.alpha_compare1, alpha_reference1,
                        call.alpha_logic, source_alpha))
         continue;
+
+      // Late z, the hardware order: the alpha test has already killed the
+      // pixel or not, and only a surviving pixel compares and writes depth
+      // (Software/Tev.cpp does exactly this). The write happens even when the
+      // blend then contributes nothing visible - that too is what the console
+      // does with an alpha-passing, fully transparent pixel.
+      if (depth_active)
+      {
+        const float zf = w0 * a.z + w1 * b.z + w2 * c.z;
+        const u32 z = static_cast<u32>(std::clamp(zf, 0.0f, 16777215.0f));
+        u32& stored = depth_scanline[x];
+        if (!DepthPasses(call.depth_func, z, stored))
+          continue;
+        if (call.depth_write)
+          stored = z;
+      }
 
       u32& target = scanline[x];
       switch (call.blend)
@@ -553,6 +620,8 @@ void UiRasterizer::Draw(const DrawCall& call, const std::vector<Vertex>& vertice
     m_draws.emplace_back();
   RecordedDraw& draw = m_draws[m_draw_count++];
   draw.call = call;
+  if (call.depth_test)
+    m_depth_used = true;
   // assign onto the existing storage: these vectors are recycled frame to frame
   // precisely so that recording a HUD does not allocate a hundred times.
   draw.vertices.assign(vertices.begin(), vertices.end());
