@@ -1820,27 +1820,54 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // it. Left in object space with the single matrix on the instance instead,
   // the hash is stable: one handle, reused, and with usable motion vectors.
   //
-  // Costs one extra pass over the posmtx attribute, which is 4 bytes a vertex.
+  // The same pass builds the COMPACT bone table a genuinely multi-matrix draw
+  // needs, so both readings come out of one walk of the attribute (4 bytes a
+  // vertex). Compact means "0, 1, 2... in order of first appearance", not the
+  // physical posMatrices row: which of the 64 rows a game hands a character is
+  // an allocation detail it is free to change between frames, and these indices
+  // fold into the mesh hash, so naming rows directly would re-hash the mesh for
+  // no reason at all. Renumbering the palette is then invisible; only genuinely
+  // re-partitioning which vertices belong to which bone is not.
   u32 uniform_matrix_index = 0;
   bool uniform_matrix = per_vertex_matrix;
   if (per_vertex_matrix)
   {
-    std::memcpy(&uniform_matrix_index, m_base_buffer_pointer + decl.posmtx.offset, sizeof(u32));
-    uniform_matrix_index &= 0x3f;
-    for (u32 i = 1; i < vertex_count; ++i)
+    for (const u32 slot : m_palette_slots)
+      m_palette_named[slot] = false;
+    m_palette_slots.clear();
+    m_skinning.blend_indices.clear();
+    m_skinning.blend_indices.reserve(vertex_count);
+
+    for (u32 i = 0; i < vertex_count; ++i)
     {
       u32 index = 0;
-      std::memcpy(&index, m_base_buffer_pointer + static_cast<size_t>(i) * stride + decl.posmtx.offset,
+      std::memcpy(&index,
+                  m_base_buffer_pointer + static_cast<size_t>(i) * stride + decl.posmtx.offset,
                   sizeof(u32));
-      if ((index & 0x3f) != uniform_matrix_index)
+      index &= 0x3f;
+      if (!m_palette_named[index])
       {
-        uniform_matrix = false;
-        break;
+        m_palette_named[index] = true;
+        m_palette_compact[index] = static_cast<u8>(m_palette_slots.size());
+        m_palette_slots.push_back(index);
       }
+      m_skinning.blend_indices.push_back(m_palette_compact[index]);
     }
+    uniform_matrix_index = m_palette_slots.front();
+    uniform_matrix = m_palette_slots.size() == 1;
   }
-  // Only genuinely multi-matrix geometry gets its vertices transformed.
-  const bool bake_vertices = per_vertex_matrix && !uniform_matrix;
+  // Genuinely multi-matrix geometry either goes over with real skinning data -
+  // stable object-space bytes, the palette on the instance - or, with that off,
+  // has every vertex transformed here as it always did.
+  //
+  // Orthographic draws are excluded on purpose. Neither UI path carries bones:
+  // mode 1 rasterizes vertices on the CPU, mode 2 composes its own placement
+  // onto the instance transform at flush time, and a palette UI draw is rare
+  // enough that growing bones plumbing into either would be all risk and no
+  // payoff. They keep the bake, which works.
+  const bool skin_draw = per_vertex_matrix && !uniform_matrix && !is_ortho &&
+                         g_remix_api->GpuSkinningEnabled();
+  const bool bake_vertices = per_vertex_matrix && !uniform_matrix && !skin_draw;
 
   const int position_components = std::min(decl.position.components, 3);
   const bool has_normals = decl.normals[0].enable;
@@ -2108,12 +2135,13 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
     if (bake_vertices)
     {
-      // Genuinely multi-matrix geometry: each vertex names its own modelview.
-      // There is no per-vertex transform on the Remix side without real skinning
-      // data, so bake the transform in and submit with an identity instance
-      // transform. The mesh hash then covers the transformed bytes, so these
-      // re-create every frame and lean on the idle-mesh LRU - an accepted cost,
-      // now paid only by the draws that actually need it.
+      // Genuinely multi-matrix geometry with skinning turned off: each vertex
+      // names its own modelview, and without real skinning data there is no
+      // per-vertex transform on the Remix side, so bake the transform in and
+      // submit with an identity instance transform. The mesh hash then covers
+      // the transformed bytes, so these re-create every frame and lean on the
+      // idle-mesh LRU - an accepted cost, now paid only by the draws that
+      // actually need it.
       u32 matrix_index = 0;
       std::memcpy(&matrix_index, src + decl.posmtx.offset, sizeof(u32));
       const float* const matrix = &xfmem.posMatrices[(matrix_index & 0x3f) * 4];
@@ -2138,6 +2166,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     }
     else
     {
+      // Raw, in whatever space the game authored the model. A skinned draw takes
+      // this branch too, deliberately: the whole point is that these bytes never
+      // change, so the mesh hash holds still while the pose moves. The runtime's
+      // kernel applies the bone matrix to the NORMAL as well as the position
+      // (skinning.h), which is why the normal goes over untouched here rather
+      // than being pre-transformed the way the bake does it.
       dst.position[0] = position[0];
       dst.position[1] = position[1];
       dst.position[2] = position[2];
@@ -2205,14 +2239,20 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // light and GI, so it is not cosmetic either.
     //
     // On the baked path the vertices are already in view space and the instance
-    // transform is identity, so there is no modelview to un-mirror.
+    // transform is identity, so there is no modelview to un-mirror. A skinned
+    // draw passes null for the same reason in a different arrangement: there is
+    // no single matrix to read a determinant from, and none is needed, because
+    // the kernel transforms the generated normal by the same bone matrix as the
+    // positions - so a mirroring bone flips both together, exactly as the bake
+    // gets it for free by computing the cross product post-transform.
     const float* const winding_matrix =
-        bake_vertices ? nullptr :
-                        &xfmem.posMatrices[(uniform_matrix ?
-                                                uniform_matrix_index :
-                                                static_cast<u32>(
-                                                    g_main_cp_state.matrix_index_a.PosNormalMtxIdx)) *
-                                           4];
+        (bake_vertices || skin_draw) ?
+            nullptr :
+            &xfmem.posMatrices[(uniform_matrix ?
+                                    uniform_matrix_index :
+                                    static_cast<u32>(
+                                        g_main_cp_state.matrix_index_a.PosNormalMtxIdx)) *
+                               4];
     const bool flip = ShouldFlipGeneratedNormals(winding_matrix);
     const float normal_sign = flip ? -1.0f : 1.0f;
     ++stats.normals_generated;
@@ -2224,6 +2264,14 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     m_flat_vertices.reserve(triangle_count * 3);
     m_flat_indices.clear();
     m_flat_indices.reserve(triangle_count * 3);
+    // The blend array is indexed by SUBMITTED vertex, so a split that forks the
+    // vertex array has to fork this one in lockstep or every vertex past the
+    // first shared one is skinned by the wrong bone.
+    if (skin_draw)
+    {
+      m_flat_blend_indices.clear();
+      m_flat_blend_indices.reserve(triangle_count * 3);
+    }
 
     for (size_t tri = 0; tri < triangle_count; ++tri)
     {
@@ -2240,14 +2288,17 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                          normal_sign * (e0[0] * e1[1] - e0[1] * e1[0])};
       Normalize(normal);
 
-      for (const remixapi_HardcodedVertex* source : {&v0, &v1, &v2})
+      for (size_t corner = 0; corner < 3; ++corner)
       {
-        remixapi_HardcodedVertex vertex = *source;
+        const u32 source_index = m_indices[tri * 3 + corner];
+        remixapi_HardcodedVertex vertex = m_vertices[source_index];
         vertex.normal[0] = normal[0];
         vertex.normal[1] = normal[1];
         vertex.normal[2] = normal[2];
         m_flat_indices.push_back(static_cast<u32>(m_flat_vertices.size()));
         m_flat_vertices.push_back(vertex);
+        if (skin_draw)
+          m_flat_blend_indices.push_back(m_skinning.blend_indices[source_index]);
       }
     }
 
@@ -2267,11 +2318,54 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // Which slot that matrix came out of, for the modelview histogram. Hoisted out
   // of the branch below because the diagnostics are filled in further down.
   u32 position_matrix_slot = DrawDiagnostics::NO_POSITION_MATRIX;
-  if (bake_vertices)
+  // Non-null marks this draw GPU-skinned, and is what carries the palette down
+  // into RemixApi::SubmitMesh.
+  const DrawSkinning* draw_skinning = nullptr;
+  if (bake_vertices || skin_draw)
   {
+    // Identity, for two different reasons that arrive at the same matrix. The
+    // bake has already put the vertices in view space. The skin path has the
+    // modelviews themselves in the bone palette, and the runtime applies
+    // skinning FIRST - into the BLAS - with the instance transform on top, so
+    // the palette must be the ONLY place a modelview appears. What the flush
+    // then computes is V^-1 * C * palette * v, which is term for term what the
+    // bake produces; the projection correction folded in below rides C either
+    // way. Pre-multiplying V^-1 into each bone would be the same algebra with
+    // one more place to get the convention wrong.
     transform.matrix[0][0] = 1.0f;
     transform.matrix[1][1] = 1.0f;
     transform.matrix[2][2] = 1.0f;
+
+    if (skin_draw)
+    {
+      // The flat-normal split forked the vertex array, so the blend array it
+      // forked alongside is the one that parallels what is actually submitted.
+      // Traded rather than copied: both are per-draw scratch, both are cleared
+      // before their next use, so the swap just hands each the other's buffer.
+      if (!has_normals)
+        m_skinning.blend_indices.swap(m_flat_blend_indices);
+
+      // Read xfmem HERE, in the draw, and not at frame end. The palette
+      // registers are rewritten between draws - XFStructs.cpp flushes the vertex
+      // manager on every XF write precisely so that draw-time reads are well
+      // defined - so a deferred read would give every skinned draw in the frame
+      // the last character's pose.
+      //
+      // GX modelview matrices are 3 rows of 4 floats, row-major, which is
+      // byte-identical to remixapi_Transform::matrix[3][4] and to what the
+      // non-palette instance transform memcpys below. Bone transforms and
+      // instance transforms go through the same conversion inside the runtime,
+      // so sharing the copy is what guarantees the two cannot drift apart.
+      m_skinning.palette.clear();
+      m_skinning.palette.reserve(m_palette_slots.size());
+      for (const u32 slot : m_palette_slots)
+      {
+        remixapi_Transform bone = {};
+        std::memcpy(&bone.matrix[0][0], &xfmem.posMatrices[slot * 4], sizeof(float) * 12);
+        m_skinning.palette.push_back(bone);
+      }
+      draw_skinning = &m_skinning;
+    }
   }
   else
   {
@@ -2851,7 +2945,14 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // The untextured sky's colour is the folded TEV constant, which is already
   // sitting in blend.tfactor as 0x00RRGGBB; a textured sky ignores it and uses
   // its own albedo as the emissive texture instead.
-  const u64 geometry_hash = RemixApi::GeometryHash(*out_vertices, *out_indices);
+  // The vertex-to-bone partition is part of what this mesh IS, so it belongs in
+  // the identity the mesh cache and every sky decision key on. See
+  // RemixApi::FoldSkinningHash.
+  const u64 geometry_hash =
+      draw_skinning != nullptr ?
+          RemixApi::FoldSkinningHash(RemixApi::GeometryHash(*out_vertices, *out_indices),
+                                     draw_skinning->blend_indices) :
+          RemixApi::GeometryHash(*out_vertices, *out_indices);
   const bool sky_emissive =
       !is_ortho && g_remix_api->SkyEmissiveEnabled() && g_remix_api->IsSkyGeometry(geometry_hash);
   const MaterialRef material =
@@ -2863,7 +2964,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     ++stats.sky_emissive;
 
   g_remix_api->SubmitMesh(material, geometry_hash, *out_vertices, *out_indices, transform,
-                          category_flags, blend, raw_modelview, diagnostics, world_ui_projection);
+                          category_flags, blend, raw_modelview, diagnostics, world_ui_projection,
+                          draw_skinning);
 }
 
 }  // namespace Remix

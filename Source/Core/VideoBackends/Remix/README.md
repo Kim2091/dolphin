@@ -138,7 +138,7 @@ and are cleared by right-clicking the control. Editing that file by hand works
 just as well.
 
 Global values live in `%APPDATA%\Dolphin Emulator\Config\GFX.ini` under
-`[Settings]`. All 60 knobs are declared in
+`[Settings]`. All 61 knobs are declared in
 `Source/Core/Core/Config/RemixSettings.cpp` with a comment explaining what each
 is for and why its default is what it is; the tables below are a summary, and
 that file is the authority. The metadata table at the bottom of the same file is
@@ -337,6 +337,8 @@ All default on; `False` is the pre-fix behaviour in every case.
 | `RemixGxLightDropDistant` | `False` | Drop the game's *directional* lights so an atmosphere mod owns the key light — two suns double up and the game's flat white fights the mod's. Positional lights are kept. Default off, because with no sky mod loaded this removes the scene's only key light. Watch the frame line's `dropped` count. |
 | `RemixFallbackLight` | `True` | The backend's own single distant light, drawn only on frames where the scene submitted **no** lights at all — many GC titles bake lighting into vertex colours and enable none. **Not** the runtime's `rtx.fallbackLightMode`; that is a third, separate mechanism in `rtx.conf`. Turn it off whenever a sky mod provides the light; `RemixGxLightDropDistant` already implies off. |
 | `RemixWorldScissorSkip` | `True` | Skip world draws whose scissor result is empty. Only the all-or-nothing case — a path tracer has no screen-space clip. |
+| `RemixGpuSkinning` | `True` | Submit matrix-palette draws as **object-space** meshes with one bone per vertex plus a per-draw bone palette (`remixapi_MeshInfoSkinning` + `remixapi_InstanceInfoBoneTransformsEXT`), instead of CPU-transforming every vertex by its own `xfmem.posMatrices` row. The bake re-hashes the mesh every frame — new handle, new instance, no BLAS history, no motion vectors — which is what makes skinned characters ghost. Per-vertex bone indices are remapped to compact `0..N-1` in order of first appearance, so the hash survives the game renumbering palette slots. Off is the bake, exactly. Counter: `skinned`. |
+| `RemixDynamicMeshIdentity` | `True` | Stable temporal identity for geometry the **game** regenerates every frame (game-CPU-skinned characters — no palette ever reaches this backend, so `RemixGpuSkinning` cannot help them). Identity is keyed on what a re-pose does *not* change — index bytes, per-vertex UVs and colours, vertex count, material — and a topology whose full mesh hash is seen changing across two distinct frames is promoted: its existing handle's vertex bytes are rewritten in place through the runtime's `UpdateMeshBatched`, which refits the BLAS and yields real per-vertex motion vectors, instead of minting a new handle per frame. Skinned and world-UI draws are excluded; update-path draws are kept out of the camera electorate. Degrades to off (one warning) on a runtime without `UpdateMeshBatched`. Off is the old behaviour, byte for byte. Counter: `updated`. |
 
 ### Projection and viewport
 
@@ -476,8 +478,16 @@ as a screen overlay.
   portraits, position ladders, viewmodel-style rects — are handled.
 - BC-compressed custom texture packs, and mipmaps.
 - Points and lines are not submitted.
-- Skinned characters can ghost: matrix-palette draws are CPU-transformed and
-  re-hash every frame, so they carry no motion vectors.
+- Skinned characters go through the runtime's GPU skinning path
+  (`RemixGpuSkinning`, on by default): the object-space mesh is submitted once
+  with one bone per vertex and the palette rides each instance, so the hash is
+  stable and motion vectors are real. Two caveats remain. Normals are
+  transformed by the *position* matrix — the GPU kernel has no separate GX
+  normal matrix — which is exact for a rigid palette and drifts under
+  non-uniform scale. And the runtime skins each BLAS once per frame, so two
+  clones of one mesh in the same frame share the first submission's pose; that
+  is a runtime-wide limitation, the same one D3D9 titles have. Turning the knob
+  off restores the CPU bake, ghost included.
 - **EFB copies are classified, not all executed** (see *EFB emulation* above).
   Copies of *2D-composed* content run against a real CPU-side EFB and produce
   real pixels; scene, depth and intensity copies are **deliberately** discarded,

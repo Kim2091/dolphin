@@ -63,5 +63,27 @@ private:
   std::vector<u32> m_indices;
   std::vector<remixapi_HardcodedVertex> m_flat_vertices;
   std::vector<u32> m_flat_indices;
+
+  // Matrix-palette skinning scratch, for the same reason. `m_skinning` holds the
+  // compact per-vertex bone indices and the snapshotted palette handed to
+  // RemixApi::SubmitMesh; `m_flat_blend_indices` is its blend-index array
+  // re-expanded to match the flat-normal vertex split, which forks the vertex
+  // array and so has to fork this one identically.
+  //
+  // `m_palette_compact` maps a physical posMatrices row (0-63) to its compact
+  // id and `m_palette_named` says whether that entry means anything yet;
+  // `m_palette_slots` is the inverse, compact id -> row. The inverse is what
+  // makes clearing the forward table cost only the rows a draw actually named
+  // rather than a blind 64-entry wipe on a path that runs hundreds of times a
+  // frame, and it is also the order the palette snapshot is taken in.
+  //
+  // Value-initialized `named` flags are exactly the right starting state - no
+  // row is claimed before the first draw - which is why the claim is a separate
+  // bool rather than a sentinel inside the index table.
+  DrawSkinning m_skinning;
+  std::vector<u32> m_flat_blend_indices;
+  std::vector<u32> m_palette_slots;
+  std::array<u8, 64> m_palette_compact = {};
+  std::array<bool, 64> m_palette_named = {};
 };
 }  // namespace Remix

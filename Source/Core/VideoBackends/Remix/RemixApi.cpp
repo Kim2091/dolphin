@@ -60,6 +60,13 @@ namespace
 // costs VRAM temporarily, never correctness.
 constexpr u64 MESH_IDLE_FRAMES_BEFORE_DESTROY = 300;
 
+// Seed for a promoted (regenerated) mesh's synthetic m_meshes key, derived from
+// its topology key. Its full mesh hash churns every frame, so the lineage's one
+// MeshEntry needs a key that does not; deriving it deterministically also lets
+// a re-promotion after an LOD-switch demotion find and destroy its own zombie.
+// Distinct from every seed the identity hashes use.
+constexpr u64 DYNAMIC_MESH_KEY_SEED = 0x44796e4d65736821ull;  // "DynMesh!"
+
 // Fixed hashes for the handles we own that are not derived from game content.
 constexpr u64 FALLBACK_MATERIAL_HASH = 0x8B1D0F17'52D9A3C1ULL;
 constexpr u64 FALLBACK_MESH_HASH = 0x8B1D0F17'52D9A3C2ULL;
@@ -958,6 +965,14 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_debug_color_routes = Config::Get(Config::GFX_REMIX_DEBUG_COLOR_ROUTES);
   m_ui_ras_channel = Config::Get(Config::GFX_REMIX_UI_RAS_CHANNEL);
   m_world_scissor_skip = Config::Get(Config::GFX_REMIX_WORLD_SCISSOR_SKIP);
+  // Read once, never refreshed: it decides how a matrix-palette draw's vertices
+  // are built, so it is baked into every mesh hash the cache holds. See
+  // GpuSkinningEnabled.
+  m_gpu_skinning = Config::Get(Config::GFX_REMIX_GPU_SKINNING);
+  // Read once for the same reason: promoted meshes live under synthetic cache
+  // keys, so the two modes cannot share a session. Degraded below, after the
+  // runtime is loaded, if the deployed d3d9 predates UpdateMeshBatched.
+  m_dynamic_mesh_identity = Config::Get(Config::GFX_REMIX_DYNAMIC_MESH_IDENTITY);
   m_light_range = std::max(1.0f, Config::Get(Config::GFX_REMIX_LIGHT_RANGE));
   // World space starts as view space and drifts away from it as the estimator
   // integrates. Frame 0 is therefore exactly the identity-view behaviour.
@@ -1070,6 +1085,20 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
     remixapi_lib_shutdownAndUnloadRemixDll(&m_interface, m_dll);
     m_dll = nullptr;
     return false;
+  }
+
+  // Degrade the dynamic-mesh-identity feature, once and audibly, when the
+  // loaded runtime predates the UpdateMeshBatched vtable slot. The knob's
+  // promise is "off is the old behaviour exactly"; a silent nullptr here would
+  // make ON the old behaviour too, which would poison any A/B run.
+  if (m_dynamic_mesh_identity && m_interface.UpdateMeshBatched == nullptr)
+  {
+    WARN_LOG_FMT(VIDEO,
+                 "Remix: RemixDynamicMeshIdentity is on, but the loaded runtime is too old to "
+                 "support it (no UpdateMeshBatched entry point). Regenerated meshes keep the old "
+                 "one-handle-per-frame behaviour this session; deploy a newer d3d9-remix.dll to "
+                 "get stable identity.");
+    m_dynamic_mesh_identity = false;
   }
 
   HWND hwnd = static_cast<HWND>(wsi.render_surface);
@@ -1247,6 +1276,7 @@ void RemixApi::DestroyAllHandles()
       CallGuarded("DestroyMesh", [&] { m_interface.DestroyMesh(handle); });
   }
   m_meshes.clear();
+  m_topology.clear();
   m_poisoned_meshes.clear();
 
   if (m_fallback_mesh != nullptr)
@@ -1565,6 +1595,48 @@ u64 RemixApi::GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices
   return hash;
 }
 
+u64 RemixApi::FoldSkinningHash(u64 geometry_hash, const std::vector<u32>& blend_indices)
+{
+  // A third distinct seed, in the same XXH64-with-a-distinct-seed style the two
+  // folds above use, so the blend indices cannot alias either of them.
+  constexpr u64 SKINNING_SEED = 0x536b696e6e696e67ull;  // "Skinning"
+  return geometry_hash ^ XXH64(blend_indices.data(), blend_indices.size() * sizeof(u32),
+                               SKINNING_SEED);
+}
+
+u64 RemixApi::TopologyHash(const std::vector<remixapi_HardcodedVertex>& vertices,
+                           const std::vector<u32>& indices, u64 material_hash)
+{
+  // A fourth distinct seed, same style as the three above, so a topology key
+  // cannot alias a geometry or skinning hash.
+  constexpr u64 TOPOLOGY_SEED = 0x546f706f6c6f6779ull;  // "Topology"
+
+  // Gather the pose-invariant vertex bytes: texcoord (8 B) + colour (4 B) per
+  // vertex. Positions and normals are excluded on purpose - they are exactly
+  // what a re-pose changes - and the vertex layout is one hardcoded struct, so
+  // the format needs no fold of its own.
+  m_topology_scratch.clear();
+  m_topology_scratch.reserve(vertices.size() * 12);
+  for (const remixapi_HardcodedVertex& vertex : vertices)
+  {
+    const u8* texcoord = reinterpret_cast<const u8*>(&vertex.texcoord[0]);
+    m_topology_scratch.insert(m_topology_scratch.end(), texcoord,
+                              texcoord + sizeof(vertex.texcoord));
+    const u8* color = reinterpret_cast<const u8*>(&vertex.color);
+    m_topology_scratch.insert(m_topology_scratch.end(), color, color + sizeof(vertex.color));
+  }
+
+  // Chained through the seed rather than XORed together, so two components
+  // that happen to hash equal cannot cancel each other out.
+  u64 key = XXH64(indices.data(), indices.size() * sizeof(u32), TOPOLOGY_SEED);
+  key = XXH64(m_topology_scratch.data(), m_topology_scratch.size(), key);
+  key = FoldHash(key, static_cast<u64>(vertices.size()));
+  key = FoldHash(key, material_hash);
+  // Zero is MeshEntry.topology_key's "untracked" sentinel, so it must never be
+  // a real key.
+  return NonZeroHash(key);
+}
+
 MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
                                      u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
                                      bool emissive, u32 emissive_rgb)
@@ -1768,7 +1840,8 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
                           remixapi_InstanceCategoryFlags category_flags,
                           const DrawBlendState& blend, const float* raw_modelview,
                           const DrawDiagnostics& diagnostics,
-                          const std::array<float, 6>* world_ui_projection)
+                          const std::array<float, 6>* world_ui_projection,
+                          const DrawSkinning* skinning)
 {
   if (!m_valid || material.handle == nullptr || vertices.empty() || indices.empty())
     return;
@@ -1791,18 +1864,219 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
   // not collapse onto one handle (whichever registered first would win).
   const u64 mesh_hash = NonZeroHash(FoldHash(geometry_hash, material.hash));
 
+  // Decided once, before anything acts on it, so that the mesh created on the
+  // first submission and the bones attached on every later one cannot disagree
+  // about whether this draw is skinned. The two size tests are what makes it a
+  // decision rather than an assumption: the runtime indexes the blend array by
+  // vertex, and a palette this instance cannot fill would skin the mesh by
+  // whatever a zeroed bone array means.
+  const bool skinned = skinning != nullptr && !skinning->palette.empty() &&
+                       skinning->blend_indices.size() == vertices.size();
+
   if (m_poisoned_meshes.count(mesh_hash) != 0)
     return;
 
   remixapi_MeshHandle mesh_handle = nullptr;
+  // Recorded rather than inferred from meshes_created: that counter is global to
+  // the frame, and we need to know whether THIS draw reused a handle.
+  bool minted_mesh = false;
+  // Set when this draw was served by rewriting an existing handle's vertex
+  // bytes in place. Such a draw must stay out of the camera electorate below:
+  // a stable correspondence key over per-frame-changing object-space bytes
+  // would poison the estimator's "same hash means same geometry" premise.
+  bool updated_in_place = false;
+  // The pose-invariant key of this draw, or 0 when the dynamic-mesh-identity
+  // feature is not tracking it (feature off, skinned, world-UI, or a plain
+  // full-hash hit that carries its create-time key instead).
+  u64 topology_key = 0;
+  TopoEntry* topo = nullptr;
   if (const auto it = m_meshes.find(mesh_hash); it != m_meshes.end())
   {
     mesh_handle = it->second.handle;
     it->second.last_used_frame = m_frame_index;
     it->second.geometry_hash = geometry_hash;
     it->second.diagnostics = diagnostics;
+    // A repeating full hash is the ordinary cache working; make sure its
+    // lineage cannot creep toward promotion. Refreshed in O(1) through the
+    // key recorded at create time - no regather, no rehash.
+    if (it->second.topology_key != 0)
+    {
+      if (const auto topo_it = m_topology.find(it->second.topology_key);
+          topo_it != m_topology.end())
+      {
+        topo_it->second.last_full_hash = mesh_hash;
+        topo_it->second.last_seen_frame = m_frame_index;
+        topo_it->second.change_streak = 0;
+      }
+    }
   }
-  else
+  else if (m_dynamic_mesh_identity && !skinned && world_ui_projection == nullptr)
+  {
+    // Dynamic mesh identity. A full-hash MISS is either genuinely new
+    // geometry or a known mesh in a new pose; the two are told apart by the
+    // topology key - everything a re-pose does NOT change (index bytes,
+    // per-vertex UVs and colours, vertex count, material). A key whose full
+    // hash is observed changing across two distinct frames is geometry the
+    // game regenerates per frame (BFBB's CPU-animated characters and that
+    // whole class), and it is served by rewriting its existing handle's
+    // vertex bytes through UpdateMeshBatched - BLAS refit, real per-vertex
+    // motion vectors - instead of minting a fresh handle, and a fresh ghost,
+    // every frame. Skinned and world-UI draws never reach this block: the
+    // palette-skinning path is stable and validated, and this must not touch
+    // its gate.
+    topology_key = TopologyHash(vertices, indices, material.hash);
+    if (const auto topo_it = m_topology.find(topology_key); topo_it != m_topology.end())
+      topo = &topo_it->second;
+
+    MeshEntry* update_target = nullptr;
+    if (topo != nullptr)
+    {
+      const bool counts_match = topo->vertex_count == static_cast<u32>(vertices.size()) &&
+                                topo->index_count == static_cast<u32>(indices.size());
+
+      // Demote before anything acts on the promotion, so the promoted branch
+      // below only ever sees a servable lineage: a count change under a
+      // stable key is an LOD switch (the runtime would drop the update
+      // anyway), and a missing dynamic entry means the reaper destroyed the
+      // handle while the lineage record outlived it.
+      if (topo->dynamic_mesh_key != 0 &&
+          (!counts_match || m_meshes.find(topo->dynamic_mesh_key) == m_meshes.end()))
+      {
+        topo->dynamic_mesh_key = 0;
+        topo->change_streak = 0;
+      }
+
+      if (topo->dynamic_mesh_key != 0)
+      {
+        MeshEntry& entry = m_meshes.find(topo->dynamic_mesh_key)->second;
+        if (mesh_hash == topo->last_full_hash)
+        {
+          // Paused animation: the bytes did not change, so the handle is
+          // reused as-is and the pause costs zero API traffic. The draw may
+          // also vote in the camera electorate below - its bytes really are
+          // frame-stable for as long as the hash repeats, which is exactly
+          // the behaviour these draws had before this feature existed.
+          mesh_handle = entry.handle;
+          entry.last_used_frame = m_frame_index;
+          entry.geometry_hash = geometry_hash;
+          entry.diagnostics = diagnostics;
+          topo->last_seen_frame = m_frame_index;
+        }
+        else
+        {
+          update_target = &entry;
+        }
+      }
+      else if (topo->last_seen_frame == m_frame_index)
+      {
+        // Two different objects landed on one topology key in the SAME frame
+        // (mirrored props, particle quads). Two objects are not one object
+        // regenerating, so this creates normally and leaves the lineage
+        // record alone - the collision must not be able to walk it toward
+        // promotion.
+      }
+      else
+      {
+        if (mesh_hash != topo->last_full_hash)
+        {
+          ++topo->change_streak;
+          if (topo->change_streak >= 2 && counts_match)
+          {
+            // The full hash has now changed across two distinct frames with
+            // stable counts: regenerated geometry. Move last frame's
+            // MeshEntry from its already-stale full-hash key to the
+            // lineage's synthetic key, and serve THIS frame's bytes through
+            // the update path below.
+            if (const auto prev_it = m_meshes.find(topo->last_full_hash);
+                prev_it != m_meshes.end())
+            {
+              const u64 dynamic_key = NonZeroHash(FoldHash(topology_key, DYNAMIC_MESH_KEY_SEED));
+              // An LOD-switch demotion can leave a zombie under the
+              // deterministic synthetic key. Nothing looks it up after the
+              // demote, so destroy it rather than collide with it.
+              if (const auto stale_it = m_meshes.find(dynamic_key); stale_it != m_meshes.end())
+              {
+                if (stale_it->second.handle != nullptr)
+                {
+                  remixapi_MeshHandle stale_handle = stale_it->second.handle;
+                  CallGuarded("DestroyMesh(stale dynamic)",
+                              [&] { m_interface.DestroyMesh(stale_handle); });
+                }
+                m_meshes.erase(stale_it);
+              }
+              MeshEntry moved = prev_it->second;
+              m_meshes.erase(prev_it);
+              moved.topology_key = topology_key;
+              update_target = &m_meshes.emplace(dynamic_key, moved).first->second;
+              topo->dynamic_mesh_key = dynamic_key;
+            }
+          }
+        }
+        // Record this frame's observation whichever way the miss resolves:
+        // the lineage last showed THIS hash, on THIS frame, at these counts.
+        topo->last_full_hash = mesh_hash;
+        topo->last_seen_frame = m_frame_index;
+        topo->vertex_count = static_cast<u32>(vertices.size());
+        topo->index_count = static_cast<u32>(indices.size());
+      }
+    }
+
+    if (update_target != nullptr)
+    {
+      // The same surface the create path would build, minus skinning (draws
+      // with a palette never enter this block). info.hash names the EXISTING
+      // handle - the runtime's update convention - rather than minting a new
+      // identity.
+      remixapi_MeshInfoSurfaceTriangles surface = {};
+      surface.vertices_values = vertices.data();
+      surface.vertices_count = vertices.size();
+      surface.indices_values = indices.data();
+      surface.indices_count = indices.size();
+      surface.skinning_hasvalue = 0;
+      surface.material = material.handle;
+
+      remixapi_MeshInfo info = {};
+      info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+      info.pNext = nullptr;
+      info.hash = reinterpret_cast<uint64_t>(update_target->handle);
+      info.surfaces_values = &surface;
+      info.surfaces_count = 1;
+
+      remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      const int guard = CallGuarded("UpdateMeshBatched",
+                                    [&] { status = m_interface.UpdateMeshBatched(&info); });
+      if (guard == 0 && status == REMIXAPI_ERROR_CODE_SUCCESS)
+      {
+        mesh_handle = update_target->handle;
+        update_target->last_used_frame = m_frame_index;
+        update_target->geometry_hash = geometry_hash;
+        update_target->diagnostics = diagnostics;
+        topo->last_full_hash = mesh_hash;
+        topo->last_seen_frame = m_frame_index;
+        ++m_stats.meshes_updated;
+        updated_in_place = true;
+      }
+      else
+      {
+        // Not poisoned: the full hash is per-frame anyway, so poisoning would
+        // blacklist one pose of the mesh and nothing else. Demote and fall
+        // back to a plain create this frame; the lineage can re-promote once
+        // the hash is seen changing again.
+        WARN_LOG_FMT(VIDEO,
+                     "Remix: UpdateMeshBatched({:#018x}) failed (guard {}, error {}); falling "
+                     "back to a fresh mesh",
+                     info.hash, guard, static_cast<int>(status));
+        topo->dynamic_mesh_key = 0;
+        topo->change_streak = 0;
+        topo->last_full_hash = mesh_hash;
+        topo->last_seen_frame = m_frame_index;
+        topo->vertex_count = static_cast<u32>(vertices.size());
+        topo->index_count = static_cast<u32>(indices.size());
+      }
+    }
+  }
+
+  if (mesh_handle == nullptr)
   {
     remixapi_MeshInfoSurfaceTriangles surface = {};
     surface.vertices_values = vertices.data();
@@ -1811,6 +2085,29 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
     surface.indices_count = indices.size();
     surface.skinning_hasvalue = 0;
     surface.material = material.handle;
+
+    // GX has no bones, so its palette does not decompose into a rig: a vertex
+    // names ONE of 64 complete object-to-view modelviews and that matrix is the
+    // whole of its transform. That is exactly one bone per vertex at full
+    // weight, which is the degenerate case the runtime's skinning kernel already
+    // handles (positionOut = sum of w_i * bone[idx_i] * v, over one term).
+    //
+    // Both weights and indices are consumed before this call returns - the
+    // batched path deep-copies them into its own pending record, the plain path
+    // memcpys them straight into DXVK buffers - so a local weight array and the
+    // caller's scratch indices are safe to hand over.
+    std::vector<float> blend_weights;
+    if (skinned)
+    {
+      blend_weights.assign(vertices.size(), 1.0f);
+      surface.skinning_hasvalue = 1;
+      surface.skinning_value.bonesPerVertex = 1;
+      surface.skinning_value.blendWeights_values = blend_weights.data();
+      surface.skinning_value.blendWeights_count = static_cast<u32>(blend_weights.size());
+      surface.skinning_value.blendIndices_values = skinning->blend_indices.data();
+      surface.skinning_value.blendIndices_count =
+          static_cast<u32>(skinning->blend_indices.size());
+    }
 
     remixapi_MeshInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
@@ -1859,8 +2156,24 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
     entry.object_radius = std::sqrt(radius_sq);
     entry.geometry_hash = geometry_hash;
     entry.diagnostics = diagnostics;
+    entry.topology_key = topology_key;
     m_meshes.emplace(mesh_hash, entry);
     ++m_stats.meshes_created;
+    minted_mesh = true;
+
+    // First sighting of a tracked topology: open its lineage record, so a
+    // hash change on a later frame is observable at all. Existing lineages
+    // were already brought up to date (or deliberately left alone, for the
+    // same-frame collision) before the create was chosen.
+    if (topology_key != 0 && topo == nullptr)
+    {
+      TopoEntry fresh;
+      fresh.last_full_hash = mesh_hash;
+      fresh.last_seen_frame = m_frame_index;
+      fresh.vertex_count = static_cast<u32>(vertices.size());
+      fresh.index_count = static_cast<u32>(indices.size());
+      m_topology.emplace(topology_key, fresh);
+    }
   }
 
   // Sample this draw for the camera estimator before queueing it. The mesh hash
@@ -1870,7 +2183,13 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
   // and their baked view-space vertices re-hash every frame, so they cannot
   // take part either way.
   const size_t sample_cap = m_view_electorate_fix ? MAX_VIEW_SAMPLES : LEGACY_MAX_VIEW_SAMPLES;
-  if (raw_modelview != nullptr && m_view_samples.size() < sample_cap &&
+  // Update-path draws are excluded: the electorate pairs by mesh hash on the
+  // premise that a repeated hash means repeated geometry, and an in-place
+  // update is precisely a stable identity over CHANGING object-space bytes.
+  // Before this feature such a draw entered once under a never-repeating hash
+  // and could not pair - harmless; with a stable key it WOULD pair, and the
+  // false correspondence would feed the camera estimator.
+  if (!updated_in_place && raw_modelview != nullptr && m_view_samples.size() < sample_cap &&
       vertices.size() >= MIN_VIEW_SAMPLE_VERTICES)
   {
     Affine modelview = {};
@@ -1934,7 +2253,17 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
     pending.world_ui = true;
     pending.ortho_projection = *world_ui_projection;
   }
-  m_pending_instances.push_back(pending);
+  // On every submission, hit or miss. The mesh carries the vertex-to-bone
+  // partition, which is fixed the moment it is created; the pose is what changes
+  // per draw, and it lives here.
+  if (skinned)
+  {
+    pending.bones = skinning->palette;
+    ++m_stats.draws_skinned;
+    if (minted_mesh)
+      ++m_stats.draws_skinned_new_mesh;
+  }
+  m_pending_instances.push_back(std::move(pending));
 }
 
 const char* EfbCopyClassName(EfbCopyClass copy_class)
@@ -2876,6 +3205,22 @@ void RemixApi::FlushPendingInstances()
     picking.objectPickingValue = m_next_picking_value++;
     if (m_next_picking_value == 0)
       m_next_picking_value = 1;
+
+    // This draw's bone palette, which is the entire handshake that makes a
+    // matrix-palette mesh move: the runtime hashes it, re-skins the BLAS on
+    // every frame the hash changes, and keeps the BLAS - and therefore the
+    // motion vectors - when it does not. Chained off picking, which was the end
+    // of the chain, so both the with-blend and without-blend arrangements pick
+    // it up; the runtime's pNext walk is a search, not an order.
+    remixapi_InstanceInfoBoneTransformsEXT bones_ext = {};
+    if (!pending.bones.empty())
+    {
+      bones_ext.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+      bones_ext.pNext = nullptr;
+      bones_ext.boneTransforms_values = pending.bones.data();
+      bones_ext.boneTransforms_count = static_cast<u32>(pending.bones.size());
+      picking.pNext = &bones_ext;
+    }
 
     // Fixed-function texture-stage state. Without it the runtime keeps its own
     // defaults - argument 1 is the texture, argument 2 is nothing - and the
@@ -4389,7 +4734,31 @@ void RemixApi::ReapIdleMeshes()
       remixapi_MeshHandle handle = it->second.handle;
       CallGuarded("DestroyMesh(idle)", [&] { m_interface.DestroyMesh(handle); });
     }
+    // If this mesh IS a promoted lineage's single entry, the lineage record
+    // dies with it - a dangling dynamic_mesh_key would otherwise be looked up
+    // (and demoted) on the topology's next appearance, which works but wastes
+    // the promotion the lineage had already earned. Unpromoted records are
+    // left to the idle sweep below: another live mesh may share the topology.
+    if (it->second.topology_key != 0)
+    {
+      if (const auto topo_it = m_topology.find(it->second.topology_key);
+          topo_it != m_topology.end() && topo_it->second.dynamic_mesh_key == it->first)
+      {
+        m_topology.erase(topo_it);
+      }
+    }
     it = m_meshes.erase(it);
+  }
+
+  // Same idleness rule for the lineage records themselves, so one-off meshes
+  // (and topologies whose meshes were reaped above) cannot grow the map for
+  // the rest of the session.
+  for (auto it = m_topology.begin(); it != m_topology.end();)
+  {
+    if (m_frame_index - it->second.last_seen_frame > MESH_IDLE_FRAMES_BEFORE_DESTROY)
+      it = m_topology.erase(it);
+    else
+      ++it;
   }
 }
 
@@ -4439,7 +4808,9 @@ void RemixApi::OnAfterFrame()
                  "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} efbdisc {} empty {} "
                  "invisible {} "
                  "scissor {} "
-                 "| meshes created {} (live {}) | instances {} (sky {}) | colour {} vertex, {} "
+                 "| meshes created {} (live {}) | skinned {} ({} new mesh) | updated {} | "
+                 "instances {} (sky {}) "
+                 "| colour {} vertex, {} "
                  "register, {} none, {} split | tev colour {} folded, {} tinted, {} identity, {} bailed, {} "
                  "later-stage tex | texgen {} ({} non-trivial) | blended {} tested {} "
                  "logicop {} "
@@ -4460,7 +4831,10 @@ void RemixApi::OnAfterFrame()
                  m_stats.skipped_efb_discarded, m_stats.skipped_degenerate,
                  m_stats.skipped_invisible, m_stats.skipped_scissor,
                  m_stats.meshes_created,
-                 m_meshes.size(), m_stats.instances_drawn, m_stats.sky_draws, m_stats.color_vertex,
+                 m_meshes.size(), m_stats.draws_skinned, m_stats.draws_skinned_new_mesh,
+                 m_stats.meshes_updated,
+                 m_stats.instances_drawn,
+                 m_stats.sky_draws, m_stats.color_vertex,
                  m_stats.color_register, m_stats.color_none, m_stats.ras_channel_split,
                  m_stats.tev_color_folded, m_stats.tev_color_tinted,
                  m_stats.tev_color_identity, m_stats.tev_color_bailed,

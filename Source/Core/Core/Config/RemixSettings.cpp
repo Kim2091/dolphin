@@ -808,6 +808,49 @@ const Info<std::string> GFX_REMIX_PER_GAME_ROOT{{System::GFX, "Settings", "Remix
 // see. The rest of the separation - config, captures, log - is unaffected either
 // way.
 const Info<bool> GFX_REMIX_PER_GAME_MODS{{System::GFX, "Settings", "RemixPerGameMods"}, true};
+// Submit matrix-palette (skinned) draws as stable object-space meshes with
+// per-vertex bone indices and a per-draw bone palette, so the runtime skins them
+// on the GPU, instead of transforming every vertex on the CPU.
+//
+// The CPU bake is what makes characters ghost. A baked draw's vertex bytes are
+// in VIEW space, so they change whenever the character animates OR the camera
+// moves; the mesh hash covers those bytes, so every frame mints a brand new mesh
+// handle and a brand new instance. Remix has nothing to match against the
+// previous frame - no BLAS history, no motion vectors - so the denoiser and
+// every temporal feature see a character that teleports into existence each
+// frame, which reads on screen as a duplicate trail dragging behind anything
+// that moves.
+//
+// Skinning on the GPU instead makes the submitted mesh the object-space one the
+// game authored: identical bytes every frame, one stable hash, one reused
+// handle, real per-vertex motion vectors. Only the bone palette changes, and the
+// runtime already re-skins exactly when it does.
+//
+// Off restores the CPU bake exactly, byte for byte, so the two are a clean A/B -
+// which is the tool to reach for if a character ever renders exploded or
+// collapsed, since a bone/vertex convention mistake presents that way and
+// nothing else does.
+const Info<bool> GFX_REMIX_GPU_SKINNING{{System::GFX, "Settings", "RemixGpuSkinning"}, true};
+// Give geometry the game regenerates every frame - CPU-skinned characters and
+// their whole class - one stable Remix mesh handle, updated in place, instead
+// of a brand new mesh per frame.
+//
+// A regenerated draw's vertex bytes change every frame, so its full mesh hash
+// changes every frame, so the old path minted a new handle, a new BLAS and a
+// new instance per frame: no temporal identity, zero motion vectors, and the
+// same duplicate-trail ghost the GPU-skinning knob fixes for palette draws -
+// but for geometry the GAME skins on ITS cpu, where no palette ever reaches
+// this backend. This knob keys identity on what a re-pose does NOT change -
+// indices, UVs, vertex colours, material - and when that topology is seen
+// re-posing across frames, the existing handle's vertices are rewritten
+// through the runtime's UpdateMeshBatched, which refits the BLAS and yields
+// real per-vertex motion vectors.
+//
+// Off restores the old behaviour exactly, byte for byte. It also degrades to
+// off automatically (with one warning) when the deployed runtime predates
+// UpdateMeshBatched.
+const Info<bool> GFX_REMIX_DYNAMIC_MESH_IDENTITY{
+    {System::GFX, "Settings", "RemixDynamicMeshIdentity"}, true};
 
 // The GUI's view of everything above. Rows are in README section order; the
 // tooltips are the comments above rewritten for someone who has never read this
@@ -1095,6 +1138,22 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "case is acted on, deliberately: a path tracer has no screen-space clipping, so a draw "
            "the clip merely trims is submitted whole.",
            Group::GxSemantics),
+    Toggle(&GFX_REMIX_GPU_SKINNING, "GPU-skinned characters",
+           "Let the renderer pose characters, instead of moving every vertex on the CPU first. "
+           "Moving them here rebuilds the character from scratch every frame, so the renderer "
+           "cannot tell it is the same character as last frame and leaves a ghostly duplicate "
+           "trailing behind anything that moves. Sending the unposed model plus the bones fixes "
+           "that, and it is also what makes characters replaceable by a mod. Off restores the old "
+           "behaviour exactly - turn it off if a character ever comes out mangled.",
+           Group::GxSemantics, Liveness::RequiresRestart, Maturity::Experimental),
+    Toggle(&GFX_REMIX_DYNAMIC_MESH_IDENTITY, "Stable identity for regenerated meshes",
+           "Recognise geometry the game rebuilds every frame - characters the game animates on "
+           "its own CPU - and update one mesh in place instead of creating a brand new one each "
+           "frame. Without this the renderer cannot tell it is the same object as last frame, so "
+           "a ghostly duplicate trails behind it and captures fill up with thousands of one-frame "
+           "meshes. Off restores the old behaviour exactly - turn it off if two identically-built "
+           "objects ever appear to swap or flicker for a frame.",
+           Group::GxSemantics, Liveness::RequiresRestart, Maturity::Experimental),
 
     // Projection and viewport.
     Toggle(&GFX_REMIX_PROJECTION_FIX, "Per-draw projection correction",

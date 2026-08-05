@@ -233,6 +233,34 @@ struct FrameStats
   // dominant matrix's share can be read against the right denominator.
   u32 modelview_samples = 0;
   u32 modelview_palette = 0;
+  // Of those palette draws, how many were submitted GPU-skinned rather than
+  // CPU-baked. Read it against `meshes created`: skinned draws are the ones that
+  // used to mint a fresh mesh every frame, so a non-zero `skinned` with a
+  // collapsed mesh count is the whole feature working. `skinned` non-zero while
+  // meshes stay high means the game re-partitions which vertices name which
+  // palette slot, so even compact indices re-hash - the one thing that cannot be
+  // established without running a game.
+  u32 draws_skinned = 0;
+  // How many of those skinned draws had to MINT a mesh rather than reuse one.
+  // This is the splitter the plain `meshes` count cannot give: that number mixes
+  // skinned draws with regenerated geometry (WW-sea-style), so it can stay high
+  // for reasons that have nothing to do with skinning. Read it as:
+  //   0            - hashes are stable, handles are being reused, and the
+  //                  runtime is taking kUpdateBVH (which is what populates
+  //                  previousPositionBuffer). If motion vectors are still black
+  //                  here, the fault is downstream of identity, not in the hash.
+  //   == skinned   - a new handle every frame, so the runtime takes KBuildBVH.
+  //                  Skinning STILL dispatches on that path, so characters look
+  //                  correct while carrying no history at all - exactly the
+  //                  "geometry fine, motion vectors zero" symptom.
+  u32 draws_skinned_new_mesh = 0;
+  // Draws served by rewriting an existing mesh handle's vertex bytes in place
+  // (UpdateMeshBatched) instead of minting a fresh handle - the regenerated-
+  // geometry counterpart of `skinned`. Read it against `meshes created`: in a
+  // steady scene this should carry the per-frame regenerated draw count while
+  // `meshes created` collapses toward zero, because those draws are exactly
+  // the ones that used to create a new mesh every frame.
+  u32 meshes_updated = 0;
   // Orthographic draws placed on the world-space UI plane, and those that could
   // not be (no camera yet, or a degenerate ortho projection). A game whose menus
   // are missing while `ui_placed` is non-zero has a placement bug, not a
@@ -474,6 +502,32 @@ struct DrawDiagnostics
   // and the slot is known here and nowhere downstream.
   static constexpr u32 NO_POSITION_MATRIX = 0xFFFFFFFFu;
   u32 position_matrix = NO_POSITION_MATRIX;
+};
+
+// One matrix-palette draw's skinning data, carried from the vertex manager into
+// SubmitMesh. Split in two because the halves have different lifetimes: the
+// blend indices describe the MESH and are consumed once, at create time, while
+// the palette is per-draw state that has to survive until the frame's camera is
+// known and the instance is finally emitted.
+//
+// This exists at all because GX has no bones. A matrix-palette draw names one of
+// 64 xfmem.posMatrices rows per vertex, so the console's "palette" is a set of
+// complete object-to-VIEW modelviews rather than a rig - which is exactly what
+// the Remix skinning kernel wants (positionOut = bone[idx] * v), one bone per
+// vertex, weight 1.
+struct DrawSkinning
+{
+  // One compact bone index per SUBMITTED vertex, in the same order and of the
+  // same length as the vertex array that goes to CreateMesh. Compact means
+  // 0..palette.size()-1 in order of first appearance in the vertex stream, NOT
+  // the physical posMatrices row: which rows a game hands a character is an
+  // allocation detail that can change between frames, and the mesh hash folds
+  // these indices in, so anything less canonical would re-hash for free.
+  std::vector<u32> blend_indices;
+  // The referenced modelviews, in that same compact order, snapshotted AT DRAW
+  // TIME. xfmem is rewritten mid-frame, so reading it any later would give every
+  // skinned draw in the frame the last one's pose.
+  std::vector<remixapi_Transform> palette;
 };
 
 // One draw's viewport, as a screen mapping rather than as registers. GX maps
@@ -761,6 +815,17 @@ public:
   // the pre-fix behaviour: the world path read scissor state nowhere.
   bool WorldScissorSkipEnabled() const { return m_world_scissor_skip; }
 
+  // False restores the CPU bake for matrix-palette draws exactly, which is the
+  // pre-fix behaviour: every vertex is transformed by its own modelview here and
+  // the mesh is submitted in view space, so its bytes - and therefore its hash,
+  // its handle and its instance - are new every frame and it carries no motion.
+  // On, the raw object-space mesh goes over with one bone per vertex and the
+  // palette rides the instance, so the hash is stable and the runtime skins it.
+  // It participates in mesh identity, so it is read once at init and never
+  // re-read: flipping it mid-game would leave the two kinds of mesh sharing one
+  // cache.
+  bool GpuSkinningEnabled() const { return m_gpu_skinning; }
+
   // Per-draw world colour trace. Heavier than the other trace knobs - a line per
   // draw rather than per frame - so it is off by default.
   bool TraceColorsEnabled() const { return m_trace_colors; }
@@ -810,6 +875,17 @@ public:
   static u64 GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices);
 
+  // Folds a skinned draw's per-vertex bone indices into that geometry identity.
+  // Object-space positions stop being a unique description of the mesh the
+  // moment skinning exists: two draws can share every vertex and every triangle
+  // and still partition those vertices across bones differently, and they must
+  // not collapse onto one handle, because the partition is baked into the mesh
+  // at create time and whichever registered first would decide the other's pose.
+  // It also keeps a skinned mesh apart from an unskinned twin. Lives here rather
+  // than at the call site so every rule about how geometry identity is computed
+  // stays in one file.
+  static u64 FoldSkinningHash(u64 geometry_hash, const std::vector<u32>& blend_indices);
+
   // Whether a geometry hash has been classified as sky. Keyed on geometry rather
   // than on the mesh hash precisely so that asking this question cannot be
   // perturbed by the answer - see MeshEntry::geometry_hash.
@@ -838,12 +914,22 @@ public:
   // flush time, when the camera exists. Such a draw must pass raw_modelview as
   // null - an ortho modelview is not a view matrix, and letting one into the
   // histogram would corrupt the very camera the UI is placed against.
+  //
+  // skinning non-null marks a GPU-skinned matrix-palette draw. `vertices` are
+  // then the game's OBJECT-space ones and `transform` is the identity (plus the
+  // projection correction), because the pose lives entirely in the bone palette:
+  // the runtime skins into the BLAS first and applies the instance transform on
+  // top, so the flush fold by V^-1 lands the result in exactly the place the CPU
+  // bake used to put it. Caller-owned and read within the call - the palette is
+  // copied into the pending instance, the indices go straight into CreateMesh,
+  // which deep-copies them - so scratch vectors are fine.
   void SubmitMesh(const MaterialRef& material, u64 geometry_hash,
                   const std::vector<remixapi_HardcodedVertex>& vertices,
                   const std::vector<u32>& indices, const remixapi_Transform& transform,
                   remixapi_InstanceCategoryFlags category_flags, const DrawBlendState& blend,
                   const float* raw_modelview, const DrawDiagnostics& diagnostics,
-                  const std::array<float, 6>* world_ui_projection = nullptr);
+                  const std::array<float, 6>* world_ui_projection = nullptr,
+                  const DrawSkinning* skinning = nullptr);
 
   // How orthographic draws - HUD, menus, 2D screens - are handled.
   //   0 = dropped, the pre-feature behaviour
@@ -988,6 +1074,41 @@ private:
     u64 geometry_hash = 0;
     // Last draw of this mesh, for the classification log line only.
     DrawDiagnostics diagnostics;
+    // The pose-invariant key this mesh registered under in m_topology, or 0
+    // for a mesh the dynamic-identity feature is not tracking (feature off,
+    // skinned, world-UI). Carried here so a full-hash HIT can refresh its topo
+    // entry in O(1) without regathering and rehashing the vertex stream, and
+    // so ReapIdleMeshes can drop the topo entry alongside the mesh.
+    u64 topology_key = 0;
+  };
+
+  // Cross-frame lineage of one topology - everything about a mesh that a
+  // re-pose does NOT change (index bytes, per-vertex UVs and colours, vertex
+  // count, material). When the full mesh hash observed under one topology key
+  // changes across two distinct frames, the geometry is being regenerated per
+  // frame, and the lineage is promoted: one handle, updated in place through
+  // UpdateMeshBatched, instead of a fresh handle per pose.
+  struct TopoEntry
+  {
+    // Full mesh hash seen on this topology's most recent submission. A
+    // promoted entry whose incoming hash EQUALS this one is a paused
+    // animation: the handle is reused as-is and no update call is made.
+    u64 last_full_hash = 0;
+    u64 last_seen_frame = 0;
+    // Distinct frames on which the full hash changed under this key. Two are
+    // required before promotion so a one-off spawn/despawn collision between
+    // different objects sharing a topology cannot promote; any full-hash HIT
+    // resets it, because a hash that repeats is cached geometry working.
+    u32 change_streak = 0;
+    // Non-zero once promoted: the synthetic m_meshes key the lineage's single
+    // MeshEntry lives under (the full hash churns per frame, so it cannot
+    // serve as the key anymore).
+    u64 dynamic_mesh_key = 0;
+    // Recorded so a count change under a stable key (an LOD switch is the
+    // realistic case) demotes instead of feeding UpdateMeshBatched an update
+    // the runtime would reject.
+    u32 vertex_count = 0;
+    u32 index_count = 0;
   };
 
   // A mesh that has been matching the sky transform signature. Only frames on
@@ -1077,6 +1198,11 @@ private:
     // are arriving, and is composed onto it in FlushPendingInstances.
     bool world_ui = false;
     std::array<float, 6> ortho_projection = {};
+    // This draw's bone palette, in the compact order its mesh's blend indices
+    // name, or empty for an unskinned draw. OWNED rather than borrowed: the
+    // vertex manager's scratch is reused by the very next draw, and this
+    // instance is not emitted until the whole frame has been seen.
+    std::vector<remixapi_Transform> bones;
   };
   // How many draws may vote on the camera delta, and how many of those the
   // O(n^2) consensus pass will consider as candidates.
@@ -1138,6 +1264,15 @@ private:
   bool UploadTexture(const RemixTexture& texture);
   bool EnsureFallbackMesh();
   void DestroyAllHandles();
+  // Pose-invariant identity for the dynamic-mesh-identity feature: folds the
+  // index bytes, the per-vertex texcoords and colours, the vertex count and
+  // the material hash - and deliberately NOT positions or normals, which are
+  // exactly what a re-pose changes. Lives next to the other identity helpers
+  // so every rule about how identity is computed stays in one file. A member
+  // rather than static because the texcoord+colour gather reuses
+  // m_topology_scratch to keep heap allocation off the per-draw path.
+  u64 TopologyHash(const std::vector<remixapi_HardcodedVertex>& vertices,
+                   const std::vector<u32>& indices, u64 material_hash);
 
   remixapi_Interface m_interface = {};
   remixapi_HMODULE m_dll = nullptr;
@@ -1152,6 +1287,14 @@ private:
   std::unordered_map<u64, remixapi_TextureHandle> m_textures;
   std::unordered_map<u64, remixapi_MaterialHandle> m_materials;
   std::unordered_map<u64, MeshEntry> m_meshes;
+  // Topology-keyed lineages for the dynamic-mesh-identity feature. Only draws
+  // eligible for it enter (feature on, unskinned, not world-UI); swept
+  // alongside m_meshes in ReapIdleMeshes so one-off meshes cannot grow it.
+  std::unordered_map<u64, TopoEntry> m_topology;
+  // Scratch for TopologyHash's per-vertex texcoord+colour gather. A member so
+  // the 60 Hz submit path does not heap-allocate per draw - the same idiom as
+  // the vertex manager's reused vectors.
+  std::vector<u8> m_topology_scratch;
   // Mesh hashes whose create or draw faulted inside the runtime. Never retried:
   // a handle that made the runtime throw once will do it every frame.
   std::unordered_set<u64> m_poisoned_meshes;
@@ -1180,6 +1323,12 @@ private:
   bool m_gx_tev_color = true;
   bool m_gx_texture_stage = true;
   bool m_debug_color_routes = false;
+  bool m_gpu_skinning = true;
+  // RemixDynamicMeshIdentity AND-ed with "the loaded runtime actually has the
+  // UpdateMeshBatched slot". Read once at init and never refreshed: promoted
+  // meshes live in m_meshes under synthetic keys, so flipping it mid-game
+  // would strand cache entries under keys the other mode never looks up.
+  bool m_dynamic_mesh_identity = true;
 
   // Camera recovery state. m_view maps world -> view and is built by
   // integrating per-frame deltas from an arbitrary origin; m_view_inverse is
