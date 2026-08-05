@@ -3066,25 +3066,37 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // here, the panel "overtakes" the text with every counter reading clean.
   // The ortho path has an equivalent dump; the divert path skipped it, and the
   // first RE4 report cost a build to even name the mechanism.
-  if (perspective && ShouldTraceDraws())
+  if (ShouldTraceDraws())
   {
     u32 vtx_alpha_min = 256;
     u32 vtx_alpha_max = 0;
+    float z_min = std::numeric_limits<float>::max();
+    float z_max = std::numeric_limits<float>::lowest();
     for (const UiRasterizer::Vertex& v : m_ui_vertices)
     {
       const u32 alpha = static_cast<u32>(std::clamp(v.color[3], 0.0f, 1.0f) * 255.0f + 0.5f);
       vtx_alpha_min = std::min(vtx_alpha_min, alpha);
       vtx_alpha_max = std::max(vtx_alpha_max, alpha);
+      z_min = std::min(z_min, v.z);
+      z_max = std::max(z_max, v.z);
     }
+    // Both projection kinds, not just perspective: the depth plane serves ortho
+    // draws too, and Super Monkey Ball's title UI - the plane's first live
+    // customer - z-tests all 155 of its overlay draws, most of them ortho. The
+    // z range is printed at full precision because the suspected failure mode
+    // is draws ONE integer apart after float truncation, which a rounded
+    // display would hide.
     INFO_LOG_FMT(VIDEO,
-                 "Remix persp UI {}: tex {:#018x} | blend en {} src {} dst {} -> mode {} | "
-                 "corners {} [{:.2f} {:.2f} {:.2f} {:.2f}] | vtxA [{} {}] | atest c{}/{} "
-                 "r{}/{} logic {} | painted [{} {} {} {}]",
-                 m_stats.ui_placed, texture != nullptr ? texture->GetContentHash() : 0,
-                 blend.blend_enabled ? 1 : 0, blend.src_color_factor, blend.dst_color_factor,
-                 static_cast<int>(call.blend), call.tev_alpha_known ? 1 : 0,
-                 call.tev_alpha_corners[0], call.tev_alpha_corners[1], call.tev_alpha_corners[2],
-                 call.tev_alpha_corners[3], vtx_alpha_min > 255 ? 0 : vtx_alpha_min, vtx_alpha_max,
+                 "Remix {} UI {}: tex {:#018x} | blend en {} src {} dst {} -> mode {} | "
+                 "corners {} [{:.2f} {:.2f} {:.2f} {:.2f}] | vtxA [{} {}] | z [{:.3f} {:.3f}] "
+                 "ztest {} func {} zwrite {} | atest c{}/{} r{}/{} logic {} | painted [{} {} {} {}]",
+                 perspective ? "persp" : "ortho", m_stats.ui_placed,
+                 texture != nullptr ? texture->GetContentHash() : 0, blend.blend_enabled ? 1 : 0,
+                 blend.src_color_factor, blend.dst_color_factor, static_cast<int>(call.blend),
+                 call.tev_alpha_known ? 1 : 0, call.tev_alpha_corners[0],
+                 call.tev_alpha_corners[1], call.tev_alpha_corners[2], call.tev_alpha_corners[3],
+                 vtx_alpha_min > 255 ? 0 : vtx_alpha_min, vtx_alpha_max, z_min, z_max,
+                 blend.depth_test ? 1 : 0, blend.depth_func, blend.depth_write ? 1 : 0,
                  blend.raw_alpha_compare0, blend.raw_alpha_compare1, blend.raw_alpha_reference0,
                  blend.raw_alpha_reference1, blend.raw_alpha_logic, painted.left, painted.top,
                  painted.right, painted.bottom);
@@ -5510,6 +5522,8 @@ void RemixApi::RefreshLiveConfig()
   // DrawCall), so live for the same A/B reason: on-vs-off is how a wrong-order
   // HUD is diagnosed without a restart.
   m_ui_depth = Config::Get(Config::GFX_REMIX_UI_DEPTH);
+  // The tagging view has to be live or it is useless: flip on, click, flip off.
+  m_ui_world_view = Config::Get(Config::GFX_REMIX_UI_WORLD_VIEW);
   // Same coupling as Initialize: the histogram is what the camera is read out
   // of, so turning the trace off must not be able to take the camera down with
   // it.

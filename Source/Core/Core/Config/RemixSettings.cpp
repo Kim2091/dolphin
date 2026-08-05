@@ -1002,6 +1002,19 @@ const Info<bool> GFX_REMIX_UI_STRICT{{System::GFX, "Settings", "RemixUiStrict"},
 // as before, so False here is the pre-fix painter's algorithm, byte for byte.
 const Info<bool> GFX_REMIX_UI_DEPTH{{System::GFX, "Settings", "RemixUiDepth"}, true};
 
+// Show the game's whole 2D layer as world geometry instead of compositing it.
+//
+// This is the click-to-tag view, and it used to be automatic: opening the
+// runtime's dev menu routed every 2D draw world-side so the picker could reach
+// it, and closing the menu put everything back. In practice that coupling was
+// wrong - the menu is opened for plenty of reasons that are not tagging
+// (flipping options, reading light statistics), and every one of them yanked
+// the HUD into the world and back. Now it is this toggle, flipped by hand:
+// on = every 2D draw is a real, clickable world object (including untextured
+// white boxes, which have no grid thumbnail and can be reached no other way);
+// off = normal compositing. Live, so it can be flipped without a restart.
+const Info<bool> GFX_REMIX_UI_WORLD_VIEW{{System::GFX, "Settings", "RemixUiWorldView"}, false};
+
 // The GUI's view of everything above. Rows are in README section order; the
 // tooltips are the comments above rewritten for someone who has never read this
 // file. See RemixSettingMeta in the header for what each column means.
@@ -1418,6 +1431,14 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "submits its HUD background after its text and lets the z test sort them, so without "
            "this the background paints over the text. Ordinary 2D draws have the test off and are "
            "untouched. Off restores the pure painter's algorithm.",
+           Group::UiOverlay, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_WORLD_VIEW, "Show the 2D layer in the world (tagging view)",
+           "Turn the game's whole 2D layer into clickable world geometry so elements can be "
+           "click-tagged in the Remix dev menu - the only way to reach an untextured white box, "
+           "which has no thumbnail in the texture grid. Flip it on to tag, off to play; it can be "
+           "changed while the game runs. This used to happen automatically whenever the dev menu "
+           "was open, which moved the HUD around every time the menu was opened for any other "
+           "reason.",
            Group::UiOverlay, Liveness::Live),
     Real(&GFX_REMIX_WORLD_UI_DISTANCE, "World-space HUD distance",
          "World-space UI mode only. How far in front of the camera the UI plane sits, in game "

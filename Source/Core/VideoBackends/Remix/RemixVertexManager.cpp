@@ -2808,8 +2808,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
     if (g_remix_api->UiTaggingModeActive())
     {
-      // The dev menu is open. Send EVERY 2D draw through the world path for the
-      // duration: an overlay draw is finished pixels by the time the runtime
+      // The tagging view is on (RemixUiWorldView - a user toggle, no longer
+      // coupled to the dev menu being open). Send EVERY 2D draw through the
+      // world path: an overlay draw is finished pixels by the time the runtime
       // sees it, so it has no object for the click-to-tag picker to hit. World
       // draws do, including untextured white boxes - which are precisely the
       // ones with no grid thumbnail to reach them by.
@@ -3121,11 +3122,11 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       g_remix_api->UiTagPerspectiveEnabled() && !g_remix_api->UiTaggingModeActive())
   {
     // Mode 1 is required because the overlay only exists in mode 1; diverting in
-    // mode 0 or 2 would vanish the draw rather than move it. The tagging-mode
-    // check is the mirror of the ortho block's: while the dev menu is open the
-    // element stays a world draw, because overlay pixels have no object for the
-    // click-to-tag picker to hit and a tag that cannot be removed is a trap.
-    // Neither needs a counter - nothing about the draw changed.
+    // mode 0 or 2 would vanish the draw rather than move it. The tagging-view
+    // check is the mirror of the ortho block's: while RemixUiWorldView is on
+    // the element stays a world draw, because overlay pixels have no object for
+    // the click-to-tag picker to hit and a tag that cannot be removed is a
+    // trap. Neither needs a counter - nothing about the draw changed.
     const bool textured = albedo != nullptr && albedo->HasData();
     const u64 tag_key = textured ? albedo->GetContentHash() :
                                    RemixApi::ComputeMeshHash(geometry_hash, material.hash);

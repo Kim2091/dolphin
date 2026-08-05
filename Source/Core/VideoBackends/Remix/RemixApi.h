@@ -1053,11 +1053,14 @@ public:
   // draw for those), and duplicating that here would double-apply.
   bool UiTagPerspectiveEnabled() const { return m_ui_tag_perspective; }
 
-  // True while the runtime's dev menu is open. Every 2D draw is routed
-  // world-side for the duration, because that is the only way the runtime's
-  // click-to-tag picker can reach one - an overlay draw is finished pixels by
-  // the time the runtime sees it and has no object to pick.
-  bool UiTaggingModeActive() const { return m_runtime_ui_state != 0; }
+  // The click-to-tag view: every 2D draw is routed world-side so the runtime's
+  // picker can reach it - an overlay draw is finished pixels by the time the
+  // runtime sees it and has no object to pick. A user toggle
+  // (RemixUiWorldView), NOT derived from the dev menu being open: the menu is
+  // opened for plenty of non-tagging reasons and every one of them used to
+  // yank the HUD into the world and back. m_runtime_ui_state is still polled,
+  // but only as the `uistate` diagnostic on the frame line.
+  bool UiTaggingModeActive() const { return m_ui_world_view; }
 
   // "Keep only what was tagged UI." Consulted for untagged draws only; an
   // explicit tag of any kind outranks it.
@@ -1715,6 +1718,9 @@ private:
   // same argument). Off zeroes the depth fields in every recorded DrawCall, so
   // the rasterizer runs the pure painter's algorithm it always ran.
   bool m_ui_depth = true;
+  // The click-to-tag world view (RemixUiWorldView), Live for the same reason:
+  // flip on to tag, off to play, no restart.
+  bool m_ui_world_view = false;
   // The runtime's three texture-category sets, re-read once a frame. Hashes are
   // either a texture's content hash (textured draws) or a mesh hash (untextured
   // ones) - the runtime's own two identities for an API draw, which is what
