@@ -3100,6 +3100,45 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
                  blend.raw_alpha_compare0, blend.raw_alpha_compare1, blend.raw_alpha_reference0,
                  blend.raw_alpha_reference1, blend.raw_alpha_logic, painted.left, painted.top,
                  painted.right, painted.bottom);
+
+    // The INPUTS behind a diverted perspective draw, because Super Monkey Ball
+    // proved the outputs alone cannot name a placement failure: its title
+    // banner diverts to ndc in the thousands and z = -11 million while the
+    // very same texture composites fine through the ortho path in the same
+    // frame. Whether that is a wrong modelview, a stale projection, or
+    // vertices arriving in a space the null-modelview contract does not
+    // cover is only readable from the raw matrix, the raw projection, the
+    // viewport, and one vertex followed through the chain.
+    if (perspective && !vertices.empty())
+    {
+      const remixapi_HardcodedVertex& v0 = vertices[0];
+      float view0[3] = {v0.position[0], v0.position[1], v0.position[2]};
+      if (modelview != nullptr)
+      {
+        for (int i = 0; i < 3; ++i)
+        {
+          view0[i] = modelview[i * 4 + 0] * v0.position[0] +
+                     modelview[i * 4 + 1] * v0.position[1] +
+                     modelview[i * 4 + 2] * v0.position[2] + modelview[i * 4 + 3];
+        }
+      }
+      const std::string mv =
+          modelview == nullptr ?
+              std::string("null") :
+              fmt::format("[{:.6g} {:.6g} {:.6g} {:.6g} | {:.6g} {:.6g} {:.6g} {:.6g} | "
+                          "{:.6g} {:.6g} {:.6g} {:.6g}]",
+                          modelview[0], modelview[1], modelview[2], modelview[3], modelview[4],
+                          modelview[5], modelview[6], modelview[7], modelview[8], modelview[9],
+                          modelview[10], modelview[11]);
+      INFO_LOG_FMT(VIDEO,
+                   "Remix persp UI inputs: mv {} | proj [{:.6g} {:.6g} {:.6g} {:.6g} {:.6g} "
+                   "{:.6g}] | vp [{:.6g} {:.6g} {:.6g} {:.6g} {:.6g} {:.6g}] | v0 obj "
+                   "({:.6g} {:.6g} {:.6g}) view ({:.6g} {:.6g} {:.6g})",
+                   mv, raw_projection[0], raw_projection[1], raw_projection[2], raw_projection[3],
+                   raw_projection[4], raw_projection[5], viewport[0], viewport[1], viewport[2],
+                   viewport[3], viewport[4], viewport[5], v0.position[0], v0.position[1],
+                   v0.position[2], view0[0], view0[1], view0[2]);
+    }
   }
 
   // A full-screen opaque 2D draw arriving AFTER world geometry.
@@ -3154,7 +3193,22 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // leaves the fields at their zero defaults, which IS the painter's algorithm:
   // the rasterizer never learns depth existed. GX only updates z while the
   // test is enabled, so there is no test-off-write-on case to carry.
-  if (m_ui_depth && blend.depth_test)
+  //
+  // ORTHO DRAWS ONLY, and that is a measurement, not a simplification. The 2D
+  // layer's own layering is what the plane exists for, and it reproduces it
+  // faithfully - Super Monkey Ball graduates its title UI across distinct
+  // integer depths (21..336, func Less) and the values come out exact. A
+  // DIVERTED perspective draw's z lives in a different regime entirely: its
+  // geometry sits nearer than the near plane (fine for x and y, meaningless
+  // through the 2D depth mapping - SMB's banners read z = -11,184,865 against
+  // a legal range of 0..16,777,215), the per-pixel clamp pins that to 0 = the
+  // nearest possible value, and with zwrite on it POISONS the plane: every 2D
+  // draw at depth 21+ fails `Less` against 0 for the rest of the frame. That
+  // was the white-boxes-eating-their-text screenshot. Diverted draws therefore
+  // composite in submission order, exactly as they did before the plane
+  // existed - no tagged HUD measured so far z-tests meaningfully (RE4: ztest 0
+  // on all nine).
+  if (m_ui_depth && blend.depth_test && !perspective)
   {
     call.depth_test = true;
     call.depth_func = blend.depth_func;
