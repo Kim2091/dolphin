@@ -2831,6 +2831,17 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     call.blend = UiRasterizer::BlendMode::Opaque;
   else if (blend.src_color_factor == 1 && blend.dst_color_factor == 1)
     call.blend = UiRasterizer::BlendMode::Additive;
+  else if (blend.src_color_factor == 6 && blend.dst_color_factor == 1)
+  {
+    // SrcAlpha / One: additive with the source scaled by its own alpha, which
+    // is EXACTLY what the rasterizer's Additive mode computes - so this is the
+    // one blend the fallthrough got actively wrong rather than approximately
+    // right. Falling to Over multiplies the destination by (1 - alpha): a glow
+    // layer that on console merely brightens what is under it instead ERASES
+    // it. Measured on RE4's HUD - the ammo glow (src 6 dst 1), drawn after the
+    // digits, blanked them out; every other element is ordinary src 6 dst 7.
+    call.blend = UiRasterizer::BlendMode::Additive;
+  }
   else if (blend.src_color_factor == 1 && blend.dst_color_factor == 0)
     call.blend = UiRasterizer::BlendMode::Opaque;
   else
@@ -3046,6 +3057,37 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   {
     ++m_stats.ui_dropped_pre_world;
     return true;
+  }
+
+  // Everything that decides a DIVERTED perspective draw's compositing, one line
+  // per draw, in submission order. This exists because RE4's HUD panels draw
+  // AFTER its text with the z test off, so on console the text survives purely
+  // through the panels' per-pixel ALPHA - and if that alpha resolves too opaque
+  // here, the panel "overtakes" the text with every counter reading clean.
+  // The ortho path has an equivalent dump; the divert path skipped it, and the
+  // first RE4 report cost a build to even name the mechanism.
+  if (perspective && ShouldTraceDraws())
+  {
+    u32 vtx_alpha_min = 256;
+    u32 vtx_alpha_max = 0;
+    for (const UiRasterizer::Vertex& v : m_ui_vertices)
+    {
+      const u32 alpha = static_cast<u32>(std::clamp(v.color[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+      vtx_alpha_min = std::min(vtx_alpha_min, alpha);
+      vtx_alpha_max = std::max(vtx_alpha_max, alpha);
+    }
+    INFO_LOG_FMT(VIDEO,
+                 "Remix persp UI {}: tex {:#018x} | blend en {} src {} dst {} -> mode {} | "
+                 "corners {} [{:.2f} {:.2f} {:.2f} {:.2f}] | vtxA [{} {}] | atest c{}/{} "
+                 "r{}/{} logic {} | painted [{} {} {} {}]",
+                 m_stats.ui_placed, texture != nullptr ? texture->GetContentHash() : 0,
+                 blend.blend_enabled ? 1 : 0, blend.src_color_factor, blend.dst_color_factor,
+                 static_cast<int>(call.blend), call.tev_alpha_known ? 1 : 0,
+                 call.tev_alpha_corners[0], call.tev_alpha_corners[1], call.tev_alpha_corners[2],
+                 call.tev_alpha_corners[3], vtx_alpha_min > 255 ? 0 : vtx_alpha_min, vtx_alpha_max,
+                 blend.raw_alpha_compare0, blend.raw_alpha_compare1, blend.raw_alpha_reference0,
+                 blend.raw_alpha_reference1, blend.raw_alpha_logic, painted.left, painted.top,
+                 painted.right, painted.bottom);
   }
 
   // A full-screen opaque 2D draw arriving AFTER world geometry.
