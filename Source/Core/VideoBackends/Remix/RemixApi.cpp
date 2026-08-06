@@ -1760,64 +1760,98 @@ bool RemixApi::PollTagSet(const char* option_name, std::unordered_set<u64>& out)
 // string contract rather than part of the ABI, so there is nothing to include
 // here - this is a deliberate duplicate and the two spellings must stay equal.
 static constexpr const char* kTaggingWorldViewKey = "__remix.tagging.worldView";
+static constexpr const char* kTaggingWorldViewFollowsMenuKey =
+    "__remix.tagging.worldViewFollowsMenu";
+
+bool RemixApi::ReadGameFlag(const char* key, bool& out)
+{
+  char buffer[8] = {};
+  u32 actual = 0;
+  remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  const int guard = CallGuarded("GetGameValue", [&] {
+    status = m_interface.GetGameValue(key, buffer, static_cast<u32>(sizeof(buffer)), &actual);
+  });
+  // A missing key is SUCCESS with a zero size, so "no answer" and "answered
+  // false" have to stay distinguishable - the caller keeps its own value when
+  // this returns false rather than reading the absence as an off.
+  if (guard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS || actual == 0 ||
+      actual > sizeof(buffer))
+  {
+    return false;
+  }
+  out = (buffer[0] == '1');
+  return true;
+}
 
 void RemixApi::SyncTaggingWorldView()
 {
+  // Polled before the bridge check below, and ungated, because it is also the
+  // frame line's `uistate` diagnostic - an older runtime without the game-value
+  // slots should still report it. Non-zero = the dev menu is open.
+  int ui_state = 0;
+  if (m_valid && m_interface.GetUIState != nullptr)
+    CallGuarded("GetUIState", [&] { ui_state = static_cast<int>(m_interface.GetUIState()); });
+  m_runtime_ui_state = ui_state;
+
   // Both halves are needed: we publish so the dev menu knows the mode exists,
-  // and read so its checkbox can drive us. An older runtime with neither just
+  // and read so its checkboxes can drive us. An older runtime with neither just
   // leaves the Dolphin-side setting as the only control, which is the previous
   // behaviour exactly.
   if (!m_valid || m_interface.SetGameValue == nullptr || m_interface.GetGameValue == nullptr)
     return;
 
-  const auto publish = [this](bool value) {
-    CallGuarded("SetGameValue(taggingWorldView)",
-                [&] { m_interface.SetGameValue(kTaggingWorldViewKey, value ? "1" : "0"); });
+  const auto publish = [this](const char* key, bool value) {
+    CallGuarded("SetGameValue(tagging)",
+                [&] { m_interface.SetGameValue(key, value ? "1" : "0"); });
   };
 
   const bool config_now = Config::Get(Config::GFX_REMIX_UI_WORLD_VIEW);
 
-  // Seed once. The key's PRESENCE is what makes the dev-menu checkbox appear at
-  // all - the runtime cannot know whether a given host is able to route its 2D
-  // layer into the world, so publishing is how we say we can.
+  // Seed once. The key's PRESENCE is what makes the dev-menu checkboxes appear
+  // at all - the runtime cannot know whether a given host is able to route its
+  // 2D layer into the world, so publishing is how we say we can. The auto-switch
+  // preference is seeded off: it moves the HUD on every menu open, which has to
+  // be asked for rather than inherited.
   if (!m_tagging_view_seeded)
   {
-    publish(config_now);
+    publish(kTaggingWorldViewKey, config_now);
+    publish(kTaggingWorldViewFollowsMenuKey, false);
     m_tagging_view_config = config_now;
+    m_tagging_view_manual = config_now;
     m_ui_world_view = config_now;
     m_tagging_view_seeded = true;
     return;
   }
 
-  // Dolphin's own setting moved, so it wins and gets pushed out. Checking the
-  // config against its previous value rather than against m_ui_world_view is
-  // what keeps the two controls from fighting: without it, a dev-menu toggle
-  // would look like a config change on the very next frame and get stomped.
+  // Track the MANUAL position separately from what is in effect, so that the
+  // auto-switch below can override it without destroying it: turning the
+  // preference back off has to return to whatever was last chosen by hand, not
+  // to wherever the menu happened to leave things.
   if (config_now != m_tagging_view_config)
   {
+    // Dolphin's own setting moved, so it wins and gets pushed out. Comparing
+    // the config against its previous value rather than against the live flag
+    // is what keeps the two controls from fighting: without it, a dev-menu
+    // toggle would look like a config edit on the very next frame and get
+    // stomped.
     m_tagging_view_config = config_now;
-    m_ui_world_view = config_now;
-    publish(config_now);
-    return;
+    m_tagging_view_manual = config_now;
+    publish(kTaggingWorldViewKey, config_now);
   }
-
-  // Otherwise follow the dev menu. Runs after RefreshLiveConfig, which has just
-  // reset m_ui_world_view to the configured value, so this is the override that
-  // makes the checkbox stick.
-  char buffer[8] = {};
-  u32 actual = 0;
-  remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-  const int guard = CallGuarded("GetGameValue(taggingWorldView)", [&] {
-    status = m_interface.GetGameValue(kTaggingWorldViewKey, buffer,
-                                      static_cast<u32>(sizeof(buffer)), &actual);
-  });
-  if (guard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS || actual == 0 ||
-      actual > sizeof(buffer))
+  else
   {
-    return;
+    bool manual = m_tagging_view_manual;
+    if (ReadGameFlag(kTaggingWorldViewKey, manual))
+      m_tagging_view_manual = manual;
   }
 
-  m_ui_world_view = (buffer[0] == '1');
+  bool follows_menu = false;
+  ReadGameFlag(kTaggingWorldViewFollowsMenuKey, follows_menu);
+
+  // Runs after RefreshLiveConfig, which has just reset m_ui_world_view from the
+  // Dolphin setting, so this is the override that makes either dev-menu control
+  // stick.
+  m_ui_world_view = follows_menu ? (m_runtime_ui_state != 0) : m_tagging_view_manual;
 }
 
 void RemixApi::PollRuntimeTagState()
@@ -1846,13 +1880,11 @@ void RemixApi::PollRuntimeTagState()
   PollTagSet("rtx.ignoreTextures", m_tag_ignore);
   PollTagSet("rtx.worldSpaceUiTextures", m_tag_world_ui);
 
-  // Non-zero = the dev menu is open, which is what switches 2D draws to the
-  // world path so they can be picked and tagged. Optional slot: an older
-  // runtime just never enters tagging mode, which is harmless.
-  int ui_state = 0;
-  if (m_interface.GetUIState != nullptr)
-    CallGuarded("GetUIState", [&] { ui_state = static_cast<int>(m_interface.GetUIState()); });
-  m_runtime_ui_state = ui_state;
+  // The dev-menu open state used to be read here. It moved to
+  // SyncTaggingWorldView, which is not gated on RemixUiTagRouting: the
+  // auto-switch preference drives the tagging view from it, and that has to
+  // keep working with routing off so a tag can be placed before the routing
+  // that consumes it is switched on.
 }
 
 u64 RemixApi::GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,

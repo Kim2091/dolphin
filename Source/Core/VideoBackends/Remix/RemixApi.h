@@ -1440,6 +1440,9 @@ private:
   // game-state store. See the definition for why the Dolphin setting is
   // compared against its own previous value rather than against the live flag.
   void SyncTaggingWorldView();
+  // Reads a "1"/"0" game value. False means "no usable answer" - a missing key
+  // reads as SUCCESS with size 0, so absence must not be mistaken for an off.
+  bool ReadGameFlag(const char* key, bool& out);
   // One set's worth of that. Returns false and leaves `out` untouched when the
   // runtime refuses the read, so a transient failure cannot silently un-tag
   // everything for a frame. Grows and retries once on truncation.
@@ -1733,6 +1736,11 @@ private:
   // dev-menu toggle is not mistaken for a config edit on the following frame.
   bool m_tagging_view_seeded = false;
   bool m_tagging_view_config = false;
+  // The manual position, kept apart from m_ui_world_view so the auto-switch
+  // preference can override what is in effect without destroying what the user
+  // last chose by hand - turning auto back off returns to that, not to wherever
+  // the menu left things.
+  bool m_tagging_view_manual = false;
   // The runtime's three texture-category sets, re-read once a frame. Hashes are
   // either a texture's content hash (textured draws) or a mesh hash (untextured
   // ones) - the runtime's own two identities for an API draw, which is what
