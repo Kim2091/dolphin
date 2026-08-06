@@ -116,8 +116,31 @@ bool VideoBackend::Initialize(const WindowSystemInfo& wsi)
 
 void VideoBackend::Shutdown()
 {
-  g_remix_api.reset();
+  // ShutdownShared() FIRST, then the runtime - the order every other backend
+  // uses (D3D11 D3DMain.cpp:168, D3D12 VideoBackend.cpp:145, Vulkan
+  // VKMain.cpp:239, OGL OGLMain.cpp:218, Null NullBackend.cpp:75 all tear the
+  // shared state down before their device, and Vulkan waits for device idle on
+  // top of that). It is not a style preference: ShutdownShared stops the GPU
+  // thread (its last act is Fifo::Shutdown) and destroys g_gfx,
+  // g_vertex_manager and g_texture_cache, every one of which reaches into
+  // g_remix_api and therefore into the runtime DLL.
+  //
+  // The reverse order destroyed the runtime and FreeLibrary'd d3d9-remix.dll
+  // while the GPU thread was still draining the FIFO. Both consumers null-check
+  // g_remix_api exactly once and then dereference it freely for the rest of the
+  // call - RemixVertexManager::DrawCurrentBatch checks at :1580 and derefs ~40
+  // times after, TextureCache::CopyEFB checks at :72 and derefs through :181 -
+  // so a stop landing mid-draw sails past the check and every deref after it
+  // lands on a destroyed object, in code that has just been unmapped. That is a
+  // crash on stop that no amount of null-guarding at the call sites can fix,
+  // because the guard and the use cannot be made atomic against a teardown on
+  // another thread. Stopping the thread first removes the race outright.
+  //
+  // Destroying the dependents before the thing they depend on is also just the
+  // right direction: nothing in this backend's teardown needs the runtime to be
+  // gone already (no destructor here touches g_remix_api at all).
   ShutdownShared();
+  g_remix_api.reset();
 }
 
 std::string VideoBackend::GetDisplayName() const

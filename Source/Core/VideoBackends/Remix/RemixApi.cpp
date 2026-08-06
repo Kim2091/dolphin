@@ -1097,7 +1097,11 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
 
   // Everything on the per-frame path must exist; a runtime missing any of these
   // is not one we can drive, and finding out mid-frame means a null call.
-  if (m_interface.CreateMaterial == nullptr || m_interface.DestroyMaterial == nullptr ||
+  // Shutdown is in this list because it is not just a teardown nicety: it is the
+  // only thing that destroys a device handed over by dxvk_RegisterD3D9Device,
+  // which by then is no longer ours to release (see Shutdown).
+  if (m_interface.Shutdown == nullptr || m_interface.CreateMaterial == nullptr ||
+      m_interface.DestroyMaterial == nullptr ||
       (m_interface.CreateMesh == nullptr && m_interface.CreateMeshBatched == nullptr) ||
       m_interface.DestroyMesh == nullptr || m_interface.SetupCamera == nullptr ||
       m_interface.DrawInstance == nullptr || m_interface.CreateLight == nullptr ||
@@ -1188,6 +1192,8 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
         if (status == REMIXAPI_ERROR_CODE_SUCCESS)
         {
           device_registered = true;
+          // The runtime now owns both objects; Shutdown must not release them.
+          m_device_registered = true;
           INFO_LOG_FMT(VIDEO, "Remix: D3D9 device created and registered ({}x{}, hwnd {})", width,
                        height, fmt::ptr(hwnd));
         }
@@ -1273,20 +1279,79 @@ void RemixApi::Shutdown()
   m_after_frame_event.reset();
   DestroyAllHandles();
 
-  if (m_d3d9_device != nullptr)
+  // dxvk_RegisterD3D9Device TRANSFERS OWNERSHIP of the device and its
+  // IDirect3D9Ex to the runtime. It stores the raw pointers without taking a
+  // reference of its own, and remixapi_Shutdown then releases each one in a
+  // loop until its refcount reaches zero. Releasing our reference here first
+  // would take that count to zero and destroy both objects, so the loop inside
+  // Shutdown would then run on freed memory - a use-after-free that killed the
+  // process every single time emulation stopped.
+  //
+  // So once registration succeeded, drop the pointers without releasing and let
+  // Shutdown destroy them; our reference is exactly the one its loop consumes.
+  // The unregistered paths are the opposite and must still release: the
+  // IDirect3D9Ex handed back by dxvk_CreateD3D9 is not stored by the runtime,
+  // and dxvk_RegisterD3D9Device stores nothing on any of its failure paths, so
+  // whatever we hold there is ours alone. Those failure paths already release
+  // and null both pointers before m_device_registered is ever set, which is why
+  // this branch only has to cover a shutdown that never got that far.
+  if (m_device_registered)
   {
-    m_d3d9_device->Release();
     m_d3d9_device = nullptr;
-  }
-  if (m_d3d9 != nullptr)
-  {
-    m_d3d9->Release();
     m_d3d9 = nullptr;
+    m_device_registered = false;
+  }
+  else
+  {
+    if (m_d3d9_device != nullptr)
+    {
+      m_d3d9_device->Release();
+      m_d3d9_device = nullptr;
+    }
+    if (m_d3d9 != nullptr)
+    {
+      m_d3d9->Release();
+      m_d3d9 = nullptr;
+    }
   }
 
-  // Shutdown() + FreeLibrary in one call, so switching backends does not leak
-  // the device or leave the runtime resident.
-  remixapi_lib_shutdownAndUnloadRemixDll(&m_interface, m_dll);
+  // Shut the runtime down, but DELIBERATELY DO NOT FreeLibrary it. This is the
+  // fix for the crash-on-stop-emulation, and it is proven by a crash dump
+  // (Dolphin.exe.33288.dmp), whose faulting stack is this, repeated until the
+  // stack overflows:
+  //
+  //     <Unloaded_d3d9-remix.dll>+0x680bd0
+  //     ntdll!RtlpCallVectoredHandlers+0xd6
+  //     ntdll!RtlDispatchException+0x206
+  //     ntdll!KiUserExceptionDispatch+0x2e
+  //
+  // The runtime registers a VECTORED EXCEPTION HANDLER and never unregisters
+  // it - remixapi_Shutdown does not, and the API exposes nothing that would.
+  // The registration is process-wide and outlives the module, so once the code
+  // it points at is unmapped the next exception of ANY kind calls into dead
+  // memory; that access violation dispatches exceptions again, hits the same
+  // dead handler, and recurses until the stack is gone. Exceptions here are
+  // routine, not exotic - an ordinary C++ throw during teardown is enough - so
+  // this fired essentially every time.
+  //
+  // Note this is also why the crash could never be guarded against locally:
+  // vectored handlers run BEFORE any SEH frame handler, so CallGuarded's
+  // __except below could not have caught it.
+  //
+  // Keeping the module mapped costs nothing real, because the runtime is
+  // already a once-per-process thing by construction: it resolves its config
+  // layers and file paths under a ONCE() inside Direct3DCreate9 and refuses to
+  // redo them. Initialize already knows this and warns about an
+  // already-resident runtime (see the s_env_applied block) - unloading was
+  // never buying a clean second init, it was only making every pointer left
+  // behind (this handler, the swapchain's window-proc subclass, thread
+  // trampolines) point at unmapped memory instead of valid code.
+  //
+  // m_dll is cleared rather than kept: a later Initialize calls LoadLibraryW
+  // again, which on an already-mapped module just bumps its refcount and
+  // re-runs remixapi_InitializeLibrary, which is exactly what we want.
+  CallGuarded("Shutdown", [&] { m_interface.Shutdown(); });
+  m_interface = {};
   m_dll = nullptr;
   m_valid = false;
 }

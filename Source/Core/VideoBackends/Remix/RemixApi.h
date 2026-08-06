@@ -1484,6 +1484,9 @@ private:
   remixapi_HMODULE m_dll = nullptr;
   IDirect3D9Ex* m_d3d9 = nullptr;
   IDirect3DDevice9Ex* m_d3d9_device = nullptr;
+  // Whether dxvk_RegisterD3D9Device accepted the pair above. That call transfers
+  // ownership to the runtime, so it decides who releases them - see Shutdown.
+  bool m_device_registered = false;
   bool m_valid = false;
 
   Common::EventHook m_after_frame_event;
