@@ -1436,6 +1436,10 @@ private:
   // the cost is one API call per set and about two frames of latency between
   // tagging something and seeing it take effect.
   void PollRuntimeTagState();
+  // Two-way sync of the tagging view with the Remix dev menu, via the
+  // game-state store. See the definition for why the Dolphin setting is
+  // compared against its own previous value rather than against the live flag.
+  void SyncTaggingWorldView();
   // One set's worth of that. Returns false and leaves `out` untouched when the
   // runtime refuses the read, so a transient failure cannot silently un-tag
   // everything for a frame. Grows and retries once on truncation.
@@ -1724,6 +1728,11 @@ private:
   // The click-to-tag world view (RemixUiWorldView), Live for the same reason:
   // flip on to tag, off to play, no restart.
   bool m_ui_world_view = false;
+  // Tagging-view sync state. m_tagging_view_config is the last value seen from
+  // the Dolphin setting, kept separately from m_ui_world_view so that a
+  // dev-menu toggle is not mistaken for a config edit on the following frame.
+  bool m_tagging_view_seeded = false;
+  bool m_tagging_view_config = false;
   // The runtime's three texture-category sets, re-read once a frame. Hashes are
   // either a texture's content hash (textured draws) or a mesh hash (untextured
   // ones) - the runtime's own two identities for an API draw, which is what
