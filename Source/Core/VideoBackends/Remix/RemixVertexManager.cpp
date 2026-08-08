@@ -1615,6 +1615,20 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       is_ortho ? -1 :
                  g_remix_api->ObserveProjection(xfmem.projection.rawProjection, *draw_viewport);
 
+  // A discarded helper pass: this viewport's rect was EFB-copied to a non-XFB
+  // destination with clear and the copy discarded (learned last frame). On
+  // console the clear erased these pixels and the main pass overdrew the
+  // region; as world geometry nothing would, so they would linger as a ghost
+  // mini-scene in a corner of the view - or, before the reference gate, steal
+  // the reference outright (Sonic Unleashed's quarter-screen). After
+  // ObserveProjection on purpose, so the variant tables still show the pass
+  // that was dropped.
+  if (!is_ortho && g_remix_api->ShouldDropAuxPass(*draw_viewport))
+  {
+    g_remix_api->NoteAuxPassDropped();
+    return;
+  }
+
   // bSupportsPrimitiveRestart is false for this backend, so every quad/strip/fan
   // has already been expanded into a plain triangle list by the index generator
   // and there are no restart tokens to parse. Anything that is still not

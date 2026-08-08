@@ -73,6 +73,27 @@ const Info<bool> GFX_REMIX_PROJECTION_FIX{{System::GFX, "Settings", "RemixProjec
 // carries a second view matrix, which one camera cannot express no matter where
 // the geometry is folded.
 const Info<bool> GFX_REMIX_VIEWPORT_FIX{{System::GFX, "Settings", "RemixViewportFix"}, true};
+// Which draw is allowed to define the frame's reference - the projection and
+// viewport Remix's single camera renders, and the rect every other draw's
+// viewport correction is measured against. Off is first-perspective-draw-wins,
+// which breaks any game that renders an off-screen helper pass before its main
+// scene: Sonic Unleashed draws 27 helper draws into the top-left 320x240
+// quarter of the EFB first, so that quarter latched as "the screen" and the
+// real 640x480 scene was folded out of the frustum - only its top-left quarter
+// stayed visible, magnified 2x.
+//
+// On, a draw may only latch the reference if its viewport covers more than half
+// of the region the previous frame's XFB copy presented. The XFB rect is the
+// ground truth for "the screen" (a game that renders 512x448 in a corner and
+// presents exactly that rect - which exists, and is correct today - keeps its
+// sub-rect reference), and the previous frame's is used because the copy that
+// ends the frame is the only place the rect is knowable. Games whose first
+// perspective draw already covers the presented region latch identically with
+// this on or off, which is the safety argument for the default. When no
+// viewport covered the presented rect at all last frame (split screen, menus),
+// the gate stands down and first-draw-wins returns.
+const Info<bool> GFX_REMIX_VIEWPORT_REF_XFB{{System::GFX, "Settings", "RemixViewportRefXfb"},
+                                            true};
 // Log every distinct projection seen per frame, every frame. The per-frame
 // summary already reports variants whenever there is more than one (or any
 // off-centre term), so this is only needed to watch a projection change live.
@@ -708,6 +729,21 @@ const Info<bool> GFX_REMIX_EFB_UI_COMPOSE{{System::GFX, "Settings", "RemixEfbUiC
 // exactly.
 const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX{
     {System::GFX, "Settings", "RemixEfbSkipDiscardedTex"}, false};
+// Drop perspective draws that render a helper pass this backend then throws
+// away. The signature, learned from the previous frame: a viewport whose rect
+// was EFB-copied to a non-XFB destination WITH the clear flag, and the copy was
+// discarded. On console those pixels exist only to feed the copied texture -
+// the clear erases them and the main pass overdraws the region - but as
+// path-traced world geometry nothing erases them, so after the reference fix
+// they would composite as a ghost mini-scene in that corner of the view. Never
+// fires on a viewport covering most of the presented region (that IS the
+// scene, whatever the copy pattern around it), and stands down entirely on
+// frames with no majority-coverage viewport (split screen), so a false cull
+// requires the game to draw VISIBLE content in a sub-rect it also
+// copies-and-clears to a texture nobody executes - the mirror-composite
+// pattern, whose composite quad is already blank today for the same discard.
+const Info<bool> GFX_REMIX_EFB_DROP_AUX_PASS{{System::GFX, "Settings", "RemixEfbDropAuxPass"},
+                                             true};
 // Drop untextured 2D draws that arrive before any world geometry in the frame.
 //
 // Those are EFB clears and scratch-region fills, not UI. The console draws the
@@ -1332,6 +1368,14 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "RemixProjectionFix is off, and exactly equivalent to it when every draw uses the same "
            "rectangle.",
            Group::ProjectionViewport),
+    Toggle(&GFX_REMIX_VIEWPORT_REF_XFB, "Latch the camera from the presented viewport",
+           "Only let a draw define the frame's camera and screen rectangle if its viewport covers "
+           "most of the region the console actually presents. Some games render a small helper "
+           "pass into a corner of the framebuffer before the real scene - Sonic Unleashed does - "
+           "and without this the helper's quarter-rectangle becomes 'the screen', which shows only "
+           "the top-left quarter of the game magnified 2x. Games whose first draw is the real "
+           "scene behave identically with this on or off.",
+           Group::ProjectionViewport, Liveness::Live),
 
     // UI overlay.
     Choice(&GFX_REMIX_UI_MODE, "2D and HUD handling",
@@ -1500,6 +1544,13 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "scene. Confirmed on SpongeBob: Battle for Bikini Bottom, where it was a white box over "
            "a quarter of the screen.",
            Group::Efb),
+    Toggle(&GFX_REMIX_EFB_DROP_AUX_PASS, "Drop helper passes feeding discarded copies",
+           "Skip 3D draws that only exist to feed a framebuffer copy this backend throws away - a "
+           "sub-rectangle that was copied out and cleared without being executed last frame. On "
+           "console the clear erases those pixels; here nothing would, so they linger as a ghost "
+           "mini-scene in a corner of the view. Never fires on the viewport carrying the real "
+           "scene. Watch the 'aux' counter in the log.",
+           Group::Efb, Liveness::Live),
 
     // Diagnostics.
     Toggle(&GFX_REMIX_LOG_STATS, "Per-frame statistics in the log",

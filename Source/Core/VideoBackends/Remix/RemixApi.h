@@ -449,6 +449,17 @@ struct FrameStats
   // Non-zero means the viewport log is incomplete, not that anything rendered
   // wrong: neither the reference nor the fold reads the table.
   u32 viewport_overflow = 0;
+  // Perspective draws refused the reference latch because their viewport did
+  // not cover the presented region (RemixViewportRefXfb). A steady non-zero
+  // count is the helper-pass-first signature - Sonic Unleashed reads 27 - and
+  // those draws render unfolded unless the aux-pass drop removes them first.
+  u32 viewport_ref_deferred = 0;
+  // Perspective draws dropped as a discarded helper pass (RemixEfbDropAuxPass):
+  // their viewport rect was copied-out-and-cleared to a non-XFB destination
+  // last frame and the copy was discarded. Counted into m_frame_world_draws
+  // anyway, because the console's EFB did hold world pixels there and the
+  // Scene-vs-Composed2D copy classifier must keep seeing them.
+  u32 skipped_aux_pass = 0;
 };
 
 // What an EFB copy is FOR, decided from state already in hand at the copy. The
@@ -796,9 +807,11 @@ public:
 
   // Accounts for one perspective draw's projection and viewport and returns the
   // projection's slot in the frame's variant table, or -1 if the table is full.
-  // The first perspective draw of a frame also latches the reference projection
-  // that SetupCamera turns into the camera; a frame with only orthographic draws
-  // keeps the previous camera.
+  // The first perspective draw of a frame that passes the RemixViewportRefXfb
+  // gate - one whose viewport covers most of the previously presented region,
+  // or simply the first draw while the gate is down - also latches the
+  // reference projection that SetupCamera turns into the camera; a frame with
+  // only orthographic draws keeps the previous camera.
   //
   // The reference VIEWPORT is latched by the same draw, in the same call, on
   // purpose: the correction is defined relative to what SetupCamera shows, and
@@ -808,8 +821,9 @@ public:
   int ObserveProjection(const std::array<float, 6>& raw_projection, const DrawViewport& viewport);
 
   // Records that a draw which actually reached SubmitMesh used variant `slot`.
-  // The reference is "first perspective draw of the frame", and these counts
-  // are how we find out whether that draw is the one carrying the scene.
+  // The reference is the first perspective draw the RemixViewportRefXfb gate
+  // admits (first draw outright when the gate is down), and these counts are
+  // how we find out whether that draw is the one carrying the scene.
   void NoteProjectionUse(int slot, u32 vertex_count);
 
   // The frame's reference projection - the one SetupCamera is built from, and
@@ -847,6 +861,22 @@ public:
   // ProjectionFixEnabled only in name: the viewport terms ride the projection
   // correction, so this knob does nothing while that one is off.
   bool ViewportFixEnabled() const { return m_viewport_fix; }
+
+  // True when this perspective draw is a discarded helper pass: its viewport
+  // rect was EFB-copied to a non-XFB destination WITH clear and the copy was
+  // discarded, all learned from the previous presented frame. Never true for a
+  // viewport covering most of the presented region, and never true on frames
+  // where no viewport covered it (split screen) - the same stand-down rule the
+  // reference gate uses, so a false cull needs visible content in a
+  // copied-and-cleared sub-rect, which is the already-blank mirror-composite
+  // pattern.
+  bool ShouldDropAuxPass(const DrawViewport& viewport) const;
+
+  // The bookkeeping for a draw ShouldDropAuxPass rejected. Counts the skip AND
+  // m_frame_world_draws: the console's EFB held world pixels there, so the EFB
+  // copy classifier's Scene signal must not lose them, or the helper pass's own
+  // copy would reclassify Composed2D and execute.
+  void NoteAuxPassDropped();
 
   // False submits the raw vertex colour and no texture-stage state at all, which
   // is the pre-fix behaviour: the runtime's defaults never read a vertex colour
@@ -1536,6 +1566,26 @@ private:
   u32 m_viewport_variant_count = 0;
   bool m_projection_fix = true;
   bool m_viewport_fix = true;
+  // The reference-latch gate and the aux-pass drop both read the PREVIOUS
+  // presented frame, because the XFB copy that defines "the screen" is the
+  // event that ends a frame - during a frame the only rect knowable is the one
+  // before it, and using it is correct for the same reason the UI overlay's
+  // XFB mapping is: presented size changes at a mode switch, not between two
+  // draws. All three survive FinishFrame; they are refreshed, not reset.
+  MathUtil::Rectangle<int> m_presented_rect = {};
+  bool m_presented_rect_valid = false;
+  // True when some perspective viewport covered >50% of that rect last
+  // presented frame. False - menus, split screen, boot - stands both the
+  // reference gate and the aux-pass drop down to pre-fix behaviour.
+  bool m_ref_gate_valid = false;
+  // Non-XFB EFB-copy source rects that were discarded WITH the clear flag:
+  // regions whose world pixels existed only to feed a texture this backend
+  // refuses to produce. This frame's collection, and the previous presented
+  // frame's - the one ShouldDropAuxPass consults.
+  std::vector<MathUtil::Rectangle<int>> m_scratch_clear_rects;
+  std::vector<MathUtil::Rectangle<int>> m_scratch_clear_rects_previous;
+  bool m_viewport_ref_xfb = true;
+  bool m_efb_drop_aux_pass = true;
   bool m_trace_projections = false;
   bool m_gx_color = true;
   bool m_gx_texgen = true;

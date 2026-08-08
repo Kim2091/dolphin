@@ -21,6 +21,7 @@ extern const Info<int> GFX_REMIX_SKY_MODE;
 extern const Info<std::string> GFX_REMIX_SKY_TEXTURES;
 extern const Info<bool> GFX_REMIX_PROJECTION_FIX;
 extern const Info<bool> GFX_REMIX_VIEWPORT_FIX;
+extern const Info<bool> GFX_REMIX_VIEWPORT_REF_XFB;
 extern const Info<bool> GFX_REMIX_TRACE_PROJECTIONS;
 extern const Info<bool> GFX_REMIX_TRACE_MODELVIEWS;
 extern const Info<bool> GFX_REMIX_CAMERA_FROM_MODELVIEW;
@@ -67,6 +68,7 @@ extern const Info<bool> GFX_REMIX_EFB_COPY_INTENSITY;
 extern const Info<bool> GFX_REMIX_EFB_XFB_ENCODE;
 extern const Info<bool> GFX_REMIX_EFB_UI_COMPOSE;
 extern const Info<bool> GFX_REMIX_EFB_SKIP_DISCARDED_TEX;
+extern const Info<bool> GFX_REMIX_EFB_DROP_AUX_PASS;
 extern const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD_BLANK;
 extern const Info<bool> GFX_REMIX_GX_LIGHT_DROP_DISTANT;
 extern const Info<bool> GFX_REMIX_FALLBACK_LIGHT;
@@ -87,7 +89,7 @@ extern const Info<bool> GFX_REMIX_UI_WORLD_VIEW;
 // Must equal the number of extern Info<> declarations above. The metadata table
 // in RemixSettings.cpp static_asserts against this; if you add a knob, add its
 // table row or the build breaks.
-inline constexpr size_t kRemixSettingCount = 70;
+inline constexpr size_t kRemixSettingCount = 72;
 
 // One row per knob: how to edit it, where it belongs, whether it can be changed
 // while a game is running, and what it is for in plain language.

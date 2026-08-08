@@ -962,6 +962,8 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_log_stats = Config::Get(Config::GFX_REMIX_LOG_STATS);
   m_projection_fix = Config::Get(Config::GFX_REMIX_PROJECTION_FIX);
   m_viewport_fix = Config::Get(Config::GFX_REMIX_VIEWPORT_FIX);
+  m_viewport_ref_xfb = Config::Get(Config::GFX_REMIX_VIEWPORT_REF_XFB);
+  m_efb_drop_aux_pass = Config::Get(Config::GFX_REMIX_EFB_DROP_AUX_PASS);
   m_trace_projections = Config::Get(Config::GFX_REMIX_TRACE_PROJECTIONS);
   m_trace_modelviews = Config::Get(Config::GFX_REMIX_TRACE_MODELVIEWS);
   m_camera_from_modelview = Config::Get(Config::GFX_REMIX_CAMERA_FROM_MODELVIEW);
@@ -1483,6 +1485,29 @@ bool RecoverFovAspect(const std::array<float, 6>& raw, float& fov_y_deg, float& 
   aspect = raw[2] / raw[0];
   return fov_y_deg >= 5.0f && fov_y_deg <= 170.0f && aspect >= 0.25f && aspect <= 8.0f;
 }
+
+// What fraction of `rect` (EFB pixels) this viewport's screen rect covers.
+// Coverage rather than rect equality on purpose, twice over: a 640x480
+// viewport must still qualify against a 640x448 presented rect (overscan
+// crop), and field-rendering games move their viewport by half a line every
+// frame, so any bit-exact comparison against last frame's value would never
+// match again. The viewport edges come from the scissor-adjusted centre and
+// the half extents - the same screen mapping every hardware backend positions
+// by - with abs() because a mirrored viewport encodes winding, not size.
+float ViewportCoverageOfRect(const DrawViewport& viewport, const MathUtil::Rectangle<int>& rect)
+{
+  const float half_w = std::abs(viewport.wd());
+  const float half_h = std::abs(viewport.ht());
+  const float left = std::max(viewport.cx - half_w, static_cast<float>(rect.left));
+  const float right = std::min(viewport.cx + half_w, static_cast<float>(rect.right));
+  const float top = std::max(viewport.cy - half_h, static_cast<float>(rect.top));
+  const float bottom = std::min(viewport.cy + half_h, static_cast<float>(rect.bottom));
+  const float rect_area =
+      static_cast<float>(rect.GetWidth()) * static_cast<float>(rect.GetHeight());
+  if (right <= left || bottom <= top || rect_area <= 0.0f)
+    return 0.0f;
+  return ((right - left) * (bottom - top)) / rect_area;
+}
 }  // namespace
 
 int RemixApi::ObserveProjection(const std::array<float, 6>& raw_projection,
@@ -1490,29 +1515,50 @@ int RemixApi::ObserveProjection(const std::array<float, 6>& raw_projection,
 {
   if (!m_projection_latched)
   {
-    m_raw_projection = raw_projection;
-    m_projection_latched = true;
-    float fov_y_deg = 0.0f;
-    float aspect = 0.0f;
-    m_reference_usable = RecoverFovAspect(raw_projection, fov_y_deg, aspect);
-    // Latched together with the projection, by the same draw, for the reason
-    // spelled out on ObserveProjection's declaration.
-    m_reference_viewport = viewport;
-    // A rect with no extent cannot be divided by, so it is not a reference even
-    // though it was latched. 1e-3 rather than 1e-6: viewport extents are HALF
-    // widths in EFB pixels, where anything under a thousandth of a pixel is a
-    // degenerate write and not a small screen.
-    m_reference_viewport_usable =
-        std::abs(viewport.wd()) > 1e-3f && std::abs(viewport.ht()) > 1e-3f;
+    // The reference gate. First-draw-wins breaks any game that renders an
+    // off-screen helper pass before its main scene (Sonic Unleashed: a
+    // quarter-rect pass latched as "the screen" and the real scene was folded
+    // out of the frustum). So when last presented frame had a viewport
+    // covering most of its XFB rect, only a draw covering most of that rect
+    // may latch; helper draws wait, and render unfolded if nothing drops them
+    // first. When no viewport covered the rect (split screen, menus, boot) the
+    // gate stands down and this is bit-for-bit the old first-draw latch.
+    const bool gated = m_viewport_ref_xfb && m_ref_gate_valid && m_presented_rect_valid;
+    if (!gated || ViewportCoverageOfRect(viewport, m_presented_rect) > 0.5f)
+    {
+      m_raw_projection = raw_projection;
+      m_projection_latched = true;
+      float fov_y_deg = 0.0f;
+      float aspect = 0.0f;
+      m_reference_usable = RecoverFovAspect(raw_projection, fov_y_deg, aspect);
+      // Latched together with the projection, by the same draw, for the reason
+      // spelled out on ObserveProjection's declaration.
+      m_reference_viewport = viewport;
+      // A rect with no extent cannot be divided by, so it is not a reference
+      // even though it was latched. 1e-3 rather than 1e-6: viewport extents are
+      // HALF widths in EFB pixels, where anything under a thousandth of a pixel
+      // is a degenerate write and not a small screen.
+      m_reference_viewport_usable =
+          std::abs(viewport.wd()) > 1e-3f && std::abs(viewport.ht()) > 1e-3f;
+    }
+    else
+    {
+      ++m_stats.viewport_ref_deferred;
+    }
   }
 
   // Against the REFERENCE, not against the previously seen viewport: the fold
   // is defined relative to the reference, so this counter has to count the same
-  // population the fold acts on.
-  if (!viewport.SameRect(m_reference_viewport))
-    ++m_stats.viewport_changed;
-  if (!viewport.SameDepth(m_reference_viewport))
-    ++m_stats.viewport_depth_changed;
+  // population the fold acts on. Skipped while the gate is still holding the
+  // latch open - there is no reference yet, and comparing against the empty
+  // one would count every deferred draw as a change.
+  if (m_projection_latched)
+  {
+    if (!viewport.SameRect(m_reference_viewport))
+      ++m_stats.viewport_changed;
+    if (!viewport.SameDepth(m_reference_viewport))
+      ++m_stats.viewport_depth_changed;
+  }
 
   bool viewport_known = false;
   for (u32 i = 0; i < m_viewport_variant_count; ++i)
@@ -1585,11 +1631,12 @@ void RemixApi::LogProjectionVariants()
     return;
 
   INFO_LOG_FMT(VIDEO,
-               "Remix frame {} projections: {} variant(s), reference #0 | corrected {} draw(s), "
-               "off-centre {}, UNCORRECTABLE {} | table overflow {} | fix {}",
+               "Remix frame {} projections: {} variant(s) | corrected {} draw(s), "
+               "off-centre {}, UNCORRECTABLE {} | ref-deferred {} | table overflow {} | fix {}",
                m_frame_index, m_projection_variant_count, m_stats.projection_corrected,
                m_stats.projection_oblique, m_stats.projection_uncorrectable,
-               m_stats.projection_overflow, m_projection_fix ? "on" : "off");
+               m_stats.viewport_ref_deferred, m_stats.projection_overflow,
+               m_projection_fix ? "on" : "off");
 
   for (u32 i = 0; i < m_projection_variant_count; ++i)
   {
@@ -1597,9 +1644,14 @@ void RemixApi::LogProjectionVariants()
     // raw[1] and raw[3] are the off-centre shear terms. They are the reason a
     // parameterized camera alone cannot reproduce the frame: it has no field
     // for them, so on the pre-fix path they were silently dropped.
+    //
+    // By VALUE, not "#0 is the reference": the reference gate can defer the
+    // latch past the first-observed variant, and a frame whose gate never
+    // opened has no reference at all - both must read honestly here.
+    const bool is_reference = m_projection_latched && SameProjection(variant.raw, m_raw_projection);
     INFO_LOG_FMT(VIDEO,
                  "  #{}{} raw {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} {:.5f} | draws {} verts {}{}", i,
-                 i == 0 ? " (ref)" : "     ", variant.raw[0], variant.raw[1], variant.raw[2],
+                 is_reference ? " (ref)" : "     ", variant.raw[0], variant.raw[1], variant.raw[2],
                  variant.raw[3], variant.raw[4], variant.raw[5], variant.draws, variant.vertices,
                  (variant.raw[1] != 0.0f || variant.raw[3] != 0.0f) ? "  <-- off-centre" : "");
   }
@@ -1611,12 +1663,14 @@ void RemixApi::LogProjectionVariants()
     return;
 
   INFO_LOG_FMT(VIDEO,
-               "Remix frame {} viewports: {} variant(s), reference #0 | changes {} (corrected {}, "
-               "REFUSED {}, mirrored {}, depth-only {}) | table overflow {} | fix {}",
+               "Remix frame {} viewports: {} variant(s) | changes {} (corrected {}, "
+               "REFUSED {}, mirrored {}, depth-only {}, ref-deferred {}, aux-dropped {}) | "
+               "table overflow {} | fix {}",
                m_frame_index, m_viewport_variant_count, m_stats.viewport_changed,
                m_stats.viewport_corrected, m_stats.viewport_uncorrectable,
                m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
-               m_stats.viewport_overflow, m_viewport_fix ? "on" : "off");
+               m_stats.viewport_ref_deferred, m_stats.skipped_aux_pass, m_stats.viewport_overflow,
+               m_viewport_fix ? "on" : "off");
 
   for (u32 i = 0; i < m_viewport_variant_count; ++i)
   {
@@ -1625,7 +1679,7 @@ void RemixApi::LogProjectionVariants()
     // scissor offset and a disagreement between them is the one derivation this
     // change could get wrong. zRange/farZ ride along as the viewmodel evidence:
     // a full-screen rect with a compressed zRange is the shape to look for.
-    const bool is_reference = variant.viewport.SameRect(m_reference_viewport);
+    const bool is_reference = m_projection_latched && variant.viewport.SameRect(m_reference_viewport);
     INFO_LOG_FMT(VIDEO,
                  "  #{}{} rect xOrig {:.1f} yOrig {:.1f} wd {:.1f} ht {:.1f} | centre {:.1f} {:.1f} "
                  "| zRange {:.1f} farZ {:.1f} | draws {}",
@@ -2797,6 +2851,23 @@ bool RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_add
     {
       m_efb_discarded_rects.push_back(src_rect);
     }
+
+    // The aux-pass signature, for the WORLD path: the same discarded strict
+    // subregion, but additionally copied WITH the clear flag - the game erased
+    // those pixels the moment it had copied them, which is what says they were
+    // never meant to reach the screen directly. Collected per frame and
+    // consumed one presented frame later by ShouldDropAuxPass; the clear
+    // requirement is the difference from m_efb_discarded_rects above, whose
+    // UI consumer has no reason to care.
+    if (!xfb && !execute && clear && src_rect.GetWidth() > 0 && src_rect.GetHeight() > 0 &&
+        (src_rect.GetWidth() < static_cast<int>(EFB_WIDTH) ||
+         src_rect.GetHeight() < static_cast<int>(EFB_HEIGHT)) &&
+        m_scratch_clear_rects.size() < MAX_EFB_COPY_DESTINATIONS &&
+        std::find(m_scratch_clear_rects.begin(), m_scratch_clear_rects.end(), src_rect) ==
+            m_scratch_clear_rects.end())
+    {
+      m_scratch_clear_rects.push_back(src_rect);
+    }
   }
 
   // The misclassification instrument. It names every input the decision used,
@@ -2843,6 +2914,56 @@ bool RemixApi::NoteEfbCopy(const MathUtil::Rectangle<int>& src_rect, u32 dst_add
   event.ui_draws = m_stats.ui_placed;
   m_efb_copies.push_back(event);
   return execute;
+}
+
+bool RemixApi::ShouldDropAuxPass(const DrawViewport& viewport) const
+{
+  if (!m_efb_drop_aux_pass || m_scratch_clear_rects_previous.empty())
+    return false;
+  // Both stand-down rules ride the same learned state as the reference gate:
+  // without a presented rect, or on a frame layout where no viewport covered
+  // it (split screen), there is no safe notion of "not the scene" and nothing
+  // is dropped.
+  if (!m_presented_rect_valid || !m_ref_gate_valid)
+    return false;
+  // Never the scene. A viewport covering most of the presented region IS the
+  // frame, whatever the copy pattern around it looked like - this is what
+  // protects the very common render-whole-scene-then-copy-it-out game.
+  if (ViewportCoverageOfRect(viewport, m_presented_rect) > 0.5f)
+    return false;
+
+  const float half_w = std::abs(viewport.wd());
+  const float half_h = std::abs(viewport.ht());
+  const float left = viewport.cx - half_w;
+  const float top = viewport.cy - half_h;
+  const float right = viewport.cx + half_w;
+  const float bottom = viewport.cy + half_h;
+  for (const MathUtil::Rectangle<int>& rect : m_scratch_clear_rects_previous)
+  {
+    // Whole-rect match with a one-pixel slop per edge, not containment: a draw
+    // must claim exactly the region the copy-and-clear consumed before it is
+    // called part of that helper pass. Anything looser starts eating
+    // picture-in-picture panels that merely overlap a scratch region.
+    if (std::abs(left - static_cast<float>(rect.left)) <= 1.0f &&
+        std::abs(top - static_cast<float>(rect.top)) <= 1.0f &&
+        std::abs(right - static_cast<float>(rect.right)) <= 1.0f &&
+        std::abs(bottom - static_cast<float>(rect.bottom)) <= 1.0f)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RemixApi::NoteAuxPassDropped()
+{
+  ++m_stats.skipped_aux_pass;
+  // The Scene signal must keep seeing this draw: the console's EFB held world
+  // pixels here, and without this the helper pass's own copy would arrive with
+  // world-draws still at zero, reclassify as Composed2D and execute - handing
+  // the game a blank encode AND flipping the discarded-destination bookkeeping
+  // the drop itself depends on next frame.
+  ++m_frame_world_draws;
 }
 
 bool RemixApi::EfbDestinationDiscarded(u32 addr) const
@@ -4741,8 +4862,8 @@ void RemixApi::LogModelviewHistogram()
 
 // Union of every projection variant's depth range this frame. Taking the union
 // is what stops a draw with a longer far plane from being clipped by whichever
-// projection happened to be latched first; variant #0 is the reference, so it is
-// always included.
+// projection happened to latch the reference; every variant is walked, so the
+// reference is included wherever the gate let it land in the table.
 bool RemixApi::ComputeDepthRange(float& near_plane, float& far_plane) const
 {
   bool depth_valid = false;
@@ -5522,7 +5643,8 @@ void RemixApi::OnAfterFrame()
   if (m_log_stats && (m_frame_index % 61) == 0)
   {
     INFO_LOG_FMT(VIDEO,
-                 "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} efbdisc {} empty {} "
+                 "Remix frame {}: draws {} | skipped ortho {} prim {} efb {} efbdisc {} aux {} "
+                 "empty {} "
                  "invisible {} "
                  "scissor {} "
                  "| meshes created {} (live {}) | skinned {} ({} new mesh) | updated {} | "
@@ -5544,11 +5666,12 @@ void RemixApi::OnAfterFrame()
                  "efb copies {} ({} non-xfb+clear | xfb {} depth {} int {} scene {} 2d {} | "
                  "exec {} disc {}, {} us, {} folds) | efb peeks {} pokes {}"
                  " | viewport changes {} (corrected {}, refused {}, "
-                 "mirrored {}, depth-only {}) | sky auto: candidates {}, "
+                 "mirrored {}, depth-only {}, ref-deferred {}) | sky auto: candidates {}, "
                  "classified {}, tagged {} ({} ignored), pushed {} (x{:.0f}), emissive {} (mode {})",
                  m_frame_index, m_stats.draws_seen, m_stats.skipped_ortho,
                  m_stats.skipped_non_triangle, m_stats.skipped_efb_texture,
-                 m_stats.skipped_efb_discarded, m_stats.skipped_degenerate,
+                 m_stats.skipped_efb_discarded, m_stats.skipped_aux_pass,
+                 m_stats.skipped_degenerate,
                  m_stats.skipped_invisible, m_stats.skipped_scissor,
                  m_stats.meshes_created,
                  m_meshes.size(), m_stats.draws_skinned, m_stats.draws_skinned_new_mesh,
@@ -5599,6 +5722,7 @@ void RemixApi::OnAfterFrame()
                  m_stats.efb_peeks, m_stats.efb_pokes, m_stats.viewport_changed,
                  m_stats.viewport_corrected, m_stats.viewport_uncorrectable,
                  m_stats.viewport_mirrored, m_stats.viewport_depth_changed,
+                 m_stats.viewport_ref_deferred,
                  m_stats.sky_auto_candidates,
                  m_stats.sky_auto_classified, m_stats.sky_auto_tagged, m_stats.sky_auto_ignored,
                  m_stats.sky_pushed, m_sky_at_infinity ? m_sky_infinity_scale : 0.0f,
@@ -5616,6 +5740,30 @@ void RemixApi::OnAfterFrame()
 
 void RemixApi::FinishFrame(bool minor_frame)
 {
+  // Learn next frame's reference gate and aux-pass rects from this frame,
+  // FIRST, while the viewport table and the XFB rect are still this frame's -
+  // everything below resets them. Gated on the XFB copy having happened:
+  // frames that presented nothing (loading stutters, minor frames) neither
+  // refresh nor destroy what the last real frame taught, which is the same
+  // keep-the-last-known-good discipline m_presented_width already follows.
+  if (m_xfb_frame_valid)
+  {
+    bool covered = false;
+    for (u32 i = 0; i < m_viewport_variant_count && !covered; ++i)
+    {
+      covered = ViewportCoverageOfRect(m_viewport_variants[i].viewport, m_xfb_frame_rect) > 0.5f;
+    }
+    // A presented frame with world draws but NO majority viewport is a layout
+    // this machinery has no safe answer for (split screen: two exact halves),
+    // and one with no world draws at all is a menu; both stand the gate down,
+    // which returns the latch to first-draw-wins and disarms the aux drop.
+    m_ref_gate_valid = covered;
+    m_presented_rect = m_xfb_frame_rect;
+    m_presented_rect_valid = true;
+    m_scratch_clear_rects_previous.swap(m_scratch_clear_rects);
+    m_scratch_clear_rects.clear();
+  }
+
   m_stats = {};
   m_frame_light_mask = 0;
   m_frame_light_color_mask = 0;
@@ -5747,6 +5895,12 @@ void RemixApi::RefreshLiveConfig()
   m_ui_depth = Config::Get(Config::GFX_REMIX_UI_DEPTH);
   // The tagging view has to be live or it is useless: flip on, click, flip off.
   m_ui_world_view = Config::Get(Config::GFX_REMIX_UI_WORLD_VIEW);
+  // The quarter-screen fixes. Both are consumed per draw against state learned
+  // at the frame boundary; nothing built at Initialize derives from either, and
+  // live is the A/B - flip one off mid-game and the next frame is the old
+  // behaviour, no restart.
+  m_viewport_ref_xfb = Config::Get(Config::GFX_REMIX_VIEWPORT_REF_XFB);
+  m_efb_drop_aux_pass = Config::Get(Config::GFX_REMIX_EFB_DROP_AUX_PASS);
   // Same coupling as Initialize: the histogram is what the camera is read out
   // of, so turning the trace off must not be able to take the camera down with
   // it.
