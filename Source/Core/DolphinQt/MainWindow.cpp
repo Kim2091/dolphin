@@ -13,6 +13,7 @@
 #include <QFileInfo>
 #include <QIcon>
 #include <QMimeData>
+#include <QProcess>
 #include <QStackedWidget>
 #include <QStyleHints>
 #include <QVBoxLayout>
@@ -48,6 +49,7 @@
 #include "Core/Config/AchievementSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/NetplaySettings.h"
+#include "Core/Config/RemixSettings.h"
 #include "Core/Config/UISettings.h"
 #include "Core/Config/WiimoteSettings.h"
 #include "Core/Core.h"
@@ -418,6 +420,9 @@ void MainWindow::InitCoreCallbacks()
   connect(&Settings::Instance(), &Settings::EmulationStateChanged, this, [this](Core::State state) {
     if (state == Core::State::Uninitialized)
       OnStopComplete();
+
+    if (state == Core::State::Running)
+      m_emulation_ran = true;
 
     if (state == Core::State::Running && m_fullscreen_requested)
     {
@@ -942,6 +947,12 @@ void MainWindow::OnStopComplete()
       m_exit_requested = false;
     }
   }
+  else if (MaybeRestartForRemix())
+  {
+    // A fresh Dolphin has been launched (carrying any pending boot on its
+    // command line) and this instance is exiting. Nothing below may run.
+    return;
+  }
 
   // If the current emulation prevented the booting of another, do that now
   if (m_pending_boot != nullptr)
@@ -949,6 +960,74 @@ void MainWindow::OnStopComplete()
     StartGame(std::move(m_pending_boot));
     m_pending_boot.reset();
   }
+}
+
+bool MainWindow::MaybeRestartForRemix()
+{
+  // The Remix runtime initializes crash reporting, input hooks, the overlay,
+  // config layers and per-game folders once per process, for the first game it
+  // sees. Both attempts to reset that state for a second game in the same
+  // process fell short: unloading the runtime crashed on threads still inside
+  // it, and resident re-resolve kept surfacing further subsystems that assume
+  // a fresh process (wrong config folders, a dead overlay). A new process is
+  // correct by construction - it is what every single-game session already is
+  // - so the Remix backend's stop path relaunches Dolphin instead of trying
+  // to be the first process to survive two games.
+  if (!Config::Get(Config::GFX_REMIX_RESTART_ON_STOP))
+    return false;
+  // Only for the Remix backend, and only after emulation genuinely ran - a
+  // stop that never started must not relaunch (it would loop), and other
+  // backends have no per-process state worth a restart.
+  if (!m_emulation_ran || Config::Get(Config::MAIN_GFX_BACKEND) != "Remix")
+    return false;
+  // A NetPlay window is session state a silent relaunch would destroy.
+  if (m_netplay_dialog->isVisible())
+    return false;
+
+  // The game the user queued behind this stop (double-clicking another title
+  // while one ran) rides to the new instance as a plain command-line path -
+  // the same form a file-association launch takes. Boot types with no file
+  // path behind them (NAND titles, the IPL, DFF playback) cannot ride along;
+  // for those, stay in this process rather than silently dropping the boot.
+  QStringList args;
+  if (m_pending_boot != nullptr)
+  {
+    if (const auto* disc = std::get_if<BootParameters::Disc>(&m_pending_boot->parameters))
+      args << QString::fromStdString(disc->path);
+    else if (const auto* exe = std::get_if<BootParameters::Executable>(&m_pending_boot->parameters))
+      args << QString::fromStdString(exe->path);
+    else
+      return false;
+  }
+
+  // Flush settings before the new instance reads them; the two processes
+  // overlap for a moment and the relaunched one must see today's edits.
+  Config::Save();
+
+  // A detached child inherits this process's environment, and the Remix
+  // backend pointed five variables at the game that just ran - config, mods,
+  // captures and logs, all process-wide. Handed down as-is, they read to the
+  // new instance like something the user exported before launch, and the next
+  // game boots against THIS game's files. Strip them so the child starts as
+  // clean as a launch from Explorer; the backend re-derives all five for
+  // whatever game it boots.
+  QProcessEnvironment child_env = QProcessEnvironment::systemEnvironment();
+  for (const char* var : {"DXVK_RTX_CONFIG_FILE", "DXVK_USER_CONFIG_FILE", "DEFAULT_MODS_DIR",
+                          "DXVK_CAPTURE_PATH", "DXVK_LOG_PATH"})
+  {
+    child_env.remove(QString::fromLatin1(var));
+  }
+
+  QProcess relaunch;
+  relaunch.setProgram(QCoreApplication::applicationFilePath());
+  relaunch.setArguments(args);
+  relaunch.setProcessEnvironment(child_env);
+  if (!relaunch.startDetached())
+    return false;
+
+  m_pending_boot.reset();
+  QGuiApplication::exit(0);
+  return true;
 }
 
 bool MainWindow::RequestStop()

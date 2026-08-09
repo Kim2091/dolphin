@@ -227,6 +227,10 @@ private:
   void UpdateScreenSaverInhibition();
 
   void OnStopComplete();
+  // Relaunches Dolphin so the next game gets a fresh process (RemixRestartOnStop).
+  // Returns true when the relaunch was started and this instance is exiting; a
+  // queued pending boot has then been handed to the new process's command line.
+  bool MaybeRestartForRemix();
   void dragEnterEvent(QDragEnterEvent* event) override;
   void dropEvent(QDropEvent* event) override;
   QSize sizeHint() const override;
@@ -247,6 +251,10 @@ private:
   bool m_rendering_to_main;
   bool m_stop_confirm_showing = false;
   bool m_stop_requested = false;
+  // Whether emulation ever reached Running in this process. The Remix restart
+  // must only fire after a real session - never from a defensive
+  // stop-while-uninitialized path, where it would relaunch in a loop.
+  bool m_emulation_ran = false;
   bool m_exit_requested = false;
   bool m_fullscreen_requested = false;
   bool m_is_screensaver_inhibited = false;

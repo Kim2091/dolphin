@@ -851,6 +851,18 @@ const Info<std::string> GFX_REMIX_PER_GAME_ROOT{{System::GFX, "Settings", "Remix
 // see. The rest of the separation - config, captures, log - is unaffected either
 // way.
 const Info<bool> GFX_REMIX_PER_GAME_MODS{{System::GFX, "Settings", "RemixPerGameMods"}, true};
+// Relaunch Dolphin when emulation ends, so every game gets a fresh process.
+// The Remix runtime initializes a pile of process-global state for its first
+// game - crash reporting, raw-input registration, the overlay, config layers,
+// per-game folders - and resetting all of it in place has been tried twice
+// (unload: intermittent crashes from threads still inside the module;
+// resident re-resolve: each round surfaced another subsystem that assumed a
+// fresh process). A new process is the one configuration that is correct by
+// construction, and it is what single-game users have implicitly always run.
+// A game queued behind the stop (double-clicking another title) is carried to
+// the new instance on its command line, so switching games this way becomes
+// exactly "quit and reopen with the next game" without the manual steps.
+const Info<bool> GFX_REMIX_RESTART_ON_STOP{{System::GFX, "Settings", "RemixRestartOnStop"}, true};
 // Submit matrix-palette (skinned) draws as stable object-space meshes with
 // per-vertex bone indices and a per-draw bone palette, so the runtime skins them
 // on the GPU, instead of transforming every vertex on the CPU.
@@ -1171,6 +1183,14 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "the two, not an addition: with this on the shared folder is not searched at all. Turn "
            "it off if you have mods there that every game should see.",
            Group::Files),
+    Toggle(&GFX_REMIX_RESTART_ON_STOP, "Restart Dolphin after each game",
+           "Relaunch Dolphin when emulation ends, so the next game starts in a fresh process. The "
+           "Remix runtime sets up crash reporting, input hooks, the overlay and per-game folders "
+           "once per process, for the first game it sees; running a second game in the same "
+           "process has produced wrong config folders, a dead overlay, and crashes. Restarting is "
+           "the one arrangement that is always correct. Double-clicking another game while one "
+           "runs still works: the new game rides along to the restarted Dolphin.",
+           Group::Files, Liveness::Live),
 
     // Camera recovery.
     Toggle(&GFX_REMIX_CAMERA_RECOVERY, "Camera recovery",
