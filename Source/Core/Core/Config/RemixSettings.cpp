@@ -539,6 +539,13 @@ const Info<bool> GFX_REMIX_GX_EFB_ALPHA_PASSES{
 // moves light directions in every title and has not been playtested broadly.
 const Info<bool> GFX_REMIX_GX_PRESERVE_HANDEDNESS{
     {System::GFX, "Settings", "RemixGxPreserveHandedness"}, false};
+// Take the albedo off a later TEV stage when stage 0's texture coordinate is
+// generated from the vertex normal - i.e. when stage 0 samples an environment
+// map rather than the surface.
+//
+// False = stage 0 unconditionally, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP{
+    {System::GFX, "Settings", "RemixGxEnvMapAlbedoSkip"}, true};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1348,6 +1355,14 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP, "Skip environment-map albedo",
+           "Take the albedo from a later combiner stage when stage 0's coordinate is generated "
+           "from the vertex normal. Such a stage samples an environment map - a canned reflection "
+           "- not the surface, and only one texture reaches Remix. Measured on Skyward Sword, 80% "
+           "of traced draws wore a 32x32 reflection while their real texture sat unused on a later "
+           "stage. Dropping the reflection is doubly right here: it is exactly what a path tracer "
+           "replaces with a real one.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_PRESERVE_HANDEDNESS, "Preserve mirrored camera handedness",
            "Keep a mirrored view basis mirrored when it is re-orthonormalized. A cross product is "

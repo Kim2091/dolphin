@@ -139,6 +139,7 @@ struct FrameStats
   // register lerp on stage 0 and the water texture on stage 1.
   u32 texture_later_stage = 0;
   u32 texture_ramp_skipped = 0;
+  u32 texture_envmap_skipped = 0;
 
   // Draws whose stage-0 texture coordinate went through GX texgen, and how many
   // of those produced something a raw read of attribute 0 would not have. A game
@@ -910,6 +911,7 @@ public:
   bool GxLitChannelTexGenEnabled() const { return m_gx_lit_channel_texgen; }
   bool GxEfbAlphaPassesEnabled() const { return m_gx_efb_alpha_passes; }
   bool GxPreserveHandednessEnabled() const { return m_gx_preserve_handedness; }
+  bool GxEnvMapAlbedoSkipEnabled() const { return m_gx_envmap_albedo_skip; }
   bool UiRasChannelEnabled() const { return m_ui_ras_channel; }
 
   // False submits world draws the console scissored down to nothing, which is
@@ -1619,6 +1621,7 @@ private:
   bool m_gx_lit_channel_texgen = true;
   bool m_gx_efb_alpha_passes = true;
   bool m_gx_preserve_handedness = false;
+  bool m_gx_envmap_albedo_skip = true;
   // Textures this backend synthesized by combining a colour with a mask. Keyed
   // on the pair so a mesh does not re-materialise every frame. Released in
   // Shutdown: these are full decoded images, and without that they would

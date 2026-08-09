@@ -1252,6 +1252,18 @@ bool IsIdentityTexMatrix(const float* m)
          m[5] == 1.0f && m[6] == 0.0f && m[7] == 0.0f;
 }
 
+// Whether a texture coordinate is generated from the vertex NORMAL, which is how
+// an environment map is addressed: the normal picks the reflection texel.
+bool IsNormalSourcedCoord(u32 coord)
+{
+  if (coord >= xfmem.numTexGen.numTexGens || coord >= 8)
+    return false;
+  // SourceRow::Normal is the input row, distinct from texgentype: an env map is
+  // a REGULAR texgen whose source row happens to be the normal. Testing the type
+  // misses it entirely, which is why this went unnoticed.
+  return xfmem.texMtxInfo[coord].sourcerow == SourceRow::Normal;
+}
+
 // Whether a texture coordinate is GENERATED FROM a lit colour channel, which is
 // how a cel-shaded draw addresses its toon ramp: the lighting result becomes the
 // lookup into a gradient. A texture sampled through such a coordinate is a
@@ -2195,6 +2207,39 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     }
     // No non-ramp stage to fall back on: keep stage 0 rather than drop the
     // draw's texturing entirely, which is the lesser of the two wrongs.
+  }
+  // Stage 0 samples an ENVIRONMENT MAP - a texture indexed by the vertex normal.
+  // Structurally identical to the ramp case above: the image stage 0 names is a
+  // shading term, not the surface, and only one texture reaches Remix.
+  //
+  // Measured on Skyward Sword: 6060 of 7529 traced draws (80.5%) had a
+  // normal-sourced stage 0 with a real-UV texmap available, and the median
+  // albedo went from 1024 to 16384 texels. It presented as "all world geometry
+  // is flat solid colour" - every surface wearing a 32x32 reflection while its
+  // real texture, up to 256x256, sat unused on a later stage.
+  //
+  // Dropping the reflection is doubly right here: a baked env map is exactly
+  // what a path tracer replaces with a real one.
+  else if (stage0_textured && g_remix_api->GxEnvMapAlbedoSkipEnabled() &&
+           IsNormalSourcedCoord(bpmem.tevorders[0].getTexCoord(0)))
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      const u32 coord = bpmem.tevorders[stage >> 1].getTexCoord(stage & 1);
+      // Another env map, or a ramp, is no better than the stage we are leaving.
+      if (IsNormalSourcedCoord(coord) || IsLitChannelCoord(coord))
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_stage = stage;
+      ++stats.texture_envmap_skipped;
+      break;
+    }
+    // Nothing better to fall back on: keep stage 0. A canned reflection as
+    // albedo is wrong, but an untextured draw is worse, and the same "lesser of
+    // two wrongs" reasoning as the ramp branch applies.
   }
   const RemixTexture* albedo = nullptr;
   u8 filter_mode = 1;   // MDL Filter::Linear
