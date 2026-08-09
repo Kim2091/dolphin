@@ -1182,6 +1182,18 @@ bool IsIdentityTexMatrix(const float* m)
          m[5] == 1.0f && m[6] == 0.0f && m[7] == 0.0f;
 }
 
+// Whether a texture coordinate is GENERATED FROM a lit colour channel, which is
+// how a cel-shaded draw addresses its toon ramp: the lighting result becomes the
+// lookup into a gradient. A texture sampled through such a coordinate is a
+// shading gradient, not the surface.
+bool IsLitChannelCoord(u32 coord)
+{
+  if (coord >= xfmem.numTexGen.numTexGens || coord >= 8)
+    return false;
+  const TexGenType type = xfmem.texMtxInfo[coord].texgentype;
+  return type == TexGenType::Color0 || type == TexGenType::Color1;
+}
+
 bool IsTrivialTexGen(const TexGenState& state)
 {
   if (!state.enabled)
@@ -1796,6 +1808,32 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       break;
     }
   }
+  // Stage 0 samples a toon RAMP, not the surface. A Color0/Color1 texgen
+  // generates the coordinate from the lit channel - so the image it names is a
+  // shading gradient. Only one texture reaches Remix as the albedo, and handing
+  // it the ramp paints the model in the ramp: Wind Waker's characters came out
+  // flat yellow. Shading is the path tracer's job, so take the real texture off
+  // a later stage and let the ramp go. Measured on Wind Waker: 97.6% of
+  // lit-channel draws (3926 of 4022) took their albedo from the ramp stage.
+  else if (stage0_textured && g_remix_api->GxRampAlbedoSkipEnabled() &&
+           IsLitChannelCoord(bpmem.tevorders[0].getTexCoord(0)))
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      // Another ramp stage is no better than the first one.
+      if (IsLitChannelCoord(bpmem.tevorders[stage >> 1].getTexCoord(stage & 1)))
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_stage = stage;
+      ++stats.texture_ramp_skipped;
+      break;
+    }
+    // No non-ramp stage to fall back on: keep stage 0 rather than drop the
+    // draw's texturing entirely, which is the lesser of the two wrongs.
+  }
   const RemixTexture* albedo = nullptr;
   u8 filter_mode = 1;   // MDL Filter::Linear
   u8 wrap_mode_u = 1;   // MDL WrapMode::Repeat
@@ -1830,7 +1868,15 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       // before this change, so falling back to that is strictly no worse -
       // whereas skipping it would make geometry disappear that used to be
       // visible, which is a regression dressed up as a fix.
-      if (stage0_textured)
+      //
+      // `albedo_stage == 0` is the test, NOT `stage0_textured`. The two agreed
+      // while the only redirect was the one for an untextured stage 0, which
+      // cannot fire when stage0_textured is true. The albedo-purpose rules
+      // below redirect a draw whose stage 0 IS textured, so stage0_textured no
+      // longer implies that `albedo` came from stage 0 - and dropping the draw
+      // over a later stage's missing texture is exactly the regression this
+      // guard exists to prevent.
+      if (stage0_textured && albedo_stage == 0)
       {
         ++stats.skipped_efb_texture;
         return;
@@ -1870,7 +1916,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // here through a later stage rendered untextured before, and making
     // geometry disappear that used to be visible would be a regression dressed
     // up as a fix.
-    else if (stage0_textured && g_remix_api->EfbDestinationDiscarded(texture_addr))
+    // Gated on `albedo_stage == 0` for the same reason as the test above:
+    // `texture_addr` is the address of whichever stage the albedo came from, so
+    // without it a later stage sampling a discarded destination would drop a
+    // draw whose stage 0 is perfectly fine.
+    else if (stage0_textured && albedo_stage == 0 &&
+             g_remix_api->EfbDestinationDiscarded(texture_addr))
     {
       ++stats.skipped_efb_discarded;
       return;
@@ -1892,8 +1943,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // opposed to `albedo`, which is now whichever stage actually shades the draw.
   // Keeping the two apart is what lets the later-stage lookup above be a pure
   // shading change.
+  //
+  // Looked up from `stage0_texmap` rather than read off `albedo`, and that is
+  // load-bearing twice over. `albedo` is a later stage's texture whenever one of
+  // the albedo-purpose rules redirected it - which on Skyward Sword is 80.5% of
+  // traced draws - so hashing it would silently swap the identity of most of the
+  // scene and stop a tagged sky matching the sky list. And the fallback above
+  // resets `albedo_stage` to 0 after nulling `albedo`, so the stage the albedo
+  // came from cannot be reconstructed here either.
+  const RemixTexture* const stage0_texture =
+      stage0_textured ? g_remix_api->GetBoundTexture(stage0_texmap) : nullptr;
   const u64 stage0_texture_hash =
-      stage0_textured && albedo != nullptr ? albedo->GetContentHash() : 0;
+      stage0_texture != nullptr ? stage0_texture->GetContentHash() : 0;
 
   u8 alpha_test_type = 7;
   u8 alpha_reference = 0;

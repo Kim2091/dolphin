@@ -513,6 +513,13 @@ const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiSca
 //
 // False = stage 0's channel for both halves, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
+// Take the albedo off a later TEV stage when stage 0's texture coordinate is
+// generated from a lit channel - i.e. when stage 0 samples a toon RAMP rather
+// than the surface.
+//
+// False = stage 0 unconditionally, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_RAMP_ALBEDO_SKIP{
+    {System::GFX, "Settings", "RemixGxRampAlbedoSkip"}, true};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1322,6 +1329,12 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_RAMP_ALBEDO_SKIP, "Skip toon-ramp albedo",
+           "Take the albedo from a later combiner stage when stage 0's coordinate is generated "
+           "from a lit channel. A Color0/Color1 texgen means stage 0 samples a shading ramp, not "
+           "the surface, and only one texture reaches Remix - so handing it the ramp paints the "
+           "model in the ramp. Shading is the path tracer's job.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_RAS_CHANNEL, "Per-stage colour channel (world)",
            "Take the vertex colour channel from the combiner stage that actually uses it rather "
