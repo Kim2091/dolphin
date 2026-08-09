@@ -112,11 +112,17 @@ Presenter::~Presenter()
 
 bool Presenter::Initialize()
 {
-  UpdateDrawRectangle();
-
   m_immediate_swap_happened_this_field.store(false, std::memory_order_relaxed);
 
-  if (!g_gfx->IsHeadless())
+  if (g_gfx->IsHeadless())
+  {
+    // A headless backend does not expose a SurfaceInfo, but the common video
+    // initialization still creates the EFB framebuffer immediately after the
+    // presenter. Keep the presentation math finite until the backend supplies
+    // its real client size; otherwise aspect-ratio setup divides 0 by 0.
+    SetBackbuffer(1280, 720);
+  }
+  else
   {
     SetBackbuffer(g_gfx->GetSurfaceInfo());
 

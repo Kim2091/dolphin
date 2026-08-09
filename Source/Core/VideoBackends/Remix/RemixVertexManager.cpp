@@ -24,11 +24,13 @@
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/NativeVertexFormat.h"
+#include "VideoCommon/Present.h"
 #include "VideoCommon/RenderState.h"
 // For the bound cache entry's GC address and copy flags - the only place that
 // knows a texture was decoded out of an EFB copy's destination.
 #include "VideoCommon/TextureCacheBase.h"
 #include "VideoCommon/VertexLoaderManager.h"
+#include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/XFMemory.h"
 
 namespace Remix
@@ -54,6 +56,40 @@ constexpr u32 UI_DRAW_DUMP_LIMIT = 160;
 // instead, which is what keeps the volume down: they are two thirds of the frame
 // and there is nothing to say about them.
 constexpr u32 COLOR_TRACE_DRAW_LIMIT = 2048;
+
+// Remix does not draw Dolphin's final XFB presentation pass, so it cannot pick
+// up the graphics-panel aspect mode there. Mirror the effective perspective
+// projection instead: first apply the same widescreen-hack multipliers as
+// VertexShaderManager, then make its frustum match the presenter's resolved
+// display aspect. Tagged perspective UI uses this projection too, keeping it
+// aligned with the world for game hacks that key their UI off the aspect mode.
+std::array<float, 6> GetPresentationProjection(const std::array<float, 6>& raw)
+{
+  std::array<float, 6> projection = raw;
+  projection[0] *= g_ActiveConfig.fAspectRatioHackW;
+  projection[1] *= g_ActiveConfig.fAspectRatioHackW;
+  projection[2] *= g_ActiveConfig.fAspectRatioHackH;
+  projection[3] *= g_ActiveConfig.fAspectRatioHackH;
+
+  if (!g_presenter || std::abs(projection[0]) <= 1e-6f ||
+      std::abs(projection[2]) <= 1e-6f)
+  {
+    return projection;
+  }
+
+  const float source_aspect = projection[2] / projection[0];
+  const float display_aspect = g_presenter->CalculateDrawAspectRatio();
+  if (!std::isfinite(source_aspect) || !std::isfinite(display_aspect) ||
+      source_aspect <= 0.0f || display_aspect <= 0.0f)
+  {
+    return projection;
+  }
+
+  const float horizontal_scale = source_aspect / display_aspect;
+  projection[0] *= horizontal_scale;
+  projection[1] *= horizontal_scale;
+  return projection;
+}
 
 // Dolphin's vertex loader writes vertex colors as a u32 whose memory order is
 // R, G, B, A. Remix reads remixapi_HardcodedVertex::color as
@@ -1597,6 +1633,9 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // histogram - its modelview is not a view matrix, and one in the histogram
   // would corrupt the very camera the frame is rendered from.
   const bool is_ortho = xfmem.projection.type != ProjectionType::Perspective;
+  const std::array<float, 6> perspective_projection =
+      is_ortho ? xfmem.projection.rawProjection :
+                 GetPresentationProjection(xfmem.projection.rawProjection);
   const int ui_mode = g_remix_api->UiMode();
   if (is_ortho && ui_mode == 0)
   {
@@ -1612,8 +1651,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // either latch a reference would aim every world fold at the HUD.
   const DrawViewport* draw_viewport = is_ortho ? nullptr : &CurrentDrawViewport();
   const int projection_slot =
-      is_ortho ? -1 :
-                 g_remix_api->ObserveProjection(xfmem.projection.rawProjection, *draw_viewport);
+      is_ortho ? -1 : g_remix_api->ObserveProjection(perspective_projection, *draw_viewport);
 
   // A discarded helper pass: this viewport's rect was EFB-copied to a non-XFB
   // destination with clear and the copy discarded (learned last frame). On
@@ -2451,7 +2489,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // rotation - so that geometry swings against the rest of the scene as the
   // view turns, which is the whole symptom this exists to kill.
   if (!is_ortho &&
-      (xfmem.projection.rawProjection[1] != 0.0f || xfmem.projection.rawProjection[3] != 0.0f))
+      (perspective_projection[1] != 0.0f || perspective_projection[3] != 0.0f))
   {
     ++stats.projection_oblique;
   }
@@ -2492,7 +2530,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     }
 
     ProjectionCorrection correction;
-    switch (BuildProjectionCorrection(xfmem.projection.rawProjection,
+    switch (BuildProjectionCorrection(perspective_projection,
                                       g_remix_api->ReferenceProjection(), viewport_fold,
                                       correction))
     {
@@ -3166,8 +3204,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
         // which is the raw pair. The fold only ever touches `transform`, so
         // there is nothing to undo here.
         const UiPlacement placement = ComputeUiPlacement();
-        const std::array<float, 6> persp_raw = xfmem.projection.rawProjection;
-        if (g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview, persp_raw,
+        if (g_remix_api->SubmitUiDraw(*out_vertices, *out_indices, raw_modelview,
+                                      perspective_projection,
                                       placement.viewport, placement.clip, albedo, filter_mode,
                                       wrap_mode_u, wrap_mode_v, blend, /*tag_bypass=*/true,
                                       /*perspective=*/true))

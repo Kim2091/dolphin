@@ -46,6 +46,7 @@
 // screen overlay is rasterized at the swapchain's, so the two need relating.
 #include "VideoCommon/VideoCommon.h"
 #include "VideoCommon/VideoEvents.h"
+#include "VideoCommon/Present.h"
 #include "VideoCommon/XFMemory.h"
 
 namespace Remix
@@ -3131,31 +3132,53 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   if (call.tev_alpha_known)
     ++m_stats.ui_tev_alpha;
 
-  // EFB space -> overlay pixels. The overlay is the swapchain, the viewport is
-  // in EFB units, and the two differ by however much of the EFB the console
-  // actually presents. That is the XFB copy's source rect, NOT the EFB's own
-  // 640x528 - Wind Waker copies 480 rows, so the EFB constants stretched every
-  // UI element over a region 10% taller than the one on screen and left the
-  // bottom of the window dead. Falls back to the constants until an XFB copy has
-  // been seen, which is also what the knob's off position restores.
+  // EFB space -> presentation rectangle -> overlay pixels. The overlay is the
+  // swapchain, while the viewport is in EFB units. The presenter contributes
+  // the graphics-panel aspect rectangle so 2D UI follows the same fit/crop as
+  // the normal backend. The source region is the XFB copy's rect, NOT the
+  // EFB's own 640x528 - Wind Waker copies 480 rows, so the EFB constants
+  // stretched every UI element over a region 10% taller than the one on screen
+  // and left the bottom of the window dead. It falls back to the constants
+  // until an XFB copy has been seen, which is also what the knob's off position
+  // restores.
   const float region_width = (m_ui_scale_to_xfb && m_presented_width != 0) ?
                                  static_cast<float>(m_presented_width) :
                                  static_cast<float>(EFB_WIDTH);
   const float region_height = (m_ui_scale_to_xfb && m_presented_height != 0) ?
                                   static_cast<float>(m_presented_height) :
                                   static_cast<float>(EFB_HEIGHT);
-  const float scale_x = static_cast<float>(m_surface_width) / region_width;
-  const float scale_y = static_cast<float>(m_surface_height) / region_height;
-  call.viewport_x = viewport[0] * scale_x;
-  call.viewport_y = viewport[1] * scale_y;
+  float presentation_left = 0.0f;
+  float presentation_top = 0.0f;
+  float presentation_width = static_cast<float>(m_surface_width);
+  float presentation_height = static_cast<float>(m_surface_height);
+  if (g_presenter && g_presenter->GetBackbufferWidth() > 0 &&
+      g_presenter->GetBackbufferHeight() > 0)
+  {
+    const MathUtil::Rectangle<int>& target = g_presenter->GetTargetRectangle();
+    if (target.GetWidth() > 0 && target.GetHeight() > 0)
+    {
+      const float surface_per_window_x =
+          static_cast<float>(m_surface_width) / g_presenter->GetBackbufferWidth();
+      const float surface_per_window_y =
+          static_cast<float>(m_surface_height) / g_presenter->GetBackbufferHeight();
+      presentation_left = target.left * surface_per_window_x;
+      presentation_top = target.top * surface_per_window_y;
+      presentation_width = target.GetWidth() * surface_per_window_x;
+      presentation_height = target.GetHeight() * surface_per_window_y;
+    }
+  }
+  const float scale_x = presentation_width / region_width;
+  const float scale_y = presentation_height / region_height;
+  call.viewport_x = presentation_left + viewport[0] * scale_x;
+  call.viewport_y = presentation_top + viewport[1] * scale_y;
   call.viewport_width = viewport[2] * scale_x;
   call.viewport_height = viewport[3] * scale_y;
-  call.clip_left = static_cast<int>(std::floor(clip[0] * scale_x));
-  call.clip_top = static_cast<int>(std::floor(clip[1] * scale_y));
+  call.clip_left = static_cast<int>(std::floor(presentation_left + clip[0] * scale_x));
+  call.clip_top = static_cast<int>(std::floor(presentation_top + clip[1] * scale_y));
   // The EFB rect's right/bottom are exclusive, so the last included pixel is one
   // short of them.
-  call.clip_right = static_cast<int>(std::ceil(clip[2] * scale_x)) - 1;
-  call.clip_bottom = static_cast<int>(std::ceil(clip[3] * scale_y)) - 1;
+  call.clip_right = static_cast<int>(std::ceil(presentation_left + clip[2] * scale_x)) - 1;
+  call.clip_bottom = static_cast<int>(std::ceil(presentation_top + clip[3] * scale_y)) - 1;
 
   // The draw's footprint back in EFB space, for the copy audit. The rasterizer
   // works in overlay pixels; EFB copy rects are in EFB units, so the comparison
@@ -5862,6 +5885,26 @@ void RemixApi::UpdateOverlaySurface()
       return;
     width = 1280;
     height = 720;
+  }
+
+  // Remix owns the D3D9 swapchain, so the headless common backend cannot
+  // discover its dimensions through GetSurfaceInfo(). Feed its actual client
+  // area back into Dolphin's presenter instead. Besides keeping resize and
+  // controller mapping correct, this resolves the graphics-panel aspect mode
+  // and its widescreen-hack projection multipliers.
+  if (g_presenter)
+  {
+    if (g_presenter->GetBackbufferWidth() != static_cast<int>(width) ||
+        g_presenter->GetBackbufferHeight() != static_cast<int>(height))
+    {
+      g_presenter->SetBackbuffer(static_cast<int>(width), static_cast<int>(height));
+    }
+    else
+    {
+      // Presenter::Present is intentionally skipped for headless backends, so
+      // it would otherwise never notice a live aspect-ratio setting change.
+      g_presenter->UpdateDrawRectangle();
+    }
   }
 
   // Scaled down on request: the rasterizer is fill-rate bound and the runtime
