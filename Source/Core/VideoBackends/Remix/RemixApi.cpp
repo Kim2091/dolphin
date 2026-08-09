@@ -1129,13 +1129,13 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
     height = static_cast<u32>(client_rect.bottom - client_rect.top);
   }
 
-  // The screen overlay is rasterized at this resolution, so it has to be known
-  // whether or not the explicit-device path below is taken. Scaled down on
-  // request: the rasterizer is fill-rate bound and the runtime rescales the
-  // overlay when it composites, so this trades sharpness for frame time.
-  const float ui_scale = std::clamp(Config::Get(Config::GFX_REMIX_UI_OVERLAY_SCALE), 0.1f, 1.0f);
-  m_surface_width = std::max(1u, static_cast<u32>(static_cast<float>(width) * ui_scale));
-  m_surface_height = std::max(1u, static_cast<u32>(static_cast<float>(height) * ui_scale));
+  // The screen overlay is rasterized at a resolution derived from the window,
+  // so it has to be known whether or not the explicit-device path below is
+  // taken. Kept current at every frame boundary from here on (RefreshLiveConfig
+  // calls the same function), so window resizes and the scale knob apply
+  // without a restart.
+  m_hwnd = hwnd;
+  UpdateOverlaySurface();
 
   // Preferred path: create and register the D3D9 device explicitly through the
   // dxvk extension. Startup()'s default-init flow spawns the dev-menu overlay
@@ -3040,6 +3040,8 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   if (texture != nullptr && !texture->GetPixels().empty())
   {
     call.texture.pixels = texture->GetPixels().data();
+    // Identity for the unchanged-frame cache; the pointer above is not one.
+    call.texture.content_hash = texture->GetContentHash();
     call.texture.width = texture->GetWidth();
     call.texture.height = texture->GetHeight();
     // GX TexMode0 filter: 0 = near, anything else is some flavour of linear.
@@ -3765,12 +3767,16 @@ void RemixApi::SubmitScreenOverlay()
 
   // Replay the frame's recorded draws across the worker bands. This is where the
   // rasterization actually happens, so it is what the raster timing measures.
+  // The cache verdict is Flush's own: an unchanged frame serves the previous
+  // composite and the timing reads near zero.
+  m_ui_raster.SetFrameCache(m_ui_frame_cache);
   const auto raster_start = std::chrono::steady_clock::now();
   if (m_ui_frame_begun)
     m_ui_raster.Flush();
   m_stats.ui_raster_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
                                               std::chrono::steady_clock::now() - raster_start)
                                               .count());
+  m_stats.ui_raster_cached = m_ui_raster.LastFlushWasCached();
 
   // Nothing drawn this frame: clear the runtime's pending overlay rather than
   // leaving the last one up. A null pointer is the documented way to do that
@@ -5636,7 +5642,7 @@ void RemixApi::OnAfterFrame()
                  "diffuse none {} sign {} | spec {} | GX ambient {} | UI {} draws ({} "
                  "unplaceable, {} preworld, {} tev-alpha, {} ztest, bail s{}/k{}/c{}/r{}, skipped {} "
                  "dstalpha + {} "
-                 "efbcopytex, raster {} us, upload {} us) | "
+                 "efbcopytex, raster {} us cached {}, upload {} us) | "
                  "ui-tags ui {} ign {} world {} tagmode {} strict {} persp {} wref {} pskin {} | "
                  "ui-heur preworld {} "
                  "fullscr {} | tex-reg {} | tagsets {}/{}/{} uistate {} | "
@@ -5671,7 +5677,7 @@ void RemixApi::OnAfterFrame()
                  m_stats.ui_depth_tested, m_stats.tev_bail_stages,
                  m_stats.tev_bail_konst, m_stats.tev_bail_compare, m_stats.tev_bail_rasterized,
                  m_stats.ui_skipped_dst_alpha, m_stats.ui_skipped_efb_copy_tex,
-                 m_stats.ui_raster_us,
+                 m_stats.ui_raster_us, m_stats.ui_raster_cached ? 1 : 0,
                  m_stats.ui_upload_us,
                  // Tag routing: one number per decision path, plus the two
                  // inputs those paths read (how big the runtime says each tag
@@ -5834,14 +5840,78 @@ void RemixApi::FinishFrame(bool minor_frame)
   SyncTaggingWorldView();
 }
 
+void RemixApi::UpdateOverlaySurface()
+{
+  // The live client rect. A minimized window reads 0x0 - keep the last known
+  // size rather than collapsing the overlay to a pixel; the first frame after a
+  // restore recomputes. The 1280x720 fallback only ever applies before a real
+  // rect has been seen (headless, or a window mid-creation), matching what
+  // Initialize assumed before this function existed.
+  u32 width = 0;
+  u32 height = 0;
+  RECT client_rect = {};
+  if (m_hwnd != nullptr && GetClientRect(m_hwnd, &client_rect) &&
+      client_rect.right > client_rect.left && client_rect.bottom > client_rect.top)
+  {
+    width = static_cast<u32>(client_rect.right - client_rect.left);
+    height = static_cast<u32>(client_rect.bottom - client_rect.top);
+  }
+  if (width == 0 || height == 0)
+  {
+    if (m_surface_width != 0)
+      return;
+    width = 1280;
+    height = 720;
+  }
+
+  // Scaled down on request: the rasterizer is fill-rate bound and the runtime
+  // rescales the overlay when it composites, so this trades sharpness for
+  // frame time. Same clamp as the settings GUI offers.
+  const float ui_scale = std::clamp(Config::Get(Config::GFX_REMIX_UI_OVERLAY_SCALE), 0.1f, 1.0f);
+  float surface_w = static_cast<float>(width) * ui_scale;
+  float surface_h = static_cast<float>(height) * ui_scale;
+
+  // The native cap: GC UI is authored for a 640x528 framebuffer, so rasterizing
+  // it at a 2560-wide window is ~4x the fill for edge sharpness the art does
+  // not contain. 2x native keeps scaled edges clean and bounds the cost at any
+  // window size - F-Zero GX's menu is 47 screens of overlapping fill per frame,
+  // which at full 2560x1506 was 84 ms of CPU and the whole frame budget.
+  // Aspect is preserved so the runtime's composite stretch stays uniform.
+  if (Config::Get(Config::GFX_REMIX_UI_OVERLAY_CAP))
+  {
+    constexpr float kCapWidth = 1280.0f;   // 2x EFB_WIDTH
+    constexpr float kCapHeight = 1056.0f;  // 2x EFB_HEIGHT
+    const float factor = std::min({1.0f, kCapWidth / surface_w, kCapHeight / surface_h});
+    surface_w *= factor;
+    surface_h *= factor;
+  }
+
+  const u32 new_width = std::max(1u, static_cast<u32>(surface_w));
+  const u32 new_height = std::max(1u, static_cast<u32>(surface_h));
+  if (new_width != m_surface_width || new_height != m_surface_height)
+  {
+    // Once per actual change, so a live resize is verifiable from the log.
+    if (m_surface_width != 0)
+    {
+      INFO_LOG_FMT(VIDEO, "Remix: UI overlay surface {}x{} -> {}x{} (window {}x{}, scale {:.2f})",
+                   m_surface_width, m_surface_height, new_width, new_height, width, height,
+                   ui_scale);
+    }
+    m_surface_width = new_width;
+    m_surface_height = new_height;
+  }
+}
+
 void RemixApi::RefreshLiveConfig()
 {
   // Exactly the knobs nothing bakes: UI mode is routing consumed per draw, and
   // the rest gate log lines. Adding a knob here means proving that nothing
-  // built at Initialize time - a mesh, a material, a light, the overlay surface
-  // size - was derived from it. The settings GUI greys out every other knob
-  // while a game runs, so this list and the metadata table's Liveness column
-  // have to agree.
+  // built at Initialize time - a mesh, a material, a light - was derived from
+  // it. (The overlay surface size used to be the canonical example; it is now
+  // re-derived every frame by UpdateOverlaySurface below, which is what makes
+  // the scale knob and the window size live.) The settings GUI greys out every
+  // other knob while a game runs, so this list and the metadata table's
+  // Liveness column have to agree.
   m_ui_mode = Config::Get(Config::GFX_REMIX_UI_MODE);
   // Consumed once per frame at the present decision; nothing built at
   // Initialize time depends on it, so it is safe to flip mid-game - which is
@@ -5878,6 +5948,14 @@ void RemixApi::RefreshLiveConfig()
   // behaviour, no restart.
   m_viewport_ref_xfb = Config::Get(Config::GFX_REMIX_VIEWPORT_REF_XFB);
   m_efb_drop_aux_pass = Config::Get(Config::GFX_REMIX_EFB_DROP_AUX_PASS);
+  // Safe live because the rasterizer's records and pixels are frame-scoped:
+  // flipping it only changes whether the NEXT Flush may serve the previous
+  // composite, and the off position is byte-identical to the pre-cache build.
+  m_ui_frame_cache = Config::Get(Config::GFX_REMIX_UI_FRAME_CACHE);
+  // The overlay surface, re-derived from the live window and knobs - the frame
+  // boundary is the one point where no recorded draw is in flight, so all of a
+  // frame's draws map through one consistent size.
+  UpdateOverlaySurface();
   // Same coupling as Initialize: the histogram is what the camera is read out
   // of, so turning the trace off must not be able to take the camera down with
   // it.

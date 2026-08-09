@@ -397,6 +397,11 @@ struct FrameStats
   // memcpy inside the runtime.
   u64 ui_raster_us = 0;
   u64 ui_upload_us = 0;
+  // Whether the raster above was served from the unchanged-frame cache. A menu
+  // sitting still should read 1 with raster_us near zero; a 1 while the screen
+  // visibly animates means the hash is missing an input and the cache is
+  // showing a stale frame - the one failure mode worth watching for.
+  bool ui_raster_cached = false;
   // UI draws whose final alpha was resolved from the TEV chain rather than
   // guessed from stage-0 texture alpha. A game whose HUD is drawn when it should
   // be hidden, with this at zero, is a game whose chain the evaluator gave up on.
@@ -1683,14 +1688,26 @@ private:
   // against what a real scene here recently looked like.
   bool m_skip_minor_frames = false;
   std::array<u32, 4> m_recent_pending{};
-  // Screen overlay. Sized to the swapchain, cleared at the first UI draw of each
-  // frame and handed to the runtime just before Present.
+  // Screen overlay. Sized from the render window each frame boundary (see
+  // UpdateOverlaySurface), begun at the first UI draw of each frame and handed
+  // to the runtime just before Present.
   UiRasterizer m_ui_raster;
   // Scratch, reused across draws so a per-frame HUD does not allocate ~140 times.
   std::vector<UiRasterizer::Vertex> m_ui_vertices;
   bool m_ui_frame_begun = false;
+  // Re-derives m_surface_width/height from the live client rect, the overlay
+  // scale knob and the native cap. Called at Initialize and then at every frame
+  // boundary, which is what makes window resizes and the scale knob take effect
+  // without a game restart - the F-Zero GX lesson: the surface used to be
+  // latched at boot, so shrinking the window mid-game changed nothing and the
+  // menu stayed at 84 ms of CPU fill per frame.
+  void UpdateOverlaySurface();
+  HWND m_hwnd = nullptr;
   u32 m_surface_width = 0;
   u32 m_surface_height = 0;
+  // Whether Flush may serve an unchanged frame from the previous composite.
+  // Live via RefreshLiveConfig; handed to the rasterizer just before Flush.
+  bool m_ui_frame_cache = true;
   // Non-zero dumps the composited overlay at that frame index to
   // Logs/remix-ui-overlay.bmp, once. Diagnostic only; nothing reads it back.
   int m_ui_dump_frame = 0;

@@ -62,6 +62,12 @@ public:
     // Decoded RGBA8, row-major, `width * height * 4` bytes. Null for an
     // untextured draw, which then takes its colour from the vertices alone.
     const u8* pixels = nullptr;
+    // Hash of the decoded pixels, carried for the unchanged-frame cache: the
+    // pointer above is unusable as identity (an evicted texture's storage can
+    // be reused by a different one, and a texture reloaded in place changes
+    // content under a stable address), while the content hash is exactly what
+    // "same pixels" means. Zero for an untextured draw.
+    u64 content_hash = 0;
     u32 width = 0;
     u32 height = 0;
     bool bilinear = true;
@@ -154,8 +160,12 @@ public:
   UiRasterizer(const UiRasterizer&) = delete;
   UiRasterizer& operator=(const UiRasterizer&) = delete;
 
-  // Resizes and clears to fully transparent. Everything recorded afterwards
-  // accumulates until the next Begin.
+  // Resizes the buffer and marks it for clearing. The clear itself happens in
+  // Flush, and only on a frame that actually rasterizes - which is what lets an
+  // unchanged frame keep the previous composite (see SetFrameCache) and costs
+  // the EFB-compose instance nothing, since its first Flush after a Begin
+  // clears exactly as Begin used to. Everything recorded afterwards accumulates
+  // until the next Begin.
   void Begin(u32 width, u32 height);
 
   // Records a triangle list. `indices` are into `vertices`; a count that is not
@@ -180,6 +190,19 @@ public:
   //
   // Reset to off by Begin, so it is per-frame state like everything else here.
   void SetPreWorldFilter(bool enabled) { m_pre_world_filter = enabled; }
+
+  // Whether Flush may skip rasterization entirely when the recorded frame is
+  // bit-identical to the previous one (same draws, same order, same textures by
+  // content hash, same surface size, same filter verdict). A menu holds still
+  // for hundreds of frames, and re-rasterizing an identical frame is the single
+  // largest avoidable cost on 2D-heavy screens. Off for the EFB-compose
+  // instance: its buffer is consumed mid-frame by copy folds, not re-read
+  // across frames, so a cache there has nothing to serve.
+  void SetFrameCache(bool enabled) { m_cache_enabled = enabled; }
+
+  // True when the last Flush served the previous frame's composite instead of
+  // rasterizing. Diagnostic - the frame line's `cached` flag.
+  bool LastFlushWasCached() const { return m_last_flush_cached; }
 
   // Replays everything recorded since Begin. Must be called before reading the
   // buffer; safe to call with nothing recorded.
@@ -246,6 +269,26 @@ private:
   // See SetPreWorldFilter. Read by every band worker during a Flush and written
   // only between flushes, so it needs no synchronisation of its own.
   bool m_pre_world_filter = false;
+
+  // The unchanged-frame cache (see SetFrameCache). m_frame_hash accumulates
+  // over every recorded draw, order-sensitively - the overlay is a painter's
+  // algorithm, so two frames with the same draws in a different order are
+  // different frames. Seeded with the surface size in Begin; the flush-time
+  // inputs (the pre-world filter verdict) fold in at Flush. A hash mismatch
+  // costs one re-raster, so a false MISmatch is merely slow - only a false
+  // match could show a wrong frame, which is why textures participate by
+  // content hash rather than pointer.
+  bool m_cache_enabled = false;
+  u64 m_frame_hash = 0;
+  u64 m_last_frame_hash = 0;
+  bool m_have_cached_frame = false;
+  bool m_last_flush_cached = false;
+  // HasContent()'s answer for the cached frame, restored on a hit because Begin
+  // has already reset m_touched by the time Flush decides.
+  bool m_last_touched = false;
+  // Set by Begin, consumed by the first rasterizing Flush. The buffer must not
+  // be cleared any earlier or a cache hit would have nothing to serve.
+  bool m_needs_clear = false;
 
   // Worker pool. Started on the first Flush that has enough work to be worth it,
   // and joined in the destructor.

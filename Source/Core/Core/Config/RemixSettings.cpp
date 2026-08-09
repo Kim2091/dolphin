@@ -165,6 +165,20 @@ const Info<int> GFX_REMIX_UI_MODE{{System::GFX, "Settings", "RemixUiMode"}, 1};
 // there is not much real detail to lose below 1.0 on a high-resolution window.
 const Info<float> GFX_REMIX_UI_OVERLAY_SCALE{{System::GFX, "Settings", "RemixUiOverlayScale"},
                                              1.0f};
+// Cap the overlay surface at twice the console's own 640x528, preserving
+// aspect, however large the window. GC UI is authored at that resolution, so
+// past 2x the extra pixels buy edge sharpness the art does not contain while
+// the fill cost keeps growing with the window squared - F-Zero GX's menu is
+// ~47 screens of overlapping fill a frame, 84 ms of CPU at a 2560-wide window
+// and 15 ms at 960. Off restores surface = window * RemixUiOverlayScale
+// exactly as before.
+const Info<bool> GFX_REMIX_UI_OVERLAY_CAP{{System::GFX, "Settings", "RemixUiOverlayCap"}, true};
+// Skip re-rasterizing a frame whose recorded 2D draws are bit-identical to the
+// previous frame's (same draws, order, textures by content hash, surface size,
+// filter verdict) and serve the previous composite instead. Menus and pause
+// screens hold still for hundreds of frames; this removes their entire raster
+// cost. Off is the pre-cache behaviour byte for byte.
+const Info<bool> GFX_REMIX_UI_FRAME_CACHE{{System::GFX, "Settings", "RemixUiFrameCache"}, true};
 // Non-zero writes the composited UI overlay at that frame index to
 // Logs/remix-ui-overlay.bmp, once, over a checkerboard so transparent and black
 // are distinguishable. Diagnostic only - it is the only way to see what this
@@ -1417,8 +1431,22 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
          "overlay is rasterized on the CPU and is fill-rate bound, so 0.5 quarters its cost. At "
          "1.0 it costs 3 to 9 ms a frame on Wind Waker's busiest 2D screens. GameCube UI is "
          "authored for a 640x528 framebuffer, so there is little real detail to lose on a large "
-         "window.",
-         Group::UiOverlay, 0.1f, 1.0f, 0.05f),
+         "window. Applies immediately, and the overlay now follows window resizes too.",
+         Group::UiOverlay, 0.1f, 1.0f, 0.05f, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_OVERLAY_CAP, "Cap the overlay at 2x GameCube resolution",
+           "Never rasterize the 2D overlay larger than 1280x1056 - twice the console's own "
+           "framebuffer - however large the window. The UI art holds no detail past that, but the "
+           "CPU cost keeps growing with the window: F-Zero GX's menu costs 84 ms a frame at a "
+           "2560-wide window and 15 ms under the cap, which is the difference between 10 and 60 "
+           "FPS. Turn off only if 2D edges look too soft on a very large display.",
+           Group::UiOverlay, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_FRAME_CACHE, "Reuse unchanged 2D frames",
+           "When a frame's 2D draws are exactly the ones the previous frame drew, show the "
+           "previous overlay instead of rasterizing it again. Menus and pause screens hold still "
+           "for hundreds of frames, so this removes most of their CPU cost. Any change in any "
+           "draw re-rasterizes, so animation is unaffected; if UI ever freezes while the game "
+           "visibly animates, turn this off and report it. Watch the 'cached' flag in the log.",
+           Group::UiOverlay, Liveness::Live),
     Toggle(&GFX_REMIX_UI_SCALE_TO_XFB, "Scale the overlay to the presented image",
            "Stretch the overlay over the region the console actually presents rather than over the "
            "whole internal framebuffer. Wind Waker presents 480 rows rather than 528, so the old "

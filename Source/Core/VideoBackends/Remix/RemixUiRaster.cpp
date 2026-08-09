@@ -8,10 +8,38 @@
 #include <cstring>
 #include <limits>
 
+#include <xxhash.h>
+
 namespace Remix
 {
 namespace
 {
+// Everything about a recorded draw that affects its pixels, laid out with no
+// padding so it can be hashed as raw bytes. Assembled field by field rather
+// than memcpy'd from DrawCall, whose padding bytes are indeterminate - a hash
+// over those could only produce false MISmatches, but deterministic keys make
+// the cache's behaviour reproducible. The texture participates by content
+// hash, never by pointer (see Texture::content_hash).
+struct DrawKey
+{
+  u64 texture_hash;
+  u32 tex_width;
+  u32 tex_height;
+  // bilinear, clamp_u, clamp_v, blend mode, tev_alpha_known, depth_test,
+  // depth_write, tag_protected - one bit or nibble each.
+  u32 flags;
+  // alpha_compare | alpha_compare1 << 8 | alpha_logic << 16 | depth_func << 24.
+  u32 compares;
+  float alpha_reference;
+  float alpha_reference1;
+  float tev_alpha_corners[4];
+  float viewport[4];
+  s32 clip[4];
+  u32 world_draws_at_submit;
+  u32 padding_zero;
+};
+static_assert(sizeof(DrawKey) == 88, "no padding - the key is hashed as bytes");
+
 // Everything below works in 0-255 integers rather than floats. This is a
 // full-screen-per-draw inner loop - a game that fades the screen covers every
 // pixel in the overlay several times a frame - and the first version, which
@@ -132,11 +160,18 @@ void UiRasterizer::Begin(u32 width, u32 height)
   // only touched in Flush, and only when this comes up true.
   m_depth_used = false;
   const size_t needed = static_cast<size_t>(width) * height;
-  // The buffer has to come back fully transparent every frame or last frame's
-  // HUD ghosts under this one's. resize + fill rather than assign so the
-  // allocation is reused once the size has settled.
+  // The buffer has to come back fully transparent before anything rasterizes
+  // over it, or last frame's HUD ghosts under this one's - but the clear is
+  // DEFERRED to Flush, because until Flush decides, the buffer may still be
+  // serving as the cached previous frame. resize here so the allocation is
+  // reused once the size has settled; a size change re-rasterizes regardless,
+  // the dimensions being part of the frame hash.
   m_pixels.resize(needed);
-  std::fill(m_pixels.begin(), m_pixels.end(), 0u);
+  m_needs_clear = true;
+  // The dimensions seed the hash so a resized window can never serve the old
+  // surface, however identical the draws.
+  const u32 dims[2] = {width, height};
+  m_frame_hash = XXH64(dims, sizeof(dims), 0x5549526173746572ull);  // "UIRaster"
 }
 
 void UiRasterizer::WorkerLoop()
@@ -200,8 +235,32 @@ void UiRasterizer::RasterizeBand(int min_y, int max_y)
 
 void UiRasterizer::Flush()
 {
+  m_last_flush_cached = false;
   if (m_draw_count == 0 || m_width == 0 || m_height == 0)
     return;
+
+  // The flush-time input folds in here because it is decided after recording:
+  // the same draws filtered differently are a different image.
+  const u32 flush_state = m_pre_world_filter ? 1u : 0u;
+  const u64 frame_hash = XXH64(&flush_state, sizeof(flush_state), m_frame_hash);
+
+  // The unchanged-frame case: the buffer still holds exactly this image, so
+  // serve it. Menus and pause screens sit here for hundreds of consecutive
+  // frames, and this is where their entire raster cost goes away. m_touched is
+  // restored rather than left alone because Begin already reset it.
+  if (m_cache_enabled && m_have_cached_frame && frame_hash == m_last_frame_hash)
+  {
+    m_touched.store(m_last_touched, std::memory_order_relaxed);
+    m_last_flush_cached = true;
+    return;
+  }
+
+  // Really rasterizing: the deferred clear happens now (see Begin).
+  if (m_needs_clear)
+  {
+    std::fill(m_pixels.begin(), m_pixels.end(), 0u);
+    m_needs_clear = false;
+  }
 
   // The depth plane exists only on frames that need it. Prepared here, before
   // any band starts, because the bands write disjoint rows of it but all of
@@ -219,6 +278,9 @@ void UiRasterizer::Flush()
   if (wanted <= 1 || m_height < 64)
   {
     RasterizeBand(0, static_cast<int>(m_height) - 1);
+    m_last_frame_hash = frame_hash;
+    m_have_cached_frame = true;
+    m_last_touched = m_touched.load(std::memory_order_relaxed);
     return;
   }
 
@@ -258,6 +320,11 @@ void UiRasterizer::Flush()
 
   std::unique_lock<std::mutex> lock(m_mutex);
   m_band_done.wait(lock, [&] { return m_bands_finished >= m_bands_total; });
+  lock.unlock();
+
+  m_last_frame_hash = frame_hash;
+  m_have_cached_frame = true;
+  m_last_touched = m_touched.load(std::memory_order_relaxed);
 }
 
 u32 UiRasterizer::Sample(const Texture& texture, float u, float v) const
@@ -637,5 +704,44 @@ void UiRasterizer::Draw(const DrawCall& call, const std::vector<Vertex>& vertice
   }
   draw.min_y = static_cast<int>(std::floor(lowest));
   draw.max_y = static_cast<int>(std::ceil(highest));
+
+  // Fold the recorded draw into the frame hash: geometry, indices, then every
+  // pixel-affecting field of the call. Chained rather than combined so the
+  // fold is order-sensitive - a painter's algorithm run in a different order
+  // is a different image. Vertices hash as raw bytes, which is exact: they are
+  // the deterministic output of the caller's transform, so an identical frame
+  // reproduces them bit for bit.
+  u64 hash = XXH64(draw.vertices.data(), draw.vertices.size() * sizeof(Vertex), m_frame_hash);
+  hash = XXH64(draw.indices.data(), draw.indices.size() * sizeof(u32), hash);
+  DrawKey key = {};
+  key.texture_hash = call.texture.content_hash;
+  key.tex_width = call.texture.width;
+  key.tex_height = call.texture.height;
+  key.flags = (call.texture.bilinear ? 1u : 0u) | (call.texture.clamp_u ? 2u : 0u) |
+              (call.texture.clamp_v ? 4u : 0u) | (call.tev_alpha_known ? 8u : 0u) |
+              (call.depth_test ? 16u : 0u) | (call.depth_write ? 32u : 0u) |
+              (call.tag_protected ? 64u : 0u) | (static_cast<u32>(call.blend) << 8);
+  key.compares = static_cast<u32>(call.alpha_compare) | (static_cast<u32>(call.alpha_compare1) << 8) |
+                 (static_cast<u32>(call.alpha_logic) << 16) |
+                 (static_cast<u32>(call.depth_func) << 24);
+  key.alpha_reference = call.alpha_reference;
+  key.alpha_reference1 = call.alpha_reference1;
+  for (int i = 0; i < 4; ++i)
+    key.tev_alpha_corners[i] = call.tev_alpha_corners[i];
+  key.viewport[0] = call.viewport_x;
+  key.viewport[1] = call.viewport_y;
+  key.viewport[2] = call.viewport_width;
+  key.viewport[3] = call.viewport_height;
+  key.clip[0] = call.clip_left;
+  key.clip[1] = call.clip_top;
+  key.clip[2] = call.clip_right;
+  key.clip[3] = call.clip_bottom;
+  // Participates because the pre-world filter reads it per draw at replay time
+  // - but replay only ever reads its ZERO-NESS, so only that is hashed. The
+  // exact count jitters with the world draw list (F-Zero GX's menu alternates
+  // 368 and 369 total draws over an identical 2D layer), and hashing it would
+  // break the cache on frames whose image is provably unchanged.
+  key.world_draws_at_submit = call.world_draws_at_submit == 0 ? 0u : 1u;
+  m_frame_hash = XXH64(&key, sizeof(key), hash);
 }
 }  // namespace Remix
