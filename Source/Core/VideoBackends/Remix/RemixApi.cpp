@@ -231,8 +231,9 @@ void Normalize3(float* v)
 // frame accumulates error, and the camera extraction in SetupCamera assumes
 // R^-1 == R^T - so left alone the basis would slowly shear and the recovered
 // camera would stop matching the geometry it is meant to frame.
-void AffineOrthonormalize(Affine& m)
+void AffineOrthonormalize(Affine& m, bool preserve_handedness)
 {
+  const float z0[3] = {m[8], m[9], m[10]};
   float x[3] = {m[0], m[1], m[2]};
   float y[3] = {m[4], m[5], m[6]};
   Normalize3(x);
@@ -240,8 +241,28 @@ void AffineOrthonormalize(Affine& m)
   for (int k = 0; k < 3; ++k)
     y[k] -= xy * x[k];
   Normalize3(y);
-  const float z[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2],
-                      x[0] * y[1] - x[1] * y[0]};
+  float z[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0]};
+  // A cross product is right-handed BY CONSTRUCTION, so rebuilding row 2 from
+  // one silently converts a MIRRORED basis into a right-handed one and throws
+  // the reflection away. Some games hand us exactly that: The Force Unleashed's
+  // modelview measures det -1 on every frame.
+  //
+  // Geometry hides the damage, because the image is invariant to V - world and
+  // camera move together and the picture is unchanged. LIGHTS DO NOT, because a
+  // light's world direction is computed from XF state through V^-1 and never
+  // touches MV, so it does not participate in that cancellation. A reflected V
+  // turns a rotation of +theta into -theta, a 2*theta error against the truth,
+  // which is why TFU's lights measured world/camera 1.79-1.90 where an anchored
+  // light reads 0, and why its shadows swing while its geometry looks right.
+  // Preserving the sign drops the median light drift from 89/123 deg to 5.0/0.8.
+  //
+  // No-op for a right-handed input: the cross product already agrees with row 2.
+  if (preserve_handedness && z[0] * z0[0] + z[1] * z0[1] + z[2] * z0[2] < 0.0f)
+  {
+    for (int k = 0; k < 3; ++k)
+      z[k] = -z[k];
+  }
   m[0] = x[0];  m[1] = x[1];  m[2] = x[2];
   m[4] = y[0];  m[5] = y[1];  m[6] = y[2];
   m[8] = z[0];  m[9] = z[1];  m[10] = z[2];
@@ -966,6 +987,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_ramp_albedo_skip = Config::Get(Config::GFX_REMIX_GX_RAMP_ALBEDO_SKIP);
   m_gx_lit_channel_texgen = Config::Get(Config::GFX_REMIX_GX_LIT_CHANNEL_TEXGEN);
   m_gx_efb_alpha_passes = Config::Get(Config::GFX_REMIX_GX_EFB_ALPHA_PASSES);
+  m_gx_preserve_handedness = Config::Get(Config::GFX_REMIX_GX_PRESERVE_HANDEDNESS);
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_gx_tev_color = Config::Get(Config::GFX_REMIX_GX_TEV_COLOR);
   m_gx_texture_stage = Config::Get(Config::GFX_REMIX_GX_TEXTURE_STAGE);
@@ -4398,7 +4420,7 @@ void RemixApi::EstimateView()
 
     m_view_miss_streak = 0;
     m_view = AffineMultiply(delta, m_view);
-    AffineOrthonormalize(m_view);
+    AffineOrthonormalize(m_view, m_gx_preserve_handedness);
   }
   else if (deltas.size() >= 2)
   {
@@ -4808,7 +4830,7 @@ void RemixApi::ResolveDominantModelview()
   m_modelview_camera = AffineMultiply(m_modelview_top, m_modelview_world_offset);
   // Belt and braces: SetupCamera extracts the basis assuming R^-1 == R^T, and
   // AffineIsRigid above only holds the rows to 0.02.
-  AffineOrthonormalize(m_modelview_camera);
+  AffineOrthonormalize(m_modelview_camera, m_gx_preserve_handedness);
   m_modelview_camera_valid = true;
 }
 

@@ -532,6 +532,13 @@ const Info<bool> GFX_REMIX_GX_LIT_CHANNEL_TEXGEN{
 // False = the priming pass renders as opaque geometry, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_EFB_ALPHA_PASSES{
     {System::GFX, "Settings", "RemixGxEfbAlphaPasses"}, true};
+// Keep a mirrored view basis mirrored when re-orthonormalizing it, instead of
+// letting the cross product silently make it right-handed.
+//
+// DEFAULT OFF: correct in principle and a no-op for right-handed input, but it
+// moves light directions in every title and has not been playtested broadly.
+const Info<bool> GFX_REMIX_GX_PRESERVE_HANDEDNESS{
+    {System::GFX, "Settings", "RemixGxPreserveHandedness"}, false};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1341,6 +1348,15 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_PRESERVE_HANDEDNESS, "Preserve mirrored camera handedness",
+           "Keep a mirrored view basis mirrored when it is re-orthonormalized. A cross product is "
+           "right-handed by construction, so rebuilding the third row from one throws a reflection "
+           "away. Geometry hides this - the image is invariant to the view matrix - but light "
+           "directions go through its inverse and do not cancel, so they swing while the scene "
+           "looks right. Helpful for Star Wars: The Force Unleashed, whose modelview measures "
+           "det -1 every frame. OFF by default: it is a no-op for right-handed input, but it "
+           "moves lighting in every title and is not yet widely tested.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_EFB_ALPHA_PASSES, "EFB alpha mask passes",
            "Handle the two-pass EFB-alpha-mask idiom. A game primes a per-pixel stencil in the "

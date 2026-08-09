@@ -909,6 +909,7 @@ public:
   bool GxRampAlbedoSkipEnabled() const { return m_gx_ramp_albedo_skip; }
   bool GxLitChannelTexGenEnabled() const { return m_gx_lit_channel_texgen; }
   bool GxEfbAlphaPassesEnabled() const { return m_gx_efb_alpha_passes; }
+  bool GxPreserveHandednessEnabled() const { return m_gx_preserve_handedness; }
   bool UiRasChannelEnabled() const { return m_ui_ras_channel; }
 
   // False submits world draws the console scissored down to nothing, which is
@@ -1617,6 +1618,7 @@ private:
   bool m_gx_ramp_albedo_skip = true;
   bool m_gx_lit_channel_texgen = true;
   bool m_gx_efb_alpha_passes = true;
+  bool m_gx_preserve_handedness = false;
   // Textures this backend synthesized by combining a colour with a mask. Keyed
   // on the pair so a mesh does not re-materialise every frame. Released in
   // Shutdown: these are full decoded images, and without that they would
