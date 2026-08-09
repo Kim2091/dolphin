@@ -3069,10 +3069,38 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // [0 0 256 256] - the exact rect of the EFB copy it feeds - and both carry
   // vertex colour 0xffffffff. They are the white screen and the white box.
   //
-  // Untextured is load-bearing: real 2D content is textured, so this cannot
-  // swallow a menu or a HUD element. The pre-world test is what separates a
-  // clear from a legitimate 2D layer drawn after the scene.
-  if (!tag_bypass && m_ui_drop_pre_world_blank && call.texture.pixels == nullptr)
+  // Untextured was believed load-bearing here - "real 2D content is textured,
+  // so this cannot swallow a menu or a HUD element". That holds for BFBB and
+  // Wind Waker and is FALSE for Mario Kart: Double Dash, whose in-race clear is
+  // a full-screen quad carrying a 4x4 texture. It sailed past this test and
+  // painted the whole overlay white over the traced frame.
+  //
+  // So take a second shape as well: blending disabled AND depth write enabled.
+  // Neither bit can be faked by 2D content. Blending disabled means the draw
+  // OVERWRITES, and in a layer composited over an already-finished image an
+  // opaque overwrite can only destroy what is under it - there is nothing in
+  // the overlay for it to legitimately cover. Writing depth is something no 2D
+  // overlay draw does at all. Measured on MK:DD frame 5003: of the 76 UI draws
+  // taken, this quad is the ONLY one with either bit set - every HUD element is
+  // blend-enabled with depth write off.
+  //
+  // ...and require the texture to be a PLACEHOLDER, not artwork. Those two bits
+  // alone would take a legitimate full-screen background that a game happens to
+  // draw opaque with z-write left on, which is a real shape - and on a frame
+  // with no world content that background IS the screen, so dropping it leaves
+  // the HUD floating over nothing. What a clear actually carries is a stand-in:
+  // MK:DD's is 4x4. No background art is 16x16 or smaller, so that bound
+  // separates the two without needing to know either game.
+  //
+  // The pre-world test below is still what separates a clear from a legitimate
+  // 2D layer drawn after the scene, and it does the real work in all shapes.
+  constexpr u32 MAX_PLACEHOLDER_TEXELS = 16 * 16;
+  const bool placeholder_texture =
+      static_cast<u32>(call.texture.width) * call.texture.height <= MAX_PLACEHOLDER_TEXELS;
+  const bool clear_shaped =
+      call.texture.pixels == nullptr ||
+      (!blend.blend_enabled && blend.depth_write && placeholder_texture);
+  if (!tag_bypass && m_ui_drop_pre_world_blank && clear_shaped)
   {
     if (m_frame_world_draws == 0)
     {

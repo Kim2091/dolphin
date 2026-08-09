@@ -1473,11 +1473,14 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "the risk is that a game legitimately composing its menu this way loses the menu.",
            Group::UiOverlay),
     Toggle(&GFX_REMIX_UI_DROP_PRE_WORLD_BLANK, "Drop framebuffer-clear rectangles",
-           "Drop untextured 2D draws that arrive before any world geometry in the frame. Those are "
-           "screen clears, not UI: the console draws the scene over them, but this backend "
-           "composites 2D ON TOP of the traced image, so they land over everything and paint the "
-           "screen flat. This is the SpongeBob white-box fix. Genuine UI is textured, so it is "
-           "unaffected.",
+           "Drop screen-clear rectangles that arrive before any world geometry in the frame. Those "
+           "are clears, not UI: the console draws the scene over them, but this backend composites "
+           "2D ON TOP of the traced image, so they land over everything and paint the screen flat. "
+           "This is the SpongeBob white-box fix. Two shapes count as a clear - untextured, and "
+           "opaque-with-depth-write carrying a placeholder texture of 16x16 or smaller (Mario "
+           "Kart: Double Dash's in-race clear is a full-screen quad on a 4x4 texture, which the "
+           "untextured test alone let through). Real 2D artwork is neither, so a genuine "
+           "background is unaffected.",
            Group::UiOverlay),
     Toggle(&GFX_REMIX_UI_TAG_ROUTING, "Route 2D draws by Remix texture tags",
            "Let the Remix dev menu decide what happens to each 2D draw. Tag a texture 'UI Texture' "
