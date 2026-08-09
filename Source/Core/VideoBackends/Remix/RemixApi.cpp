@@ -4277,12 +4277,27 @@ void RemixApi::EstimateView()
   // A classified skybox votes for the camera's ROTATION delta with the
   // translation missing - not a useless hypothesis but an actively wrong one,
   // which poisons the translation consensus every time the camera moves. Drop
-  // it. Only in tagging mode: mode 1 has to leave the estimate untouched, or its
-  // log-only promise is not worth anything.
+  // it.
+  //
+  // This used to be gated at >= 2, "only in tagging mode: mode 1 has to leave
+  // the estimate untouched, or its log-only promise is not worth anything".
+  // That justification was false. Mode 1 is not log-only and never was: with
+  // RemixSkyAtInfinity, which defaults on, classification already MOVES the
+  // geometry at >= 1 - as the note on that setting says outright. So the
+  // exclusion was withheld to protect a promise mode 1 does not keep, while the
+  // poisoning it prevents ran at the default.
+  //
+  // Measured on Skyward Sword (SOUE01) at mode 1, same scene, parked vs running:
+  //   w_stable   94.3% -> 0.9%      tie_breaks 0 -> 44
+  //   runner-up  0     -> 3/frame   (exactly the size of the classified set)
+  // The runner-up bloc appears only once the camera translates and is exactly
+  // the sky's own size. Parked, a skybox's translation-free delta happens to BE
+  // correct, which is why this hides in any capture taken standing still.
+  //
   // m_view_samples is keyed by MESH hash while the classified set holds GEOMETRY
   // hashes, so this has to go through the mesh record to translate rather than
   // erasing by key directly.
-  if (m_sky_auto_detect >= 2)
+  if (m_sky_auto_detect >= 1)
   {
     for (auto it = m_view_samples.begin(); it != m_view_samples.end();)
     {
