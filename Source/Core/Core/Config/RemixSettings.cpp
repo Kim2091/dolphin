@@ -1420,19 +1420,22 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "framebuffer alpha with a colour-less pass, then blends against it. There is no "
            "destination alpha here to honour, so the priming pass is dropped and the pass that "
            "follows is cut to the mask instead - by its own source alpha where they share a "
-           "texture, or by combining the two where they do not.",
+           "texture, or by combining the two where they do not. Verified in-game on The Wind "
+           "Waker, where it fixes the eyes, the eyebrows and a black bar across the face.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_LIT_CHANNEL_TEXGEN, "Light Color0/Color1 texture coordinates",
            "Run the console's per-vertex lighting when a texture coordinate is generated from a "
            "lit colour channel. Such a coordinate is an INDEX into a toon ramp, not a colour, so "
            "substituting the raw vertex colour collapses every vertex onto one texel and the "
-           "surface renders flat.",
+           "surface renders flat. Isolated A/B on The Wind Waker: characters flat yellow before, "
+           "correct red and dark grey after.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_RAMP_ALBEDO_SKIP, "Skip toon-ramp albedo",
            "Take the albedo from a later combiner stage when stage 0's coordinate is generated "
            "from a lit channel. A Color0/Color1 texgen means stage 0 samples a shading ramp, not "
            "the surface, and only one texture reaches Remix - so handing it the ramp paints the "
-           "model in the ramp. Shading is the path tracer's job.",
+           "model in the ramp. Shading is the path tracer's job. Verified in-game on The Wind "
+           "Waker, whose cel-shaded characters are the case this exists for.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_RAS_CHANNEL, "Per-stage colour channel (world)",
            "Take the vertex colour channel from the combiner stage that actually uses it rather "
