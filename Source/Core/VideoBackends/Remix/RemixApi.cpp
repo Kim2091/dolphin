@@ -989,6 +989,8 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_efb_alpha_passes = Config::Get(Config::GFX_REMIX_GX_EFB_ALPHA_PASSES);
   m_gx_preserve_handedness = Config::Get(Config::GFX_REMIX_GX_PRESERVE_HANDEDNESS);
   m_gx_envmap_albedo_skip = Config::Get(Config::GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP);
+  m_gx_unused_stage_albedo_skip =
+      Config::Get(Config::GFX_REMIX_GX_UNUSED_STAGE_ALBEDO_SKIP);
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_gx_tev_color = Config::Get(Config::GFX_REMIX_GX_TEV_COLOR);
   m_gx_texture_stage = Config::Get(Config::GFX_REMIX_GX_TEXTURE_STAGE);

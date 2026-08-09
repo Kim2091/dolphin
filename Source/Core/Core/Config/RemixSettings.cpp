@@ -546,6 +546,12 @@ const Info<bool> GFX_REMIX_GX_PRESERVE_HANDEDNESS{
 // False = stage 0 unconditionally, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP{
     {System::GFX, "Settings", "RemixGxEnvMapAlbedoSkip"}, true};
+// Take the albedo off a later TEV stage when stage 0 binds a texture its own
+// combiner never references.
+//
+// False = stage 0 unconditionally, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_UNUSED_STAGE_ALBEDO_SKIP{
+    {System::GFX, "Settings", "RemixGxUnusedStageAlbedoSkip"}, true};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1384,6 +1390,13 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_UNUSED_STAGE_ALBEDO_SKIP, "Skip albedo from an unused texture stage",
+           "Take the albedo from a later combiner stage when stage 0 binds a texture but never "
+           "references it in its own arithmetic. Such a texmap contributes nothing to the picture, "
+           "so shipping it as the material albedo hands Remix a texture the game does not draw "
+           "with. Super Mario Galaxy's characters are this shape - Mario arrived wearing a 64x64 "
+           "near-white mask while his real 128x256 texture sat unused on a later stage.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP, "Skip environment-map albedo",
            "Take the albedo from a later combiner stage when stage 0's coordinate is generated "

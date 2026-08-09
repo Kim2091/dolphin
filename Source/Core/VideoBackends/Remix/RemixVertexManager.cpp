@@ -1252,6 +1252,29 @@ bool IsIdentityTexMatrix(const float* m)
          m[5] == 1.0f && m[6] == 0.0f && m[7] == 0.0f;
 }
 
+// Whether a TEV stage's COLOUR combiner actually references the texture it has
+// bound. A stage can be texture-ENABLED and still never mention TEXC/TEXA in its
+// arithmetic, in which case the texmap it names contributes nothing to the
+// picture and is the wrong thing to hand Remix as albedo.
+//
+// This is a stronger test than the two coordinate hatches below, which key on
+// what a coordinate is generated FROM - a lit-channel ramp, a normal-sourced env
+// map - and so infer from a side channel what a texture is for. The combiner
+// says outright whether the texture matters.
+//
+// Alpha-only use is deliberately NOT counted. A stage sampling its texture purely
+// for TevAlphaArg::TexAlpha is using it as a mask, and a mask is not the surface
+// colour - which is the exact mistake being corrected here.
+bool StageUsesItsTexture(u32 stage)
+{
+  if (stage >= 16)
+    return false;
+  const auto& cc = bpmem.combiners[stage].colorC;
+  const auto uses = [](u32 arg) { return arg == 8 || arg == 9; };  // TEXC, TEXA
+  return uses(static_cast<u32>(cc.a.Value())) || uses(static_cast<u32>(cc.b.Value())) ||
+         uses(static_cast<u32>(cc.c.Value())) || uses(static_cast<u32>(cc.d.Value()));
+}
+
 // Whether a texture coordinate is generated from the vertex NORMAL, which is how
 // an environment map is addressed: the normal picks the reflection texel.
 bool IsNormalSourcedCoord(u32 coord)
@@ -2240,6 +2263,47 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // Nothing better to fall back on: keep stage 0. A canned reflection as
     // albedo is wrong, but an untextured draw is worse, and the same "lesser of
     // two wrongs" reasoning as the ramp branch applies.
+  }
+  // Stage 0 binds a texture and its combiner NEVER REFERENCES IT. The texmap it
+  // names contributes nothing to the picture, so handing it to Remix as albedo
+  // ships a texture the game does not draw with.
+  //
+  // Super Mario Galaxy's characters are this shape:
+  //   stage 0: lerp(ZERO, C0, RAS) + C0       tm1   <- no TEX anywhere in it
+  //   stage 1: lerp(ZERO, RAS, APREV) + CPREV tm0
+  //   stage 2: lerp(C1, TEX, RAS) + CPREV     tm0   <- the texture is used HERE
+  // so Mario arrived wearing a 64x64 near-white mask (mean 243,243,243) while
+  // his real 128x256 texture sat on tm0 unused. Measured on RMGE01: 3540 draws,
+  // median albedo 4096 -> 16384 texels, largest swap 4096 -> 32768 on 1164 draws.
+  //
+  // This branch is LAST on purpose. It is strictly stronger than the two
+  // coordinate hatches above - they infer a texture's PURPOSE from its
+  // coordinate, while this reads whether it is used at all - so it likely
+  // subsumes both. Those two are narrower and already playtested in-game, and
+  // demoting them now would reopen closed questions. Consolidating is a
+  // follow-up with its own A/B, not a side effect of this change.
+  else if (stage0_textured && g_remix_api->GxUnusedStageAlbedoSkipEnabled() &&
+           !StageUsesItsTexture(0))
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      // The stage has to USE its texture, or we would only be moving the same
+      // mistake one stage along.
+      if (!StageUsesItsTexture(stage))
+        continue;
+      const u32 coord = bpmem.tevorders[stage >> 1].getTexCoord(stage & 1);
+      if (IsNormalSourcedCoord(coord) || IsLitChannelCoord(coord))
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_stage = stage;
+      ++stats.texture_unused_stage_skipped;
+      break;
+    }
+    // No stage uses a texture at all: keep stage 0 rather than dropping
+    // texturing, the same lesser-of-two-wrongs as the branches above.
   }
   const RemixTexture* albedo = nullptr;
   u8 filter_mode = 1;   // MDL Filter::Linear
