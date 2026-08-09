@@ -1194,6 +1194,217 @@ bool IsLitChannelCoord(u32 coord)
   return type == TexGenType::Color0 || type == TexGenType::Color1;
 }
 
+// ---- GX per-vertex lighting ---------------------------------------------
+//
+// Ported from the software renderer's TransformUnit (CalculateLightAttn,
+// LightColor, LightAlpha and TransformColor - TransformUnit.cpp:194-401),
+// which is this tree's reference implementation of the GX lighting pipe.
+//
+// This exists ONLY to serve Color0/Color1 texgen. For the RASTER colour the
+// translator still ships the material colour and lets the path tracer light the
+// surface, which is the right call there. It is the wrong call here: a
+// Color0/Color1 texgen does not consume the lit channel as a colour, it
+// consumes it as an INDEX into a toon ramp. Substituting the raw vertex colour
+// - or white, when the vertex format carries no colour attribute at all -
+// collapses every vertex onto a single texel and the surface renders flat.
+// Wind Waker's characters are the case that exposed this, but it is a whole
+// CLASS of cel-shaded GameCube/Wii titles, not one game's quirk.
+
+float Dot3(const float* a, const float* b)
+{
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// True when the vector had enough length to normalize. The reference divides
+// unconditionally and leans on an == Vec3(0,0,0) test to catch the degenerate
+// case, which a 0/0 NaN slips straight through. A NaN here would leave as a
+// texture coordinate, so report the failure rather than propagate it.
+bool NormalizeChecked(float* v)
+{
+  const float length = std::sqrt(Dot3(v, v));
+  if (!(length > 1e-8f))
+    return false;
+  v[0] /= length;
+  v[1] /= length;
+  v[2] /= length;
+  return true;
+}
+
+float SafeDivide(float n, float d)
+{
+  return (d == 0.0f) ? (n > 0.0f ? 1.0f : 0.0f) : n / d;
+}
+
+// XF register colours - matColor, ambColor and Light::color - are stored with
+// ALPHA in the low byte, i.e. memory order A, B, G, R. Vertex-buffer colours
+// are the other way round, memory order R, G, B, A. Handing one to the other's
+// reader swaps red and blue, and on a ramp lookup that never looks like a
+// colour error, only like the wrong texel.
+void ReadXfRegisterColor(u32 reg, float* out_rgba)
+{
+  out_rgba[0] = static_cast<float>((reg >> 24) & 0xFFu);
+  out_rgba[1] = static_cast<float>((reg >> 16) & 0xFFu);
+  out_rgba[2] = static_cast<float>((reg >> 8) & 0xFFu);
+  out_rgba[3] = static_cast<float>(reg & 0xFFu);
+}
+
+// Attenuation for one light, and normalizes ldir in place the way the caller's
+// diffuse term expects. Mirrors CalculateLightAttn.
+float LightAttenuation(const Light& light, float* ldir, const float* normal,
+                       const LitChannel& chan)
+{
+  switch (chan.attnfunc)
+  {
+  case AttenuationFunc::Spec:
+  {
+    NormalizeChecked(ldir);
+    const float facing =
+        Dot3(ldir, normal) >= 0.0f ? std::max(0.0f, Dot3(light.ddir, normal)) : 0.0f;
+    const float att_len[3] = {1.0f, facing, facing * facing};
+    float dist_attn[3] = {light.distatt[0], light.distatt[1], light.distatt[2]};
+    if (chan.diffusefunc != DiffuseFunc::None)
+      NormalizeChecked(dist_attn);
+    return SafeDivide(std::max(0.0f, Dot3(att_len, light.cosatt)), Dot3(att_len, dist_attn));
+  }
+
+  case AttenuationFunc::Spot:
+  {
+    const float dist2 = Dot3(ldir, ldir);
+    const float dist = std::sqrt(dist2);
+    if (!NormalizeChecked(ldir))
+      return 0.0f;
+    const float spot = std::max(0.0f, Dot3(ldir, light.ddir));
+    const float cos_attn =
+        light.cosatt[0] + (light.cosatt[1] * spot) + (light.cosatt[2] * spot * spot);
+    const float dist_attn =
+        light.distatt[0] + (light.distatt[1] * dist) + (light.distatt[2] * dist2);
+    return SafeDivide(std::max(0.0f, cos_attn), dist_attn);
+  }
+
+  case AttenuationFunc::None:
+  case AttenuationFunc::Dir:
+  default:
+    // A light pointing straight at the surface it is already on has no
+    // direction to offer; the reference substitutes the normal.
+    if (!NormalizeChecked(ldir))
+    {
+      ldir[0] = normal[0];
+      ldir[1] = normal[1];
+      ldir[2] = normal[2];
+    }
+    return 1.0f;
+  }
+}
+
+// The diffuse weight the two accumulators share.
+float DiffuseScale(const LitChannel& chan, float attn, const float* ldir, const float* normal)
+{
+  switch (chan.diffusefunc)
+  {
+  case DiffuseFunc::Sign:
+    return attn * Dot3(ldir, normal);
+  case DiffuseFunc::Clamp:
+    return attn * std::max(0.0f, Dot3(ldir, normal));
+  case DiffuseFunc::None:
+  default:
+    return attn;
+  }
+}
+
+// Mirrors LightColor. Position and normal are MODELVIEW space - GX lights live
+// in view space, so feeding object-space attributes here lights the model in
+// whatever pose the artist modelled it, not the pose it is in.
+void AccumulateLightColor(const Light& light, const float* position, const float* normal,
+                          const LitChannel& chan, float* acc_rgb)
+{
+  float ldir[3] = {light.dpos[0] - position[0], light.dpos[1] - position[1],
+                   light.dpos[2] - position[2]};
+  const float scale = DiffuseScale(chan, LightAttenuation(light, ldir, normal, chan), ldir, normal);
+
+  // Light::color is A, B, G, R in memory order.
+  acc_rgb[0] += static_cast<float>(light.color[3]) * scale;
+  acc_rgb[1] += static_cast<float>(light.color[2]) * scale;
+  acc_rgb[2] += static_cast<float>(light.color[1]) * scale;
+}
+
+// Mirrors LightAlpha, which weights the light's ALPHA byte rather than its RGB.
+void AccumulateLightAlpha(const Light& light, const float* position, const float* normal,
+                          const LitChannel& chan, float& acc_alpha)
+{
+  float ldir[3] = {light.dpos[0] - position[0], light.dpos[1] - position[1],
+                   light.dpos[2] - position[2]};
+  const float scale = DiffuseScale(chan, LightAttenuation(light, ldir, normal, chan), ldir, normal);
+
+  acc_alpha += static_cast<float>(light.color[0]) * scale;
+}
+
+// One XF colour channel's lit result as RGBA in 0..255. Mirrors TransformColor,
+// which computes both channels unconditionally rather than gating on
+// numColorChans - kept that way deliberately, so a game that points a texgen at
+// a channel it never declared still gets the value hardware would have given it.
+void ComputeLitChannel(u32 chan, const float* mv_position, const float* mv_normal,
+                       const float* vertex_rgba, float* out_rgba)
+{
+  const LitChannel& colorchan = xfmem.color[chan];
+  const LitChannel& alphachan = xfmem.alpha[chan];
+
+  float mat_reg[4];
+  ReadXfRegisterColor(xfmem.matColor[chan], mat_reg);
+  float amb_reg[4];
+  ReadXfRegisterColor(xfmem.ambColor[chan], amb_reg);
+
+  float mat[4];
+  for (int i = 0; i < 3; ++i)
+    mat[i] = (colorchan.matsource == MatSource::Vertex) ? vertex_rgba[i] : mat_reg[i];
+  mat[3] = (alphachan.matsource == MatSource::Vertex) ? vertex_rgba[3] : mat_reg[3];
+
+  if (colorchan.enablelighting)
+  {
+    float acc[3];
+    for (int i = 0; i < 3; ++i)
+      acc[i] = (colorchan.ambsource == AmbSource::Vertex) ? vertex_rgba[i] : amb_reg[i];
+
+    const u32 mask = colorchan.GetFullLightMask();
+    for (u32 i = 0; i < 8; ++i)
+    {
+      if (mask & (1u << i))
+        AccumulateLightColor(xfmem.lights[i], mv_position, mv_normal, colorchan, acc);
+    }
+
+    // The (l + (l >> 7)) term maps 0..255 onto a 0..256 multiplier so that a
+    // fully lit channel reproduces the material colour exactly.
+    for (int i = 0; i < 3; ++i)
+    {
+      const int l = std::clamp(static_cast<int>(acc[i]), 0, 255);
+      out_rgba[i] = static_cast<float>((static_cast<int>(mat[i]) * (l + (l >> 7))) >> 8);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < 3; ++i)
+      out_rgba[i] = mat[i];
+  }
+
+  if (alphachan.enablelighting)
+  {
+    float acc = (alphachan.ambsource == AmbSource::Vertex) ? vertex_rgba[3] : amb_reg[3];
+
+    const u32 mask = alphachan.GetFullLightMask();
+    for (u32 i = 0; i < 8; ++i)
+    {
+      if (mask & (1u << i))
+        AccumulateLightAlpha(xfmem.lights[i], mv_position, mv_normal, alphachan, acc);
+    }
+
+    const int l = std::clamp(static_cast<int>(acc), 0, 255);
+    out_rgba[3] = static_cast<float>((static_cast<int>(mat[3]) * (l + (l >> 7))) >> 8);
+  }
+  else
+  {
+    out_rgba[3] = mat[3];
+  }
+}
+
 bool IsTrivialTexGen(const TexGenState& state)
 {
   if (!state.enabled)
@@ -1217,7 +1428,8 @@ bool IsTrivialTexGen(const TexGenState& state)
 // normalized and lets the sampler scale, and so does Remix.
 void GenerateTexCoord(const TexGenState& state, const u8* vertex,
                       const PortableVertexDeclaration& decl, const float* position,
-                      const float* normal, float* out_uv)
+                      const float* normal, const float* mv_position, const float* mv_normal,
+                      float* out_uv)
 {
   float src[3] = {0.0f, 0.0f, 0.0f};
   switch (state.type)
@@ -1225,18 +1437,46 @@ void GenerateTexCoord(const TexGenState& state, const u8* vertex,
   case TexGenType::Color0:
   case TexGenType::Color1:
   {
-    // The channel colour's first two components become the coordinate. Reading
-    // the vertex attribute rather than a lit channel is the same shortcut taken
-    // for the raster colour: the lighting term is the path tracer's job.
-    const int slot = state.type == TexGenType::Color0 ?
-                         (decl.colors[0].enable ? 0 : -1) :
-                         (decl.colors[1].enable ? 1 : (decl.colors[0].enable ? 0 : -1));
-    u32 color = 0xFFFFFFFFu;
-    if (slot >= 0)
-      std::memcpy(&color, vertex + decl.colors[slot].offset, sizeof(u32));
-    // Vertex colours are stored R, G, B, A in memory order.
-    out_uv[0] = static_cast<float>(color & 0xFFu) / 255.0f;
-    out_uv[1] = static_cast<float>((color >> 8) & 0xFFu) / 255.0f;
+    // The LIT channel's R and G become the coordinate - see the note above
+    // ComputeLitChannel for why the lighting has to be evaluated here rather
+    // than deferred to the path tracer like the raster colour is.
+    const u32 chan = state.type == TexGenType::Color0 ? 0u : 1u;
+
+    // A channel may name the vertex as its material or ambient source on a
+    // format that carries no colour for it. White is the benign stand-in and
+    // matches what the rest of this translator assumes for a missing colour.
+    //
+    // Which attribute feeds the channel is VertexSlotForChannel's job, not
+    // `decl.colors[chan]`. The two differ whenever the attributes are not
+    // populated in order: a vertex carrying only colour1 has it redirected to
+    // channel 0 by the hardware, so indexing by channel would read a disabled
+    // attribute and stand white in for a colour that is right there.
+    const int color_slot = VertexSlotForChannel(decl, chan);
+    float vertex_rgba[4] = {255.0f, 255.0f, 255.0f, 255.0f};
+    if (color_slot >= 0)
+    {
+      u32 color = 0xFFFFFFFFu;
+      std::memcpy(&color, vertex + decl.colors[color_slot].offset, sizeof(u32));
+      // Vertex colours are stored R, G, B, A in memory order.
+      vertex_rgba[0] = static_cast<float>(color & 0xFFu);
+      vertex_rgba[1] = static_cast<float>((color >> 8) & 0xFFu);
+      vertex_rgba[2] = static_cast<float>((color >> 16) & 0xFFu);
+      vertex_rgba[3] = static_cast<float>((color >> 24) & 0xFFu);
+    }
+
+    if (!g_remix_api->GxLitChannelTexGenEnabled())
+    {
+      // Pre-fix behaviour: the raw vertex colour stands in for the lit channel,
+      // which reads one texel of the ramp for the whole surface.
+      out_uv[0] = vertex_rgba[0] / 255.0f;
+      out_uv[1] = vertex_rgba[1] / 255.0f;
+      return;
+    }
+
+    float lit[4];
+    ComputeLitChannel(chan, mv_position, mv_normal, vertex_rgba, lit);
+    out_uv[0] = lit[0] / 255.0f;
+    out_uv[1] = lit[1] / 255.0f;
     return;
   }
   case TexGenType::EmbossMap:
@@ -2055,6 +2295,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       ++stats.texgen_nontrivial;
   }
 
+  // A Color0/Color1 texgen turns the lit channel into a texture coordinate, so
+  // those draws - and only those - have to pay for GX lighting per vertex. It
+  // wants MODELVIEW space, which neither branch of the vertex loop below leaves
+  // lying around: the bake branch transforms into it but the skinned branch
+  // deliberately keeps object space, so compute it separately for this purpose.
+  const bool texgen_needs_lighting =
+      texgen.enabled && g_remix_api->GxLitChannelTexGenEnabled() &&
+      (texgen.type == TexGenType::Color0 || texgen.type == TexGenType::Color1);
+  const u32 default_matrix_index =
+      uniform_matrix ? uniform_matrix_index :
+                       static_cast<u32>(g_main_cp_state.matrix_index_a.PosNormalMtxIdx);
+
   // Which XF lights this draw switches on, and what each one means to it. Both
   // live on the referencing CHANNEL rather than on the light, so both are
   // per-draw state and have to be accumulated here: read once at frame end they
@@ -2337,8 +2589,31 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       dst.normal[2] = normal[2];
     }
 
+    // Modelview position and normal, for GX lighting only. The normal defaults
+    // to facing the viewer so an unlit-but-normal-less vertex still lands on a
+    // defined ramp texel rather than whatever the diffuse dot happens to be.
+    float mv_position[3] = {0.0f, 0.0f, 0.0f};
+    float mv_normal[3] = {0.0f, 0.0f, 1.0f};
+    if (texgen_needs_lighting)
+    {
+      u32 lighting_matrix_index = default_matrix_index;
+      if (per_vertex_matrix)
+      {
+        std::memcpy(&lighting_matrix_index, src + decl.posmtx.offset, sizeof(u32));
+        lighting_matrix_index &= 0x3f;
+      }
+
+      const float* const lighting_matrix = &xfmem.posMatrices[lighting_matrix_index * 4];
+      TransformPosition(lighting_matrix, position, mv_position);
+      if (has_normals)
+      {
+        TransformNormal3(NormalMatrixFor(lighting_matrix_index), normal, mv_normal);
+        Normalize(mv_normal);
+      }
+    }
+
     if (texgen.enabled)
-      GenerateTexCoord(texgen, src, decl, position, normal, dst.texcoord);
+      GenerateTexCoord(texgen, src, decl, position, normal, mv_position, mv_normal, dst.texcoord);
     else if (texcoord_components > 0)
       ReadFloats(src + decl.texcoords[texcoord_slot].offset, dst.texcoord, texcoord_components);
 

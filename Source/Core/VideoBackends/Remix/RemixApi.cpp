@@ -960,6 +960,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
   m_gx_ramp_albedo_skip = Config::Get(Config::GFX_REMIX_GX_RAMP_ALBEDO_SKIP);
+  m_gx_lit_channel_texgen = Config::Get(Config::GFX_REMIX_GX_LIT_CHANNEL_TEXGEN);
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_gx_tev_color = Config::Get(Config::GFX_REMIX_GX_TEV_COLOR);
   m_gx_texture_stage = Config::Get(Config::GFX_REMIX_GX_TEXTURE_STAGE);

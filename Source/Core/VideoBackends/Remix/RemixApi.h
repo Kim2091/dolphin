@@ -904,6 +904,7 @@ public:
   // channel named by the stage that actually reads ras.
   bool GxRasChannelEnabled() const { return m_gx_ras_channel; }
   bool GxRampAlbedoSkipEnabled() const { return m_gx_ramp_albedo_skip; }
+  bool GxLitChannelTexGenEnabled() const { return m_gx_lit_channel_texgen; }
   bool UiRasChannelEnabled() const { return m_ui_ras_channel; }
 
   // False submits world draws the console scissored down to nothing, which is
@@ -1600,6 +1601,7 @@ private:
   bool m_gx_light_fix = true;
   bool m_gx_ras_channel = true;
   bool m_gx_ramp_albedo_skip = true;
+  bool m_gx_lit_channel_texgen = true;
   bool m_ui_ras_channel = true;
   bool m_world_scissor_skip = true;
   bool m_trace_colors = false;

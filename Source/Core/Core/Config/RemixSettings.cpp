@@ -520,6 +520,12 @@ const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasC
 // False = stage 0 unconditionally, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_RAMP_ALBEDO_SKIP{
     {System::GFX, "Settings", "RemixGxRampAlbedoSkip"}, true};
+// Evaluate GX per-vertex lighting to produce a Color0/Color1 texture
+// coordinate, instead of substituting the raw vertex colour.
+//
+// False = the raw vertex colour, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_LIT_CHANNEL_TEXGEN{
+    {System::GFX, "Settings", "RemixGxLitChannelTexGen"}, true};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1329,6 +1335,12 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_LIT_CHANNEL_TEXGEN, "Light Color0/Color1 texture coordinates",
+           "Run the console's per-vertex lighting when a texture coordinate is generated from a "
+           "lit colour channel. Such a coordinate is an INDEX into a toon ramp, not a colour, so "
+           "substituting the raw vertex colour collapses every vertex onto one texel and the "
+           "surface renders flat.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_RAMP_ALBEDO_SKIP, "Skip toon-ramp albedo",
            "Take the albedo from a later combiner stage when stage 0's coordinate is generated "
