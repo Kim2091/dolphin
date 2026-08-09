@@ -10,6 +10,8 @@
 
 #include <xxhash.h>
 
+#include "Common/Logging/Log.h"
+
 namespace Remix
 {
 namespace
@@ -153,6 +155,20 @@ void UiRasterizer::Begin(u32 width, u32 height)
   m_height = height;
   m_touched.store(false, std::memory_order_relaxed);
   m_draw_count = 0;
+  // The texel arena is per-frame: the slots keep their allocations, but every
+  // entry has to be re-copied because the source textures may have changed under
+  // us since. Clearing the map is what makes a stale source pointer from last
+  // frame unable to alias a slot in this one.
+  m_texel_count = 0;
+  m_texel_slots.clear();
+  if (m_short_texture_draws != 0)
+  {
+    WARN_LOG_FMT(VIDEO,
+                 "Remix UI: {} draw(s) last frame declared a texture larger than its buffer and "
+                 "were drawn untextured. This is a texture-upload bug, not a sampler one.",
+                 m_short_texture_draws);
+    m_short_texture_draws = 0;
+  }
   // Per-frame like everything else here: the caller re-decides it before each
   // Flush, from that frame's own world-draw count.
   m_pre_world_filter = false;
@@ -452,6 +468,8 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
   const u32 flat_b = static_cast<u32>(std::clamp(a.color[2], 0.0f, 1.0f) * 255.0f + 0.5f);
   const u32 flat_a = static_cast<u32>(std::clamp(a.color[3], 0.0f, 1.0f) * 255.0f + 0.5f);
   const bool white = flat_color && flat_r == 255 && flat_g == 255 && flat_b == 255 && flat_a == 255;
+  // A short buffer is rejected once at record time (see Draw), which nulls the
+  // pointer, so reaching here textured means Sample's indexing is in bounds.
   const bool textured = call.texture.pixels != nullptr && call.texture.width != 0 &&
                         call.texture.height != 0;
   // Nothing to contribute at all: an untextured, fully transparent draw still
@@ -687,6 +705,48 @@ void UiRasterizer::Draw(const DrawCall& call, const std::vector<Vertex>& vertice
     m_draws.emplace_back();
   RecordedDraw& draw = m_draws[m_draw_count++];
   draw.call = call;
+  // Sample indexes up to (width*height - 1)*4, so a buffer shorter than the
+  // dimensions claim is an out-of-bounds read. Reject it here, once, on the
+  // recording thread: RasterizeBand runs on worker threads, so counting this
+  // per-triangle over there would be a data race. Drawing untextured is a
+  // visible, survivable wrong result; over-reading is neither.
+  if (call.texture.pixels != nullptr && call.texture.width != 0 && call.texture.height != 0 &&
+      call.texture.pixels_size <
+          static_cast<size_t>(call.texture.width) * call.texture.height * 4)
+  {
+    ++m_short_texture_draws;
+    draw.call.texture.pixels = nullptr;
+  }
+  // Otherwise take our own copy of the texels. The caller's buffer belongs to
+  // the texture cache and is only guaranteed for the duration of this call, but
+  // the draw is not rasterized until Flush - so a texture evicted or re-Loaded
+  // (which reallocates) in between left this pointer dangling, and the replay
+  // read freed memory. See m_texels.
+  else if (call.texture.pixels != nullptr && call.texture.pixels_size != 0)
+  {
+    size_t slot;
+    // Keyed on the content hash, never on the source pointer: the cache can
+    // free one texture and allocate another at the same address inside a single
+    // frame, and a same-size neighbour would then be handed the first one's
+    // copy. A zero hash means the caller had none to give, so that draw always
+    // takes a fresh copy rather than risk matching another hashless one.
+    const u64 key = call.texture.content_hash;
+    const auto it = key != 0 ? m_texel_slots.find(key) : m_texel_slots.end();
+    if (it != m_texel_slots.end() && m_texels[it->second].size() == call.texture.pixels_size)
+    {
+      slot = it->second;
+    }
+    else
+    {
+      if (m_texel_count == m_texels.size())
+        m_texels.emplace_back();
+      slot = m_texel_count++;
+      m_texels[slot].assign(call.texture.pixels, call.texture.pixels + call.texture.pixels_size);
+      if (key != 0)
+        m_texel_slots[key] = slot;
+    }
+    draw.call.texture.pixels = m_texels[slot].data();
+  }
   if (call.depth_test)
     m_depth_used = true;
   // assign onto the existing storage: these vectors are recycled frame to frame

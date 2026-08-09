@@ -3043,6 +3043,9 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     call.texture.pixels = texture->GetPixels().data();
     // Identity for the unchanged-frame cache; the pointer above is not one.
     call.texture.content_hash = texture->GetContentHash();
+    // Carried explicitly so the rasterizer can check the buffer against the
+    // dimensions rather than trusting width*height*4 to be readable.
+    call.texture.pixels_size = texture->GetPixels().size();
     call.texture.width = texture->GetWidth();
     call.texture.height = texture->GetHeight();
     // GX TexMode0 filter: 0 = near, anything else is some flavour of linear.
