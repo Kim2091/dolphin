@@ -28,7 +28,8 @@ struct DrawKey
   u32 tex_width;
   u32 tex_height;
   // bilinear, clamp_u, clamp_v, blend mode, tev_alpha_known, depth_test,
-  // depth_write, tag_protected - one bit or nibble each.
+  // depth_write, tag_protected, additive_light_coverage - one bit or nibble
+  // each.
   u32 flags;
   // alpha_compare | alpha_compare1 << 8 | alpha_logic << 16 | depth_func << 24.
   u32 compares;
@@ -647,15 +648,31 @@ void UiRasterizer::DrawTriangle(const DrawCall& call, const Vertex& a, const Ver
         // this code never sees. Accumulating colour and coverage is the closest
         // a single layer gets, and it reads correctly for the glows and flashes
         // that actually use it.
+        //
+        // Coverage is the part that cannot come from source alpha. This buffer
+        // is composited straight-alpha over the traced frame, so its alpha says
+        // how much of that frame is REPLACED - and an additive draw replaces
+        // nothing. Its alpha is the weight of the addition, not an occlusion.
+        // Charging coverage to it turns a texel that adds black, which is
+        // invisible on console, into an opaque black one here. Skyward Sword's
+        // full-screen bloom pass (SRC_ALPHA/One, TEV alpha 1.0, mostly black)
+        // blacked out the entire game that way.
+        //
+        // The brightest channel added is what the draw is worth: black takes no
+        // coverage and lets the scene through, a white flash takes all of it and
+        // reads exactly as before.
         const u32 dest = target;
         u32 result = 0;
+        u32 added_max = 0;
         for (int shift = 0; shift < 24; shift += 8)
         {
-          const u32 sum = ((dest >> shift) & 0xFF) +
-                          MulDiv255((source >> shift) & 0xFF, source_alpha);
+          const u32 added = MulDiv255((source >> shift) & 0xFF, source_alpha);
+          added_max = std::max(added_max, added);
+          const u32 sum = ((dest >> shift) & 0xFF) + added;
           result |= std::min(sum, 255u) << shift;
         }
-        target = result | (std::min((dest >> 24) + source_alpha, 255u) << 24);
+        const u32 coverage = call.additive_light_coverage ? added_max : source_alpha;
+        target = result | (std::min((dest >> 24) + coverage, 255u) << 24);
         break;
       }
       case BlendMode::Over:
@@ -780,7 +797,11 @@ void UiRasterizer::Draw(const DrawCall& call, const std::vector<Vertex>& vertice
   key.flags = (call.texture.bilinear ? 1u : 0u) | (call.texture.clamp_u ? 2u : 0u) |
               (call.texture.clamp_v ? 4u : 0u) | (call.tev_alpha_known ? 8u : 0u) |
               (call.depth_test ? 16u : 0u) | (call.depth_write ? 32u : 0u) |
-              (call.tag_protected ? 64u : 0u) | (static_cast<u32>(call.blend) << 8);
+              (call.tag_protected ? 64u : 0u) |
+              // Changes the pixels an Additive draw produces, and comes from a
+              // Live knob rather than from the draw, so a frame that differs
+              // only by this must not be served from the cache.
+              (call.additive_light_coverage ? 128u : 0u) | (static_cast<u32>(call.blend) << 8);
   key.compares = static_cast<u32>(call.alpha_compare) | (static_cast<u32>(call.alpha_compare1) << 8) |
                  (static_cast<u32>(call.alpha_logic) << 16) |
                  (static_cast<u32>(call.depth_func) << 24);

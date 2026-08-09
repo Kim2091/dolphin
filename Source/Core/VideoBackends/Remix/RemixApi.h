@@ -1825,6 +1825,12 @@ private:
   // same argument). Off zeroes the depth fields in every recorded DrawCall, so
   // the rasterizer runs the pure painter's algorithm it always ran.
   bool m_ui_depth = true;
+  // Charge an additive 2D draw's overlay coverage to the light it adds rather
+  // than to its source alpha (RemixUiAdditiveLightCoverage). Per-draw-consumed
+  // like the depth fields, so Live for the same A/B reason: a game blacked out
+  // by a full-screen additive pass is diagnosed by flipping this, not by a
+  // rebuild.
+  bool m_ui_additive_light_coverage = true;
   // The click-to-tag world view (RemixUiWorldView), Live for the same reason:
   // flip on to tag, off to play, no restart.
   bool m_ui_world_view = false;

@@ -163,6 +163,14 @@ public:
     // CompareMode numbering, Never = 0 .. Always = 7, same as the alpha test.
     u8 depth_func = 7;
     bool depth_write = false;
+
+    // Additive draws only. Take the coverage this draw writes into the overlay's
+    // alpha channel from the light it actually adds, rather than from its source
+    // alpha. Additive blending hides nothing on console, so a texel adding black
+    // must stay invisible here too; source alpha is the WEIGHT of the addition,
+    // not a statement about how much of the frame behind it is gone. False is
+    // the old behaviour, kept as a same-build A/B.
+    bool additive_light_coverage = true;
   };
 
   UiRasterizer();

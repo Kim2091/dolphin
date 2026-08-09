@@ -1097,6 +1097,35 @@ const Info<bool> GFX_REMIX_UI_STRICT{{System::GFX, "Settings", "RemixUiStrict"},
 // as before, so False here is the pre-fix painter's algorithm, byte for byte.
 const Info<bool> GFX_REMIX_UI_DEPTH{{System::GFX, "Settings", "RemixUiDepth"}, true};
 
+// Take an additive 2D draw's overlay coverage from the light it actually adds,
+// not from its source alpha.
+//
+// The overlay is composited over the traced frame with straight alpha, so its
+// alpha channel is COVERAGE - how much of the traced pixel this layer replaces.
+// Additive blending has no coverage of its own: on console the draw adds
+// `src_rgb * src_alpha` to the framebuffer and hides nothing, so a texel that
+// adds black is invisible no matter what its alpha says. Charging coverage to
+// source alpha therefore makes a black additive texel fully OPAQUE and BLACK.
+//
+// Skyward Sword is the extreme case. Its bloom composite is a full-screen
+// SRC_ALPHA/ONE quad whose TEV chain resolves alpha to 1.0 over a mostly black
+// texture, so the whole 608x456 image was stamped opaque black over the scene -
+// the game rendered as a black screen with only the HUD visible. The two
+// existing levers cannot reach it: the pre-world filter needs a frame with no
+// world geometry (this arrives after ~980 world draws) and the full-screen
+// opaque filter needs blending off or One/Zero (this is SRC_ALPHA/One). It was
+// measured firing three times a frame while the screen stayed black.
+//
+// Coverage becomes max(added_r, added_g, added_b), the brightest channel the
+// draw contributes. Black adds nothing and takes no coverage, so the traced
+// scene survives; a bright flash still adds and still covers, unchanged. Dim
+// glows get proportionally more transparent, which is the same correction in
+// the small - previously they punched a near-black hole in the scene.
+//
+// False = charge coverage to source alpha, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE{
+    {System::GFX, "Settings", "RemixUiAdditiveLightCoverage"}, true};
+
 // Show the game's whole 2D layer as world geometry instead of compositing it.
 //
 // This is the click-to-tag view, and it used to be automatic: opening the
@@ -1595,6 +1624,15 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "submits its HUD background after its text and lets the z test sort them, so without "
            "this the background paints over the text. Ordinary 2D draws have the test off and are "
            "untouched. Off restores the pure painter's algorithm.",
+           Group::UiOverlay, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE, "Additive 2D draws cover by the light they add",
+           "Let an additive 2D draw hide the traced scene only as much as it brightens it. "
+           "Additive blending adds light and hides nothing, so a texel adding black is invisible "
+           "on console however opaque its alpha claims to be - charging coverage to that alpha "
+           "paints it as solid black instead. Skyward Sword's full-screen bloom pass did exactly "
+           "that and rendered the game as a black screen with only the HUD showing. Bright "
+           "flashes and glows are unchanged; dim ones stop punching dark holes in the scene. Off "
+           "restores the previous behaviour.",
            Group::UiOverlay, Liveness::Live),
     Toggle(&GFX_REMIX_UI_WORLD_VIEW, "Show the 2D layer in the world (tagging view)",
            "Turn the game's whole 2D layer into clickable world geometry so elements can be "

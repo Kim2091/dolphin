@@ -3617,6 +3617,11 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // composite in submission order, exactly as they did before the plane
   // existed - no tagged HUD measured so far z-tests meaningfully (RE4: ztest 0
   // on all nine).
+  // Additive coverage rule, stamped per draw for the same reason the depth
+  // fields are: the rasterizer stays a pure function of the DrawCall and never
+  // learns a knob exists.
+  call.additive_light_coverage = m_ui_additive_light_coverage;
+
   if (m_ui_depth && blend.depth_test && !perspective)
   {
     call.depth_test = true;
@@ -6122,6 +6127,10 @@ void RemixApi::RefreshLiveConfig()
   // DrawCall), so live for the same A/B reason: on-vs-off is how a wrong-order
   // HUD is diagnosed without a restart.
   m_ui_depth = Config::Get(Config::GFX_REMIX_UI_DEPTH);
+  // Stamped into every recorded DrawCall, so live for the same reason the depth
+  // fields are: on-vs-off is the whole diagnosis for a scene hidden behind an
+  // additive full-screen pass.
+  m_ui_additive_light_coverage = Config::Get(Config::GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE);
   // The tagging view has to be live or it is useless: flip on, click, flip off.
   m_ui_world_view = Config::Get(Config::GFX_REMIX_UI_WORLD_VIEW);
   // The quarter-screen fixes. Both are consumed per draw against state learned

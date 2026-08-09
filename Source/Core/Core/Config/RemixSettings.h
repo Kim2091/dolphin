@@ -90,6 +90,7 @@ extern const Info<bool> GFX_REMIX_UI_DROP_PRE_WORLD;
 extern const Info<bool> GFX_REMIX_UI_DROP_FULL_SCREEN_OPAQUE;
 extern const Info<bool> GFX_REMIX_UI_STRICT;
 extern const Info<bool> GFX_REMIX_UI_DEPTH;
+extern const Info<bool> GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE;
 extern const Info<bool> GFX_REMIX_UI_WORLD_VIEW;
 extern const Info<bool> GFX_REMIX_UI_OVERLAY_CAP;
 extern const Info<bool> GFX_REMIX_UI_FRAME_CACHE;
@@ -97,7 +98,7 @@ extern const Info<bool> GFX_REMIX_UI_FRAME_CACHE;
 // Must equal the number of extern Info<> declarations above. The metadata table
 // in RemixSettings.cpp static_asserts against this; if you add a knob, add its
 // table row or the build breaks.
-inline constexpr size_t kRemixSettingCount = 80;
+inline constexpr size_t kRemixSettingCount = 81;
 
 // One row per knob: how to edit it, where it belongs, whether it can be changed
 // while a game is running, and what it is for in plain language.
