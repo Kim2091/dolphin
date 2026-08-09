@@ -655,13 +655,15 @@ enum RemixEnvVar : size_t
 // same outcome with a log line attached.
 constexpr size_t MAX_ENV_VALUE_LENGTH = MAX_PATH - 1;
 
-// Whether each variable already carried a value before Dolphin touched it, and
-// whether we have set any of them in this process. An externally-set value is
-// left alone - someone who exports DXVK_LOG_PATH before launching Dolphin means
-// it - and a variable we set is cleared again if the option is later turned off,
-// so a second game cannot inherit the first game's folders.
-bool s_env_probed = false;
-bool s_env_external[REMIX_ENV_VAR_COUNT] = {};
+// Whether we have set any of these variables in this process. There is
+// deliberately NO "respect a value that was already set" courtesy here, and
+// there must never be one again: the per-game restart
+// (MainWindow::MaybeRestartForRemix) relaunches Dolphin after every game, and
+// a child process inherits its parent's environment - so a value found at
+// startup is indistinguishable from the previous game's leftovers. When such
+// values were honoured, a freshly restarted Dolphin booted Super Mario Galaxy
+// against SpongeBob's rtx.conf. These five variables are Dolphin's per-game
+// contract with the runtime; Dolphin owns them outright, every boot.
 bool s_env_applied = false;
 
 std::string EnvVarName(size_t index)
@@ -675,38 +677,11 @@ bool EnvValueFits(const std::string& value)
          UTF8ToWString(value).size() <= MAX_ENV_VALUE_LENGTH;
 }
 
-void ProbeEnvironmentOnce()
-{
-  if (s_env_probed)
-    return;
-  s_env_probed = true;
-
-  for (size_t i = 0; i < REMIX_ENV_VAR_COUNT; ++i)
-  {
-    // With no buffer, the return is the size the value would need INCLUDING its
-    // terminator, so 1 means present but empty and 0 means absent. Empty counts
-    // as absent here because that is what it means to the runtime too - its own
-    // reader falls straight through to the default path on an empty string.
-    s_env_external[i] = GetEnvironmentVariableW(REMIX_ENV_VARS[i], nullptr, 0) > 1;
-    if (s_env_external[i])
-    {
-      INFO_LOG_FMT(VIDEO,
-                   "Remix: {} was already set before Dolphin started; leaving it alone, so this "
-                   "game's own Remix folder is not used for it",
-                   EnvVarName(i));
-    }
-  }
-}
-
-// Sets one of the four, unless it came from outside this process. Returns false
-// without setting anything if the value cannot survive the runtime's MAX_PATH
-// read, since a silent fallback to the shared files is exactly what this whole
-// feature exists to prevent.
+// Sets one of the five. Returns false without setting anything if the value
+// cannot survive the runtime's MAX_PATH read, since a silent fallback to the
+// shared files is exactly what this whole feature exists to prevent.
 bool SetRuntimeEnvVar(size_t index, const std::string& value)
 {
-  if (s_env_external[index])
-    return false;
-
   if (!EnvValueFits(value))
   {
     ERROR_LOG_FMT(VIDEO,
@@ -807,10 +782,7 @@ size_t CountHashListEntries(const std::string& conf_path, size_t& lists_out)
 void ClearRuntimeEnvVars()
 {
   for (size_t i = 0; i < REMIX_ENV_VAR_COUNT; ++i)
-  {
-    if (!s_env_external[i])
-      SetEnvironmentVariableW(REMIX_ENV_VARS[i], nullptr);
-  }
+    SetEnvironmentVariableW(REMIX_ENV_VARS[i], nullptr);
   s_env_applied = false;
 }
 
@@ -857,28 +829,29 @@ std::string ResolveRuntimeDllPath()
 // is loaded.
 void ConfigureRuntimePaths()
 {
-  ProbeEnvironmentOnce();
-
   if (!Config::Get(Config::GFX_REMIX_PER_GAME_PATHS))
   {
     // Booting one game with separation on and then another with it off would
     // otherwise leave the second game reading the first game's folders: these
-    // variables are process-wide and outlive a game.
+    // variables are process-wide and outlive a game - and they even outlive
+    // the process, riding into a relaunched Dolphin as inherited environment.
+    // So clear unconditionally; s_env_applied only knows what THIS process set.
     if (s_env_applied)
     {
-      ClearRuntimeEnvVars();
       INFO_LOG_FMT(VIDEO, "Remix: per-game files are off; runtime paths reset to the shared ones "
                           "next to Dolphin.exe");
     }
+    ClearRuntimeEnvVars();
     return;
   }
 
-  // Drop whatever a previous game in this session left set, BEFORE working this
-  // game's paths out. Any of the early returns below would otherwise leave the
-  // previous game's folders in place for this one - which is the exact failure
-  // this feature exists to prevent, arrived at from the other direction.
-  if (s_env_applied)
-    ClearRuntimeEnvVars();
+  // Drop whatever is currently set, BEFORE working this game's paths out -
+  // whether this process set it for a previous game, or the Dolphin that
+  // relaunched us set it and we inherited it. Any of the early returns below
+  // would otherwise leave the previous game's folders in place for this one -
+  // which is the exact failure this feature exists to prevent, arrived at from
+  // the other direction.
+  ClearRuntimeEnvVars();
 
   const std::string game_id = SConfig::GetInstance().GetGameID();
   const RemixPaths::GamePaths paths = RemixPaths::ForGame(game_id);
@@ -1049,22 +1022,25 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   const std::wstring dll_path = UTF8ToWString(dll_path_utf8);
 
   // Before the load, and only before it: the runtime resolves its file system
-  // from the environment inside Direct3DCreate9, under a ONCE(), and then
-  // refuses to re-initialize it.
+  // from the environment inside Direct3DCreate9. Older runtimes did that once,
+  // under a run-once guard, and refused to redo it; runtimes with the
+  // resident-refresh fix (2026-08-08) re-resolve whenever these env values
+  // change - which is why they must be set before EVERY game, not just the
+  // first.
   ConfigureRuntimePaths();
 
-  // Which is also why a runtime that is ALREADY resident ignores everything set
-  // above: it resolves its config layers and file paths once, on load, and
-  // refuses to redo them. Two ways that happens, and the log has to distinguish
-  // them because the fixes differ:
+  // A runtime that is ALREADY resident historically ignored everything set
+  // above: it resolved its config layers and file paths once, on load, under a
+  // run-once guard. Runtimes built 2026-08-08 or later re-resolve both when
+  // the env vars change between games (the resident-refresh fix), so for them
+  // this is informational; for older runtimes it is the per-game-paths bug.
+  // Dolphin cannot query which kind is loaded - there is no API for it - so
+  // the log states the version dependence and the one tell that settles it:
+  // whether the runtime's own log shows it re-reading this game's rtx.conf.
   //
-  //  - The file is named d3d9.dll, so Qt's platform plugin pulled it in at
-  //    startup. Permanent, affects every boot, fixed by renaming the file.
-  //  - It stayed resident from an earlier game in this session because something
-  //    holds a reference past Shutdown's FreeLibrary. Fixed by restarting.
-  //
-  // Either way per-game files silently do not apply, which is exactly the bug
-  // this feature exists to prevent, so it must not pass quietly.
+  // The d3d9.dll case is still a real misconfiguration on EVERY runtime: Qt's
+  // platform plugin imports that name at startup, before any per-game env is
+  // set, and the first resolve then happens against no environment at all.
   if (s_env_applied)
   {
     const HMODULE resident = GetModuleHandleW(dll_path.c_str());
@@ -1074,11 +1050,12 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
       GetModuleFileNameW(resident, resident_path, static_cast<DWORD>(std::size(resident_path)));
 
       WARN_LOG_FMT(VIDEO,
-                   "Remix: '{}' was already loaded before this game started, so the per-game "
-                   "folders set up above are NOT in effect - the runtime is still using whatever "
-                   "it resolved at load time. If that file is named d3d9.dll, Qt's platform plugin "
-                   "loaded it during startup and renaming it is the fix; otherwise it survived a "
-                   "previous game in this session and restarting Dolphin is.",
+                   "Remix: '{}' was already loaded before this game started. A runtime built "
+                   "2026-08-08 or later re-resolves the per-game folders set up above on its own "
+                   "(its log will show it rebuilding config layers for this game); an older "
+                   "runtime keeps whatever it resolved at load time, and restarting Dolphin is "
+                   "the fix. If that file is named d3d9.dll, Qt's platform plugin loaded it "
+                   "during startup and renaming it is the fix on every runtime version.",
                    WStringToUTF8(resident_path));
     }
   }
