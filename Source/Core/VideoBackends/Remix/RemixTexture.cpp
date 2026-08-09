@@ -59,6 +59,15 @@ void RemixTexture::Load(u32 level, u32 width, u32 height, u32 row_length, const 
   // are astronomical, but keep it deterministic.
   if (m_content_hash == 0)
     m_content_hash = 0xD6E8FEB86659FD93ULL;
+  // Cheapest possible answer to "can this texture's alpha mask anything?".
+  // A GX format with no alpha - or a palette whose TLUT has none - decodes to
+  // alpha 255 everywhere, and any blend or cutout keyed on source alpha is then
+  // a no-op. That is invisible from the format alone once the decode has
+  // happened, and guessing it wrong cost a playtest round on Wind Waker's eyes.
+  m_min_alpha = 255;
+  for (size_t i = 3; i < m_pixels.size(); i += 4)
+    m_min_alpha = std::min(m_min_alpha, m_pixels[i]);
+
   m_has_data = true;
 }
 

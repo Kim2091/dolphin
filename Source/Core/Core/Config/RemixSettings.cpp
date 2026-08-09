@@ -526,6 +526,12 @@ const Info<bool> GFX_REMIX_GX_RAMP_ALBEDO_SKIP{
 // False = the raw vertex colour, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_LIT_CHANNEL_TEXGEN{
     {System::GFX, "Settings", "RemixGxLitChannelTexGen"}, true};
+// Handle the EFB-alpha-mask idiom: drop the colour-less pass that primes the
+// mask, and give the masked pass that follows the shape the mask encoded.
+//
+// False = the priming pass renders as opaque geometry, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_EFB_ALPHA_PASSES{
+    {System::GFX, "Settings", "RemixGxEfbAlphaPasses"}, true};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1335,6 +1341,13 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "whose first stage samples nothing. Wind Waker's sea samples its water texture on stage "
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_EFB_ALPHA_PASSES, "EFB alpha mask passes",
+           "Handle the two-pass EFB-alpha-mask idiom. A game primes a per-pixel stencil in the "
+           "framebuffer alpha with a colour-less pass, then blends against it. There is no "
+           "destination alpha here to honour, so the priming pass is dropped and the pass that "
+           "follows is cut to the mask instead - by its own source alpha where they share a "
+           "texture, or by combining the two where they do not.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_LIT_CHANNEL_TEXGEN, "Light Color0/Color1 texture coordinates",
            "Run the console's per-vertex lighting when a texture coordinate is generated from a "

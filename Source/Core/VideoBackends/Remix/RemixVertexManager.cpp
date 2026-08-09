@@ -525,6 +525,42 @@ u8 ToVkDstFactor(DstBlendFactor factor)
 // when a colour factor is asked of the alpha equation. Straight out of
 // RenderState.cpp:78-108, and load-bearing: leaving DstAlpha in place on an
 // RGB8 target makes the runtime read a blend mode the console never performed.
+// Stand the SOURCE alpha in for a destination-alpha factor. There is no
+// destination alpha channel on this backend to honour, but a game using the
+// EFB-alpha-mask idiom primes that alpha in an earlier, colour-less pass drawing
+// the SAME geometry with the SAME texture - so the mask it blends against is
+// that texture's own alpha, and feeding the source alpha reproduces the shape
+// the mask encoded using data we still have.
+//
+// Wind Waker's eyes and eyebrows: with the mask gone their quad covered Link's
+// face in the eye texture's black surround; with this, the texture's alpha cuts
+// it back to the eye shape.
+SrcBlendFactor DstAlphaAsSrcAlpha(SrcBlendFactor factor)
+{
+  switch (factor)
+  {
+  case SrcBlendFactor::DstAlpha:
+    return SrcBlendFactor::SrcAlpha;
+  case SrcBlendFactor::InvDstAlpha:
+    return SrcBlendFactor::InvSrcAlpha;
+  default:
+    return factor;
+  }
+}
+
+DstBlendFactor DstAlphaAsSrcAlpha(DstBlendFactor factor)
+{
+  switch (factor)
+  {
+  case DstBlendFactor::DstAlpha:
+    return DstBlendFactor::SrcAlpha;
+  case DstBlendFactor::InvDstAlpha:
+    return DstBlendFactor::InvSrcAlpha;
+  default:
+    return factor;
+  }
+}
+
 SrcBlendFactor RemoveDstAlphaUsage(SrcBlendFactor factor)
 {
   switch (factor)
@@ -1020,6 +1056,29 @@ u32 ApplyTevColorFold(const TevColorFold& fold, u32 color)
   return out;
 }
 
+// The mask a colour-less pass primed the EFB alpha with, for the colour pass
+// that follows to be cut to. Deliberately not cleared per frame: the only thing
+// that consumes it is a draw blending on destination alpha whose own albedo is
+// opaque and the same size, which is the idiom itself and nothing else.
+//
+// The PIXELS are copied rather than the texture borrowed. The priming pass and
+// the colour pass are different draws, and the texture cache is free to evict
+// the mask in between - a borrowed pointer here would be read after free, which
+// is the same defect the UI rasterizer's texel arena exists to prevent. One
+// mask per frame, so the copy is not worth avoiding.
+std::vector<u8> s_pending_alpha_mask_pixels;
+u32 s_pending_alpha_mask_width = 0;
+u32 s_pending_alpha_mask_height = 0;
+u64 s_pending_alpha_mask_hash = 0;
+// ...and the frame it was primed in. A mask is only meaningful to draws in the
+// SAME frame: the EFB alpha it stands for is cleared between frames on console,
+// so letting one survive into the next frame would let an unrelated object be
+// cut to the shape of whatever was masked last frame.
+// u64 to match FrameIndex(). Narrowing it to u32 would let frame N and frame
+// N + 2^32 compare equal, which is the one comparison this guard exists to get
+// right.
+u64 s_pending_alpha_mask_frame = ~0ull;
+
 void ResolveBlend(DrawBlendState& out, FrameStats& stats)
 {
   const BlendMode& mode = bpmem.blendmode;
@@ -1056,6 +1115,17 @@ void ResolveBlend(DrawBlendState& out, FrameStats& stats)
     {
       src = RemoveDstAlphaUsage(src);
       dst = RemoveDstAlphaUsage(dst);
+    }
+    else if (g_remix_api->GxEfbAlphaPassesEnabled() &&
+             (src == SrcBlendFactor::DstAlpha || src == SrcBlendFactor::InvDstAlpha ||
+              dst == DstBlendFactor::DstAlpha || dst == DstBlendFactor::InvDstAlpha))
+    {
+      // The target HAS an alpha channel, so the hardware kept the destination-
+      // alpha factor - and we have no such channel to honour it with. Stand the
+      // source's own alpha in for the mask; see DstAlphaAsSrcAlpha.
+      src = DstAlphaAsSrcAlpha(src);
+      dst = DstAlphaAsSrcAlpha(dst);
+      ++stats.dst_alpha_substituted;
     }
     // The alpha equation cannot reference a colour, and note the crossover: the
     // SOURCE factor loses its destination-colour term and vice versa.
@@ -1798,6 +1868,19 @@ UiPlacement ComputeUiPlacement()
 }
 }  // namespace
 
+void ResetPendingAlphaMask()
+{
+  // shrink_to_fit as well as clear: a mask is a full decoded image, and holding
+  // that capacity for a game that is no longer running is the same waste the
+  // masked-albedo cache is cleared to avoid.
+  s_pending_alpha_mask_pixels.clear();
+  s_pending_alpha_mask_pixels.shrink_to_fit();
+  s_pending_alpha_mask_width = 0;
+  s_pending_alpha_mask_height = 0;
+  s_pending_alpha_mask_hash = 0;
+  s_pending_alpha_mask_frame = ~0ull;
+}
+
 VertexManager::VertexManager() = default;
 
 VertexManager::~VertexManager() = default;
@@ -1968,6 +2051,45 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       bpmem.alpha_test.TestResult() == AlphaTestResult::Fail)
   {
     ++stats.skipped_invisible;
+    return;
+  }
+
+  // The MASK-PRIMING half of the EFB-alpha-mask idiom, which the rule above lets
+  // through whenever the target has an alpha channel. A game wanting a per-pixel
+  // stencil first draws with colour writes OFF to prime the EFB's alpha, then
+  // draws again blending against that alpha. The priming pass puts no colour on
+  // screen on console - that is the whole point of it - but the test above
+  // demands a draw write neither colour NOR alpha, so on an RGBA6_Z24 target
+  // (which is exactly what such a game selects, because it needs the alpha) the
+  // priming pass survived and was submitted as opaque geometry.
+  //
+  // Wind Waker's Link is the case this exists for: measured from the game's own
+  // command stream, its head texture is drawn colour_update=false /
+  // alpha_update=true, 18 draws a frame, and that is what painted a solid black
+  // bar across his eyes and eyebrows.
+  //
+  // The masked pass that follows is NOT dropped - dropping it removed Link's
+  // eyes altogether, because it carries colour_update TRUE and is what actually
+  // paints them. It is instead re-based onto the source's own alpha, in
+  // ResolveBlend; see DstAlphaAsSrcAlpha.
+  if (g_remix_api->GxEfbAlphaPassesEnabled() && !writes_colour)
+  {
+    // Remember what this pass primed the mask WITH before dropping it. When the
+    // colour pass that follows carries an opaque texture of its own, this is the
+    // only place the shape it should take exists.
+    if (bpmem.tevorders[0].getEnable(0) != 0)
+    {
+      const RemixTexture* mask = g_remix_api->GetBoundTexture(bpmem.tevorders[0].getTexMap(0));
+      if (mask != nullptr && mask->HasData() && mask->MinAlpha() < 255)
+      {
+        s_pending_alpha_mask_pixels = mask->GetPixels();
+        s_pending_alpha_mask_width = mask->GetWidth();
+        s_pending_alpha_mask_height = mask->GetHeight();
+        s_pending_alpha_mask_hash = mask->GetContentHash();
+        s_pending_alpha_mask_frame = g_remix_api->FrameIndex();
+      }
+    }
+    ++stats.skipped_alpha_only;
     return;
   }
 
@@ -2195,6 +2317,42 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       stage0_textured ? g_remix_api->GetBoundTexture(stage0_texmap) : nullptr;
   const u64 stage0_texture_hash =
       stage0_texture != nullptr ? stage0_texture->GetContentHash() : 0;
+
+  // The EFB-alpha-mask idiom, completed. A colour-less pass just primed a mask
+  // using a texture that HAS alpha, and this draw blends against that mask while
+  // its own texture is fully opaque - so the shape it is supposed to take exists
+  // only in the mask. Combine them, because a material here can carry opacity
+  // nowhere except in its albedo's alpha.
+  //
+  // Wind Waker's eyebrows never reach this: their mask and their colour are the
+  // same texture, so the rebase in ResolveBlend already finds the shape and
+  // MinAlpha() is 0. Its eyes do, because the two are different textures.
+  //
+  // Computed AFTER stage0_texture_hash deliberately - that hash is an identity
+  // decision (the sky list keys on it) and must keep naming the game's own
+  // texture, not a combination this backend invented.
+  if (!s_pending_alpha_mask_pixels.empty() &&
+      s_pending_alpha_mask_frame == g_remix_api->FrameIndex() && albedo != nullptr &&
+      albedo->MinAlpha() == 255 && g_remix_api->GxEfbAlphaPassesEnabled() &&
+      bpmem.blendmode.blend_enable &&
+      (bpmem.blendmode.src_factor == SrcBlendFactor::DstAlpha ||
+       bpmem.blendmode.src_factor == SrcBlendFactor::InvDstAlpha ||
+       bpmem.blendmode.dst_factor == DstBlendFactor::DstAlpha ||
+       bpmem.blendmode.dst_factor == DstBlendFactor::InvDstAlpha))
+  {
+    if (const RemixTexture* masked = g_remix_api->MaskedAlbedo(
+            *albedo, s_pending_alpha_mask_pixels, s_pending_alpha_mask_width,
+            s_pending_alpha_mask_height, s_pending_alpha_mask_hash))
+    {
+      albedo = masked;
+      ++stats.dst_alpha_masked;
+    }
+    // The mask is deliberately NOT cleared here. One priming pass serves every
+    // colour draw that follows it, and Wind Waker's two eyes are exactly that:
+    // two colour draws sharing one mask. Consuming it on the first left the
+    // second eye unmasked - a white quad on one side of Link's face and a
+    // correct eye on the other.
+  }
 
   u8 alpha_test_type = 7;
   u8 alpha_reference = 0;

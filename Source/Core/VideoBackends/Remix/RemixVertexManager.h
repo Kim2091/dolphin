@@ -86,4 +86,14 @@ private:
   std::array<u8, 64> m_palette_compact = {};
   std::array<bool, 64> m_palette_named = {};
 };
+
+// Drop the EFB alpha mask a priming pass may have left pending.
+//
+// The mask is file-scope state in the translation unit, not a member of
+// anything the backend destroys, so without this it survives a game being
+// stopped and is still there when the next one boots - and a mask means "cut
+// the next same-sized draw to this shape", which is not something to inherit
+// from another title. Called from RemixApi::Shutdown alongside the synthesized
+// albedos the same idiom produces.
+void ResetPendingAlphaMask();
 }  // namespace Remix

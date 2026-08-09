@@ -58,6 +58,9 @@ struct FrameStats
   // Draws that write neither colour nor alpha, or whose alpha test can never
   // pass. Depth-only geometry in a backend that has no depth buffer.
   u32 skipped_invisible = 0;
+  u32 skipped_alpha_only = 0;
+  u32 dst_alpha_substituted = 0;
+  u32 dst_alpha_masked = 0;
   u32 meshes_created = 0;
   u32 instances_drawn = 0;
   u32 sky_draws = 0;
@@ -905,6 +908,7 @@ public:
   bool GxRasChannelEnabled() const { return m_gx_ras_channel; }
   bool GxRampAlbedoSkipEnabled() const { return m_gx_ramp_albedo_skip; }
   bool GxLitChannelTexGenEnabled() const { return m_gx_lit_channel_texgen; }
+  bool GxEfbAlphaPassesEnabled() const { return m_gx_efb_alpha_passes; }
   bool UiRasChannelEnabled() const { return m_ui_ras_channel; }
 
   // False submits world draws the console scissored down to nothing, which is
@@ -968,6 +972,16 @@ public:
   // path can ask "is this mesh classified sky?" BEFORE it picks a material -
   // which it must, because the answer decides whether the material is emissive,
   // and the material then feeds the mesh hash.
+  // Colour texture with the mask's alpha substituted in, cached so the same pair
+  // resolves to one texture every frame. Null when the two disagree on size, or
+  // when the combination cannot be uploaded.
+  //
+  // The mask arrives as BYTES, not as a texture: its producer and its consumer
+  // are different draws, and the texture cache may evict it in between.
+  const RemixTexture* MaskedAlbedo(const RemixTexture& colour,
+                                   const std::vector<u8>& mask_pixels, u32 mask_width,
+                                   u32 mask_height, u64 mask_hash);
+
   static u64 GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices);
 
@@ -1602,6 +1616,12 @@ private:
   bool m_gx_ras_channel = true;
   bool m_gx_ramp_albedo_skip = true;
   bool m_gx_lit_channel_texgen = true;
+  bool m_gx_efb_alpha_passes = true;
+  // Textures this backend synthesized by combining a colour with a mask. Keyed
+  // on the pair so a mesh does not re-materialise every frame. Released in
+  // Shutdown: these are full decoded images, and without that they would
+  // accumulate for the life of the process and survive into the next game.
+  std::unordered_map<u64, std::unique_ptr<RemixTexture>> m_masked_textures;
   bool m_ui_ras_channel = true;
   bool m_world_scissor_skip = true;
   bool m_trace_colors = false;

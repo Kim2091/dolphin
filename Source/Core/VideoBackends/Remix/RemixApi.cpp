@@ -32,6 +32,10 @@
 #include "Core/RemixPaths.h"
 
 #include "VideoBackends/Remix/RemixTexture.h"
+// For ResetPendingAlphaMask: the EFB alpha mask a priming pass leaves pending is
+// file-scope state in the vertex manager's translation unit, and Shutdown is
+// what has to drop it.
+#include "VideoBackends/Remix/RemixVertexManager.h"
 // For RemixEFBInterface::DrainAccessCounters and the shared store's colour
 // packer, both of which live with the EFB interface itself.
 #include "VideoBackends/Remix/RemixGfx.h"
@@ -961,6 +965,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
   m_gx_ramp_albedo_skip = Config::Get(Config::GFX_REMIX_GX_RAMP_ALBEDO_SKIP);
   m_gx_lit_channel_texgen = Config::Get(Config::GFX_REMIX_GX_LIT_CHANNEL_TEXGEN);
+  m_gx_efb_alpha_passes = Config::Get(Config::GFX_REMIX_GX_EFB_ALPHA_PASSES);
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_gx_tev_color = Config::Get(Config::GFX_REMIX_GX_TEV_COLOR);
   m_gx_texture_stage = Config::Get(Config::GFX_REMIX_GX_TEXTURE_STAGE);
@@ -1260,6 +1265,12 @@ void RemixApi::Shutdown()
 
   m_after_frame_event.reset();
   DestroyAllHandles();
+  // Synthesized masked albedos are ours, not the texture cache's, so nothing
+  // else will ever free them.
+  m_masked_textures.clear();
+  // The other half of the same idiom: a mask a priming pass left pending lives
+  // in file-scope state in the vertex manager, which nothing else tears down.
+  ResetPendingAlphaMask();
 
   // dxvk_RegisterD3D9Device TRANSFERS OWNERSHIP of the device and its
   // IDirect3D9Ex to the runtime. It stores the raw pointers without taking a
@@ -1919,6 +1930,63 @@ void RemixApi::PollRuntimeTagState()
   // auto-switch preference drives the tagging view from it, and that has to
   // keep working with routing off so a tag can be placed before the routing
   // that consumes it is switched on.
+}
+
+const RemixTexture* RemixApi::MaskedAlbedo(const RemixTexture& colour,
+                                           const std::vector<u8>& mask_pixels, u32 mask_width,
+                                           u32 mask_height, u64 mask_hash)
+{
+  const u32 width = colour.GetWidth();
+  const u32 height = colour.GetHeight();
+  if (width != mask_width || height != mask_height)
+    return nullptr;
+
+  const std::vector<u8>& colour_pixels = colour.GetPixels();
+  if (colour_pixels.empty() || colour_pixels.size() != mask_pixels.size())
+    return nullptr;
+
+  // Keyed on the PAIR: the same colour image masked two different ways is two
+  // different images, and the same pair must resolve to one texture every frame
+  // or the mesh would re-materialise continuously.
+  const u64 key = colour.GetContentHash() ^ (mask_hash * 0x9E3779B97F4A7C15ULL);
+  if (const auto it = m_masked_textures.find(key); it != m_masked_textures.end())
+    return it->second.get();
+
+  std::vector<u8> combined = colour_pixels;
+  for (size_t i = 3; i < combined.size(); i += 4)
+    combined[i] = mask_pixels[i];
+
+  // Load() repacks and hashes exactly as it does for a decoded game texture, so
+  // the result is indistinguishable from one downstream - same upload path, same
+  // content-hash identity, same LRU.
+  TextureConfig config = colour.GetConfig();
+  auto texture = std::make_unique<RemixTexture>(config);
+  texture->Load(0, width, height, width, combined.data(), combined.size(), 0);
+  if (!texture->HasData())
+    return nullptr;
+
+  // Bounded, because nothing else bounds it. Every distinct (colour, mask) pair
+  // adds a full decoded image that only Shutdown frees, while the game's own
+  // texture cache is busy evicting the sources - so a long session in a title
+  // that masks many characters would grow this without limit.
+  //
+  // Dropped wholesale rather than by LRU: the map exists to keep a mesh's
+  // material stable frame to frame, and everything still on screen is re-made
+  // on the next draw that needs it. A cap this size is not reached by any title
+  // measured here, so the cliff is a backstop rather than a working behaviour.
+  constexpr size_t MAX_MASKED_TEXTURES = 512;
+  if (m_masked_textures.size() >= MAX_MASKED_TEXTURES)
+  {
+    WARN_LOG_FMT(VIDEO,
+                 "Remix: synthesized masked-albedo cache hit {} entries and was dropped. If this "
+                 "repeats, the EFB alpha mask idiom is matching far more pairs than expected.",
+                 m_masked_textures.size());
+    m_masked_textures.clear();
+  }
+
+  const RemixTexture* result = texture.get();
+  m_masked_textures.emplace(key, std::move(texture));
+  return result;
 }
 
 u64 RemixApi::GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
