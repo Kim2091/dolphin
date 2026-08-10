@@ -110,6 +110,27 @@ bool IsSkyDraw(const ZMode& zmode)
   return depth_test_off && !zmode.update_enable;
 }
 
+// A standard source-alpha blend that also WRITES depth is not ordinary
+// translucency.  Ordinary translucent geometry must leave the depth buffer
+// alone so later geometry can still show through it.  GameCube games use this
+// otherwise contradictory-looking state for coverage cards: foliage, fences
+// and other masked geometry, where the alpha texture chooses which pixels are
+// solid and the depth write makes the surviving pixels occlude correctly.
+//
+// RE4's grass is drawn exactly this way.  Passing it through as a translucent
+// surface makes Remix's unordered alpha path retain the quad itself, producing
+// the opaque black/brown rectangles visible behind the grass.  The runtime's
+// AlphaBlendToCutout category already exists for this conversion; it preserves
+// the source texture while turning its alpha into a deterministic coverage
+// test.  Keep the signature deliberately narrow: depth-writing additive or
+// colour blends are effects, not cards.
+bool IsDepthWritingAlphaCard()
+{
+  return bpmem.zmode.update_enable && bpmem.blendmode.blend_enable && !bpmem.blendmode.subtract &&
+         bpmem.blendmode.src_factor == SrcBlendFactor::SrcAlpha &&
+         bpmem.blendmode.dst_factor == DstBlendFactor::InvSrcAlpha;
+}
+
 // GX alpha testing is two comparators combined by a logic op. Remix's material
 // carries a single comparator, and GX's CompareMode numbering (Never=0 ..
 // Always=7) is already the numbering Remix expects, so the common shapes
@@ -2039,6 +2060,45 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
 
   // What TEV stage 0 rasterizes, by GX's rules rather than "colours[0], always".
   const bool gx_blend = g_remix_api->GxBlendEnabled();
+
+  // Which texture the TEV alpha chain actually reads TEXA through, when that is
+  // NOT the albedo's own texmap. GX places no requirement that the alpha come
+  // from the stage the colour came from, and RE4 leans on that: compressed
+  // colour art on stage 0, a separate intensity mask on a later stage, the
+  // combiner taking the LATER stage's texture alpha. The material model carries
+  // one texture, so left alone the runtime tests the albedo's alpha - flat 255
+  // on such art - and the coverage card renders solid no matter what alpha
+  // state rides the draw. Detected here, composed at material resolution.
+  //
+  // Last matching stage wins: it is the one nearest the combiner output, so
+  // when several stages read TEXA it is the closest approximation of what the
+  // chain hands the blender. World path only - the 2D overlay rasterizes with
+  // its own alpha model - and gated like the rest of the alpha translation.
+  const RemixTexture* alpha_mask = nullptr;
+  if (!is_ortho && albedo_textured && gx_blend && g_remix_api->GxAlphaMaskEnabled())
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    u32 alpha_texmap = albedo_texmap;
+    for (u32 stage = 0; stage < tev_stages; ++stage)
+    {
+      const auto& ac = bpmem.combiners[stage].alphaC;
+      const bool reads_texa =
+          static_cast<u32>(ac.a.Value()) == 4 || static_cast<u32>(ac.b.Value()) == 4 ||
+          static_cast<u32>(ac.c.Value()) == 4 || static_cast<u32>(ac.d.Value()) == 4;
+      if (!reads_texa || bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      alpha_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+    }
+    if (alpha_texmap != albedo_texmap)
+    {
+      const RemixTexture* mask = g_remix_api->GetBoundTexture(alpha_texmap);
+      if (mask != nullptr && mask->HasData())
+      {
+        alpha_mask = mask;
+        ++stats.alpha_mask_folded;
+      }
+    }
+  }
   //
   // The two paths take the rule from separate knobs, because they fail in
   // opposite directions and have to be A/B-able apart.
@@ -2608,22 +2668,53 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   remixapi_InstanceCategoryFlags category_flags = 0;
   if (is_sky)
     category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
+  if (IsDepthWritingAlphaCard())
+  {
+    category_flags |= REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT;
+    ++stats.alpha_cutout;
+  }
 
   // Trace the draws the heuristic MATCHED (plus a couple that it did not, for
   // contrast) - knowing what got tagged is what says whether the heuristic is
   // picking out the skybox or just hoovering up every depth-test-less draw.
   if (g_remix_api->ShouldTraceDraws() &&
-      ((is_sky && stats.sky_draws <= 8) || (!is_sky && stats.instances_drawn < 3)))
+      ((is_sky && stats.sky_draws <= 8) || (!is_sky && stats.instances_drawn < 3) ||
+       // The first few cutout-tagged draws as well: the cards under diagnosis
+       // are hundreds of draws in, so the first-3 window never reaches them.
+       ((category_flags & REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) != 0 &&
+        stats.alpha_cutout <= 12)))
   {
     // Log the TEXTURE content hash, not the material hash - the texture hash is
     // what RemixSkyTextures matches on. The material hash folds in sampler bits
     // and would silently never match.
+    //
+    // `tev` maps each stage to the texmap it samples ('-' = untextured stage),
+    // with a '*' on stages whose ALPHA combiner reads TEXA. Alpha arriving via
+    // a stage bound to a DIFFERENT texmap than the albedo is the one situation
+    // the single-texture material model cannot express - the runtime would test
+    // the albedo's own alpha while the console tested the other texture's.
+    std::string tev_texmaps;
+    {
+      const u32 tev_stages = bpmem.genMode.numtevstages + 1;
+      for (u32 s = 0; s < tev_stages && s < 16; ++s)
+      {
+        const auto& order = bpmem.tevorders[s >> 1];
+        if (order.getEnable(s & 1))
+          tev_texmaps += static_cast<char>('0' + static_cast<u32>(order.getTexMap(s & 1)));
+        else
+          tev_texmaps += '-';
+        const auto& ac = bpmem.combiners[s].alphaC;
+        if (static_cast<u32>(ac.a.Value()) == 4 || static_cast<u32>(ac.b.Value()) == 4 ||
+            static_cast<u32>(ac.c.Value()) == 4 || static_cast<u32>(ac.d.Value()) == 4)
+          tev_texmaps += '*';
+      }
+    }
     const float* const tex_matrix = &xfmem.posMatrices[texgen.default_matrix * 4];
     INFO_LOG_FMT(VIDEO,
                  "Remix {} draw: ztest {} zfunc {} zwrite {} | blend {} | verts {} tris {} | "
                  "tex {:#018x} | texgen coord {} type {} row {} (slot {}) proj {} form {} mtx {}{} "
                  "[{} {} {} {} / {} {} {} {}] dual {} | blend {}->{} op {} alpha {}->{} op {} "
-                 "mask {:#x} | atest {} ref {}",
+                 "mask {:#x} | atest {} ref {} cutout {} tev {}",
                  is_sky ? "SKY" : "world", bpmem.zmode.test_enable ? 1 : 0,
                  static_cast<u32>(bpmem.zmode.func.Value()), bpmem.zmode.update_enable ? 1 : 0,
                  bpmem.blendmode.blend_enable ? 1 : 0, out_vertices->size(),
@@ -2639,7 +2730,10 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
                      "off",
                  blend.src_color_factor, blend.dst_color_factor, blend.color_blend_op,
                  blend.src_alpha_factor, blend.dst_alpha_factor, blend.alpha_blend_op,
-                 blend.write_mask, blend.alpha_test_compare, blend.alpha_test_reference);
+                 blend.write_mask, blend.alpha_test_compare, blend.alpha_test_reference,
+                 (category_flags & REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT) != 0 ? 1 :
+                                                                                               0,
+                 tev_texmaps);
   }
 
   // Where a world draw's colour comes from, per draw, with the resolution's own
@@ -3144,7 +3238,8 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       !is_ortho && g_remix_api->SkyEmissiveEnabled() && g_remix_api->IsSkyGeometry(geometry_hash);
   const MaterialRef material =
       g_remix_api->EnsureMaterial(albedo, filter_mode, wrap_mode_u, wrap_mode_v, alpha_test_type,
-                                  alpha_reference, sky_emissive, blend.tfactor & 0x00FFFFFFu);
+                                  alpha_reference, sky_emissive, blend.tfactor & 0x00FFFFFFu,
+                                  alpha_mask);
   if (material.handle == nullptr)
     return;
 

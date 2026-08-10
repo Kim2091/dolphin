@@ -34,6 +34,7 @@ extern const Info<bool> GFX_REMIX_CAMERA_RECOVERY;
 extern const Info<bool> GFX_REMIX_GX_COLOR;
 extern const Info<bool> GFX_REMIX_GX_TEXGEN;
 extern const Info<bool> GFX_REMIX_GX_BLEND;
+extern const Info<bool> GFX_REMIX_GX_ALPHA_MASK;
 extern const Info<bool> GFX_REMIX_GX_LIGHT_FIX;
 extern const Info<float> GFX_REMIX_LIGHT_RANGE;
 extern const Info<bool> GFX_REMIX_VIEW_ELECTORATE_FIX;
@@ -92,7 +93,7 @@ extern const Info<bool> GFX_REMIX_UI_FRAME_CACHE;
 // Must equal the number of extern Info<> declarations above. The metadata table
 // in RemixSettings.cpp static_asserts against this; if you add a knob, add its
 // table row or the build breaks.
-inline constexpr size_t kRemixSettingCount = 75;
+inline constexpr size_t kRemixSettingCount = 76;
 
 // One row per knob: how to edit it, where it belongs, whether it can be changed
 // while a game is running, and what it is for in plain language.

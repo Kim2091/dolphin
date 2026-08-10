@@ -957,6 +957,7 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_color = Config::Get(Config::GFX_REMIX_GX_COLOR);
   m_gx_texgen = Config::Get(Config::GFX_REMIX_GX_TEXGEN);
   m_gx_blend = Config::Get(Config::GFX_REMIX_GX_BLEND);
+  m_gx_alpha_mask = Config::Get(Config::GFX_REMIX_GX_ALPHA_MASK);
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
@@ -1704,7 +1705,112 @@ bool RemixApi::UploadTexture(const RemixTexture& texture)
   }
 
   m_textures.emplace(hash, handle);
+
+  // One line per unique texture: the alpha range of the uploaded pixels. A
+  // cutout that stays a solid card while this reports [255, 255] means the
+  // coverage mask is not in the albedo texture at all - it lives in another
+  // TEV stage's texture - and no amount of alpha-state plumbing can fix that.
+  {
+    const std::vector<u8>& pixels = texture.GetPixels();
+    u8 alpha_min = 255;
+    u8 alpha_max = 0;
+    for (size_t i = 3; i < pixels.size(); i += 4)
+    {
+      alpha_min = std::min(alpha_min, pixels[i]);
+      alpha_max = std::max(alpha_max, pixels[i]);
+    }
+    INFO_LOG_FMT(VIDEO, "Remix: texture {:#018x} {}x{} alpha range [{}, {}]", hash,
+                 texture.GetWidth(), texture.GetHeight(), alpha_min, alpha_max);
+  }
   return true;
+}
+
+u64 RemixApi::EnsureComposedAlphaTexture(const RemixTexture& albedo, const RemixTexture& mask)
+{
+  // Derived identity: both source hashes folded under a seed of their own, so a
+  // composed texture can never collide with a raw upload of either source, and
+  // the same (albedo, mask) pair always resolves to the same handle.
+  constexpr u64 ALPHA_MASK_SEED = 0x414C50484D41534Bull;  // "ALPHMASK"
+  const u64 hash =
+      NonZeroHash(FoldHash(FoldHash(ALPHA_MASK_SEED, albedo.GetContentHash()),
+                           mask.GetContentHash()));
+  if (m_textures.count(hash) != 0)
+    return hash;
+  if (m_interface.CreateTexture == nullptr)
+    return 0;
+
+  const u32 width = albedo.GetWidth();
+  const u32 height = albedo.GetHeight();
+  const u32 mask_width = mask.GetWidth();
+  const u32 mask_height = mask.GetHeight();
+  const std::vector<u8>& albedo_pixels = albedo.GetPixels();
+  const std::vector<u8>& mask_pixels = mask.GetPixels();
+  if (width == 0 || height == 0 || mask_width == 0 || mask_height == 0 ||
+      albedo_pixels.size() < static_cast<size_t>(width) * height * 4 ||
+      mask_pixels.size() < static_cast<size_t>(mask_width) * mask_height * 4)
+  {
+    return 0;
+  }
+
+  // Albedo RGB, mask ALPHA. The mask is nearest-sampled to the albedo's grid;
+  // an intensity texture decodes with its value in every channel, so reading
+  // .a covers I4/I8/IA8 and real RGBA masks alike. Both textures are sampled
+  // through the SAME coordinates on the Remix side (the mesh carries one
+  // texcoord set - the albedo stage's), so texel-space composition is not an
+  // approximation of anything: it is the only mapping the submitted mesh can
+  // express.
+  std::vector<u8> pixels(static_cast<size_t>(width) * height * 4);
+  u8 alpha_min = 255;
+  u8 alpha_max = 0;
+  for (u32 y = 0; y < height; ++y)
+  {
+    const u32 mask_y = mask_height == height ? y : (y * mask_height) / height;
+    const u8* src_row = albedo_pixels.data() + static_cast<size_t>(y) * width * 4;
+    const u8* mask_row = mask_pixels.data() + static_cast<size_t>(mask_y) * mask_width * 4;
+    u8* dst_row = pixels.data() + static_cast<size_t>(y) * width * 4;
+    for (u32 x = 0; x < width; ++x)
+    {
+      const u32 mask_x = mask_width == width ? x : (x * mask_width) / width;
+      dst_row[x * 4 + 0] = src_row[x * 4 + 0];
+      dst_row[x * 4 + 1] = src_row[x * 4 + 1];
+      dst_row[x * 4 + 2] = src_row[x * 4 + 2];
+      const u8 a = mask_row[mask_x * 4 + 3];
+      dst_row[x * 4 + 3] = a;
+      alpha_min = std::min(alpha_min, a);
+      alpha_max = std::max(alpha_max, a);
+    }
+  }
+
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.pNext = nullptr;
+  info.hash = hash;
+  info.width = width;
+  info.height = height;
+  info.depth = 1;
+  info.mipLevels = 1;
+  info.format = REMIXAPI_FORMAT_R8G8B8A8_SRGB;
+  info.data = pixels.data();
+  info.dataSize = pixels.size();
+
+  remixapi_TextureHandle handle = nullptr;
+  remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  const int guard =
+      CallGuarded("CreateTexture", [&] { status = m_interface.CreateTexture(&info, &handle); });
+  if (guard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS || handle == nullptr)
+  {
+    WARN_LOG_FMT(VIDEO, "Remix: CreateTexture(composed {:#018x}) failed (guard {}, error {})",
+                 hash, guard, static_cast<int>(status));
+    return 0;
+  }
+
+  m_textures.emplace(hash, handle);
+  INFO_LOG_FMT(VIDEO,
+               "Remix: composed alpha-mask texture {:#018x} = albedo {:#018x} ({}x{}) + mask "
+               "{:#018x} ({}x{}) alpha [{}, {}]",
+               hash, albedo.GetContentHash(), width, height, mask.GetContentHash(), mask_width,
+               mask_height, alpha_min, alpha_max);
+  return hash;
 }
 
 void RemixApi::RegisterOverlayTexture(const RemixTexture* texture)
@@ -2027,7 +2133,8 @@ u64 RemixApi::UntexturedOrthoKey(const std::vector<remixapi_HardcodedVertex>& ve
 
 MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
                                      u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
-                                     bool emissive, u32 emissive_rgb)
+                                     bool emissive, u32 emissive_rgb,
+                                     const RemixTexture* alpha_mask)
 {
   MaterialRef result;
   if (!m_valid)
@@ -2042,6 +2149,22 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
     // the scene is still sampling. Cheap - the map is empty unless tag routing
     // has actually registered something.
     m_overlay_texture_frames.erase(texture_hash);
+  }
+
+  // The draw's alpha comes from a DIFFERENT texture than its albedo: reference
+  // the composed "albedo RGB + mask alpha" texture instead, so the opacity the
+  // runtime samples is the mask the console actually tested. The derived hash
+  // replaces the albedo's for EVERY downstream identity - material hash, mesh
+  // handle, dev-menu tagging key - which keeps all of them consistent with what
+  // the runtime is really rendering.
+  if (texture_hash != 0 && alpha_mask != nullptr && alpha_mask->HasData())
+  {
+    const u64 composed_hash = EnsureComposedAlphaTexture(*texture, *alpha_mask);
+    if (composed_hash != 0)
+    {
+      texture_hash = composed_hash;
+      m_overlay_texture_frames.erase(texture_hash);
+    }
   }
 
   const u64 material_hash = ComputeMaterialHash(texture_hash, filter_mode, wrap_mode_u, wrap_mode_v,
@@ -5657,7 +5780,8 @@ void RemixApi::OnAfterFrame()
                  "instances {} (sky {}) "
                  "| colour {} vertex, {} "
                  "register, {} none, {} split | tev colour {} folded, {} tinted, {} identity, {} bailed, {} "
-                 "later-stage tex | texgen {} ({} non-trivial) | blended {} tested {} "
+                 "later-stage tex | texgen {} ({} non-trivial) | blended {} tested {} cutout {} "
+                 "mask {} "
                  "logicop {} "
                  "| flat normals {} ({} flipped) | lights {} distant, {} sphere ({} spot, {} "
                  "falloff-free->distant, {} dropped), draws "
@@ -5689,6 +5813,7 @@ void RemixApi::OnAfterFrame()
                  m_stats.tev_color_identity, m_stats.tev_color_bailed,
                  m_stats.texture_later_stage, m_stats.texgen_generated,
                  m_stats.texgen_nontrivial, m_stats.blended, m_stats.alpha_tested,
+                 m_stats.alpha_cutout, m_stats.alpha_mask_folded,
                  m_stats.logic_op, m_stats.normals_generated, m_stats.normals_flipped,
                  m_stats.lights_distant, m_stats.lights_sphere, m_stats.lights_spot,
                  m_stats.lights_falloff_free, m_stats.lights_dropped_distant,

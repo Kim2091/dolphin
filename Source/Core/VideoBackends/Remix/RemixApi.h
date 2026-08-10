@@ -147,6 +147,15 @@ struct FrameStats
   // raster logic op, which has no Remix equivalent and stays opaque.
   u32 blended = 0;
   u32 alpha_tested = 0;
+  // Depth-writing source-alpha blends tagged AlphaBlendToCutout - the coverage
+  // cards (foliage, fences, hair) whose transparency comes from the blend
+  // rather than a GX alpha test. Zero while such geometry is on screen means
+  // the tag is not being applied and cutout cannot work.
+  u32 alpha_cutout = 0;
+  // Draws whose alpha came from a DIFFERENT texture than the albedo and had
+  // that mask composed into the material (RemixGxAlphaMask). The cards a
+  // cutout tag alone cannot fix.
+  u32 alpha_mask_folded = 0;
   u32 logic_op = 0;
 
   // Draws that had no normals and so got generated flat ones, and how many of
@@ -898,6 +907,12 @@ public:
   // per-instance blend state below becomes the thing the runtime reads.
   bool GxBlendEnabled() const { return m_gx_blend; }
 
+  // Fold a separate TEV alpha-mask texture into the material's albedo alpha.
+  // Off leaves the albedo's own alpha as the opacity source, the pre-fix
+  // behaviour: coverage cards whose mask lives in another stage's texture
+  // render solid.
+  bool GxAlphaMaskEnabled() const { return m_gx_alpha_mask; }
+
   // False resolves the rasterized colour channel from TEV stage 0 whether or not
   // stage 0 consumes it, which is the pre-fix behaviour. On, each half takes the
   // channel named by the stage that actually reads ras.
@@ -957,9 +972,16 @@ public:
   // texture instead, which is the same patch the runtime applies to WorldUI
   // (rtx_instance_manager.cpp:1116-1123). Both fold into material identity, so
   // the emissive variant is a distinct material and a distinct mesh.
+  // `alpha_mask`, when non-null, is the texture the TEV alpha chain actually
+  // reads TEXA through when that is NOT the albedo's own stage. The material
+  // then references a derived texture - albedo RGB with the mask's alpha
+  // composed in - because Remix's material model carries one texture and the
+  // opacity the runtime tests is that texture's alpha channel. See
+  // EnsureComposedAlphaTexture for the composition itself.
   MaterialRef EnsureMaterial(const RemixTexture* texture, u8 filter_mode, u8 wrap_mode_u,
                              u8 wrap_mode_v, u8 alpha_test_type, u8 alpha_reference,
-                             bool emissive = false, u32 emissive_rgb = 0);
+                             bool emissive = false, u32 emissive_rgb = 0,
+                             const RemixTexture* alpha_mask = nullptr);
 
   // Identity of the geometry bytes alone. Split out of SubmitMesh so the draw
   // path can ask "is this mesh classified sky?" BEFORE it picks a material -
@@ -1510,6 +1532,12 @@ private:
   void SubmitFallbackTriangle();
   void ReapIdleMeshes();
   bool UploadTexture(const RemixTexture& texture);
+  // Uploads (once) a derived texture combining `albedo`'s RGB with `mask`'s
+  // alpha, nearest-sampled when their dimensions differ, and returns its
+  // content-derived identity - or 0 when composition is impossible. The derived
+  // hash lives in the same m_textures registry as raw uploads, so material
+  // reference and dedup work identically.
+  u64 EnsureComposedAlphaTexture(const RemixTexture& albedo, const RemixTexture& mask);
   bool EnsureFallbackMesh();
   void DestroyAllHandles();
   // Pose-invariant identity for the dynamic-mesh-identity feature: folds the
@@ -1595,6 +1623,7 @@ private:
   bool m_gx_color = true;
   bool m_gx_texgen = true;
   bool m_gx_blend = true;
+  bool m_gx_alpha_mask = true;
   bool m_gx_light_fix = true;
   bool m_gx_ras_channel = true;
   bool m_ui_ras_channel = true;

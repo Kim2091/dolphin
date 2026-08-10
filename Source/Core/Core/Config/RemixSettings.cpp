@@ -231,6 +231,20 @@ const Info<bool> GFX_REMIX_GX_TEXGEN{{System::GFX, "Settings", "RemixGxTexGen"},
 // submitted as opaque geometry that also casts full shadows. Off submits
 // everything opaque, which is what the backend did before.
 const Info<bool> GFX_REMIX_GX_BLEND{{System::GFX, "Settings", "RemixGxBlend"}, true};
+// Take a draw's transparency mask from the TEV stage that actually carries it.
+//
+// GX reads its final alpha through the combiner chain, and nothing requires the
+// stage that reads TEXA to be the stage the albedo texture came from. RE4 binds
+// its compressed colour art to stage 0 and a separate intensity mask to a later
+// stage, whose alpha the combiner takes - so the albedo's own alpha channel is
+// flat 255 and every coverage card (foliage, fences, hair) renders as a solid
+// rectangle that no amount of alpha-state plumbing can fix, because the mask
+// never reaches the runtime at all. When the alpha-reading stage samples a
+// DIFFERENT texmap than the albedo, this composes "albedo RGB + mask alpha"
+// into a derived texture at upload and points the material at that. A draw
+// whose alpha already comes from the albedo's own stage resolves exactly as
+// before, which is what makes this a strict extension.
+const Info<bool> GFX_REMIX_GX_ALPHA_MASK{{System::GFX, "Settings", "RemixGxAlphaMask"}, true};
 // Translate GX lights the way the console's own renderers read them, instead of
 // approximately. Three things change: a spot cone is aimed along -ddir (xfmem's
 // ddir points from the scene TOWARD the light, so the pre-fix cone faced
@@ -1338,6 +1352,12 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "Translate the game's blend settings so the runtime can classify transparency. Without "
            "it, fire, glows, light shafts, windows and water are all submitted as opaque geometry "
            "that also casts full shadows.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_ALPHA_MASK, "Alpha mask texture fold",
+           "Take a draw's transparency mask from the texture stage that actually carries it. Some "
+           "games keep the colour art and its cutout mask in two separate textures; without this "
+           "the mask never reaches the runtime and foliage, fences and hair render as solid "
+           "cards.",
            Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_LIGHT_FIX, "GameCube light translation",
            "Translate the game's lights the way the console's own renderer reads them: the "
