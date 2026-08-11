@@ -1383,6 +1383,8 @@ void RemixApi::DestroyAllHandles()
     if (handle != nullptr)
       CallGuarded("DestroyMesh", [&] { m_interface.DestroyMesh(handle); });
   }
+  m_meshes_destroyed_total += m_meshes.size();
+  m_mesh_bytes_live = 0;
   m_meshes.clear();
   m_topology.clear();
   m_poisoned_meshes.clear();
@@ -1707,6 +1709,34 @@ void RemixApi::LogProjectionVariants()
   }
 }
 
+void RemixApi::LogResourceRegistry()
+{
+  if (!m_log_stats)
+    return;
+
+  // Reading the line: MESH is the only registry that is reaped, so its live
+  // figure is expected to sit well above the per-frame draw count - it holds
+  // MESH_IDLE_FRAMES_BEFORE_DESTROY frames of history on purpose - and what
+  // matters there is whether `made` and `reaped` climb together. TEX and MAT
+  // are never reaped at all, so anything they gain they keep: their totals
+  // should go flat within a few seconds of a scene settling, and a figure still
+  // climbing after that is the leak.
+  //
+  // `composed` and `masked` are the two texture kinds this backend derives
+  // rather than receives. Both are keyed on content, so they are supposed to
+  // converge on a small number; either one tracking the frame counter means its
+  // key is unstable and it is minting a texture per frame.
+  const auto mib = [](u64 bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+  INFO_LOG_FMT(VIDEO,
+               "Remix frame {} registry: tex {} live ({:.1f} MiB, {} composed, {} masked albedos) "
+               "| mat {} live | mesh {} live ({:.1f} MiB, {} made, {} reaped) | topo {} | "
+               "overlay-only tex {}",
+               m_frame_index, m_textures.size(), mib(m_texture_bytes),
+               m_composed_textures_created, m_masked_albedos_created, m_materials.size(),
+               m_meshes.size(), mib(m_mesh_bytes_live), m_meshes_created_total,
+               m_meshes_destroyed_total, m_topology.size(), m_overlay_texture_frames.size());
+}
+
 bool RemixApi::UploadTexture(const RemixTexture& texture)
 {
   const u64 hash = texture.GetContentHash();
@@ -1743,6 +1773,8 @@ bool RemixApi::UploadTexture(const RemixTexture& texture)
   }
 
   m_textures.emplace(hash, handle);
+  ++m_textures_created;
+  m_texture_bytes += info.dataSize;
 
   // One line per unique texture: the alpha range of the uploaded pixels. A
   // cutout that stays a solid card while this reports [255, 255] means the
@@ -1843,6 +1875,9 @@ u64 RemixApi::EnsureComposedAlphaTexture(const RemixTexture& albedo, const Remix
   }
 
   m_textures.emplace(hash, handle);
+  ++m_textures_created;
+  ++m_composed_textures_created;
+  m_texture_bytes += info.dataSize;
   INFO_LOG_FMT(VIDEO,
                "Remix: composed alpha-mask texture {:#018x} = albedo {:#018x} ({}x{}) + mask "
                "{:#018x} ({}x{}) alpha [{}, {}]",
@@ -2116,6 +2151,7 @@ const RemixTexture* RemixApi::MaskedAlbedo(const RemixTexture& colour,
   }
 
   const RemixTexture* result = texture.get();
+  ++m_masked_albedos_created;
   m_masked_textures.emplace(key, std::move(texture));
   return result;
 }
@@ -2387,6 +2423,7 @@ MaterialRef RemixApi::EnsureMaterial(const RemixTexture* texture, u8 filter_mode
   }
 
   m_materials.emplace(material_hash, handle);
+  ++m_materials_created;
   result.handle = handle;
   result.hash = material_hash;
   return result;
@@ -2596,6 +2633,8 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
                   CallGuarded("DestroyMesh(stale dynamic)",
                               [&] { m_interface.DestroyMesh(stale_handle); });
                 }
+                m_mesh_bytes_live -= stale_it->second.gpu_bytes;
+                ++m_meshes_destroyed_total;
                 m_meshes.erase(stale_it);
               }
               MeshEntry moved = prev_it->second;
@@ -2751,6 +2790,14 @@ void RemixApi::SubmitMesh(const MaterialRef& material, u64 geometry_hash,
     entry.geometry_hash = geometry_hash;
     entry.diagnostics = diagnostics;
     entry.topology_key = topology_key;
+    // What this mesh costs on the GPU, charged here and refunded by whichever
+    // destroy eventually takes it. Vertex and index bytes only - the runtime's
+    // BLAS is its own business and we have no figure for it - so read the total
+    // as a floor on the geometry footprint, not as the whole of it.
+    entry.gpu_bytes = vertices.size() * sizeof(remixapi_HardcodedVertex) +
+                      indices.size() * sizeof(u32);
+    m_mesh_bytes_live += entry.gpu_bytes;
+    ++m_meshes_created_total;
     m_meshes.emplace(mesh_hash, entry);
     ++m_stats.meshes_created;
     minted_mesh = true;
@@ -5773,6 +5820,8 @@ void RemixApi::ReapIdleMeshes()
         m_topology.erase(topo_it);
       }
     }
+    m_mesh_bytes_live -= it->second.gpu_bytes;
+    ++m_meshes_destroyed_total;
     it = m_meshes.erase(it);
   }
 
@@ -6006,6 +6055,7 @@ void RemixApi::OnAfterFrame()
                  m_stats.sky_emissive, m_sky_auto_detect);
   }
 
+  LogResourceRegistry();
   LogProjectionVariants();
   LogCameraRecovery();
   // Reads m_stats and both sample maps, so it has to run before the reset below

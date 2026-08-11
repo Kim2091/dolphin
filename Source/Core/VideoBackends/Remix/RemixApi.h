@@ -1349,6 +1349,12 @@ private:
     // entry in O(1) without regathering and rehashing the vertex stream, and
     // so ReapIdleMeshes can drop the topo entry alongside the mesh.
     u64 topology_key = 0;
+    // Vertex + index bytes this mesh handed the runtime, remembered so the
+    // reaper can subtract exactly what the create added. Without it the live
+    // figure could only be a count, and a count cannot distinguish two thousand
+    // small props from two thousand character meshes - which is the whole
+    // question when VRAM is filling.
+    u64 gpu_bytes = 0;
   };
 
   // Cross-frame lineage of one topology - everything about a mesh that a
@@ -1539,6 +1545,11 @@ private:
                    const float camera_delta[3], float far_plane);
   void FlushPendingInstances();
   void LogCameraRecovery();
+  // One line per stats interval naming everything this backend is holding on
+  // the GPU. The frame line reported live MESHES and nothing else, so a report
+  // of "VRAM fills" had no number anywhere to attach itself to - textures and
+  // materials, which are the two registries never reaped at all, were invisible.
+  void LogResourceRegistry();
   // Picks the frame's dominant modelview and, if it clears the confidence gate,
   // turns it into the camera. Runs at the TOP of OnAfterFrame - before
   // EstimateView - because with RemixCameraFromModelview on this IS the camera
@@ -1585,6 +1596,32 @@ private:
 
   std::array<const RemixTexture*, 8> m_bound_textures = {};
 
+  // ---- GPU resource accounting -------------------------------------------
+  //
+  // What this backend is holding on the GPU, so a session that fills VRAM says
+  // WHICH registry did it rather than only that it happened.
+  //
+  // Textures and materials are never reaped for the life of a session - only
+  // overlay-only thumbnails are, and EnsureMaterial removes a texture from that
+  // sweep the moment a material references it. So for those two the running
+  // total IS the live count, and a total that keeps climbing after the game has
+  // settled is a leak by definition rather than churn. Meshes are the opposite:
+  // they are reaped after MESH_IDLE_FRAMES_BEFORE_DESTROY, so created and
+  // destroyed have to be reported separately - a large live figure with the two
+  // totals tracking each other is a retention window doing its job, while
+  // created running away from destroyed is not.
+  u64 m_textures_created = 0;
+  u64 m_texture_bytes = 0;
+  // Subset of the above that this backend SYNTHESIZED rather than received from
+  // the game: the composed albedo+mask textures. Called out separately because
+  // their identity is derived, so a bug that makes the derivation unstable mints
+  // a fresh texture every frame for geometry the game never changed.
+  u64 m_composed_textures_created = 0;
+  u64 m_masked_albedos_created = 0;
+  u64 m_materials_created = 0;
+  u64 m_meshes_created_total = 0;
+  u64 m_meshes_destroyed_total = 0;
+  u64 m_mesh_bytes_live = 0;
   std::unordered_map<u64, remixapi_TextureHandle> m_textures;
   // Textures that exist ONLY so the overlay path's draws are taggable, mapped
   // to the frame each was last seen on. A material-backed texture is never in
