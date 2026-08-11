@@ -2212,6 +2212,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // texture COORDINATE has to come from the same stage, or the right image is
   // sampled through the wrong mapping.
   u32 albedo_stage = 0;
+  // Whichever counter the redirect below charged itself to, so the fallback can
+  // undo exactly that one. There used to be a bare `--stats.texture_later_stage`
+  // down there, which was right while the untextured-stage-0 rule was the only
+  // redirect there was; with four of them it decremented a counter three of them
+  // never incremented, and a u32 at zero wraps to four billion.
+  u32* albedo_redirect_counter = nullptr;
   if (!stage0_textured && g_remix_api->GxTextureStageEnabled())
   {
     const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
@@ -2222,6 +2228,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
       albedo_textured = true;
       albedo_stage = stage;
+      albedo_redirect_counter = &stats.texture_later_stage;
       ++stats.texture_later_stage;
       break;
     }
@@ -2246,6 +2253,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
         continue;
       albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
       albedo_stage = stage;
+      albedo_redirect_counter = &stats.texture_ramp_skipped;
       ++stats.texture_ramp_skipped;
       break;
     }
@@ -2278,6 +2286,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
         continue;
       albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
       albedo_stage = stage;
+      albedo_redirect_counter = &stats.texture_envmap_skipped;
       ++stats.texture_envmap_skipped;
       break;
     }
@@ -2320,6 +2329,7 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
         continue;
       albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
       albedo_stage = stage;
+      albedo_redirect_counter = &stats.texture_unused_stage_skipped;
       ++stats.texture_unused_stage_skipped;
       break;
     }
@@ -2379,7 +2389,11 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       texture_addr = 0;
       texture_is_efb_copy = false;
       texture_is_xfb_copy = false;
-      --stats.texture_later_stage;
+      if (albedo_redirect_counter != nullptr)
+      {
+        --*albedo_redirect_counter;
+        albedo_redirect_counter = nullptr;
+      }
     }
     // The destination was copied to, but this backend deliberately DISCARDED
     // that copy - it is a shadow map, a reflection, or any other capture of
