@@ -37,6 +37,11 @@ public:
   // does not implement EFB copies - that is what makes this flag the draw
   // classifier's "is this a render-to-texture surface?" test.
   bool HasData() const { return m_has_data; }
+  // Smallest alpha in the DECODED image. 255 means the texture is fully opaque,
+  // so nothing keyed on its alpha - a cutout, or a blend rebased onto source
+  // alpha - can shape it. Answers from the pixels rather than from the GX
+  // format, which cannot tell you what a palette's TLUT contained.
+  u8 MinAlpha() const { return m_min_alpha; }
   u64 GetContentHash() const { return m_content_hash; }
   const std::vector<u8>& GetPixels() const { return m_pixels; }
 
@@ -44,6 +49,7 @@ private:
   std::vector<u8> m_pixels;
   u64 m_content_hash = 0;
   bool m_has_data = false;
+  u8 m_min_alpha = 255;
 };
 
 class RemixStagingTexture final : public AbstractStagingTexture

@@ -527,6 +527,45 @@ const Info<bool> GFX_REMIX_UI_SCALE_TO_XFB{{System::GFX, "Settings", "RemixUiSca
 //
 // False = stage 0's channel for both halves, the pre-fix behaviour.
 const Info<bool> GFX_REMIX_GX_RAS_CHANNEL{{System::GFX, "Settings", "RemixGxRasChannel"}, true};
+// Take the albedo off a later TEV stage when stage 0's texture coordinate is
+// generated from a lit channel - i.e. when stage 0 samples a toon RAMP rather
+// than the surface.
+//
+// False = stage 0 unconditionally, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_RAMP_ALBEDO_SKIP{
+    {System::GFX, "Settings", "RemixGxRampAlbedoSkip"}, true};
+// Evaluate GX per-vertex lighting to produce a Color0/Color1 texture
+// coordinate, instead of substituting the raw vertex colour.
+//
+// False = the raw vertex colour, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_LIT_CHANNEL_TEXGEN{
+    {System::GFX, "Settings", "RemixGxLitChannelTexGen"}, true};
+// Handle the EFB-alpha-mask idiom: drop the colour-less pass that primes the
+// mask, and give the masked pass that follows the shape the mask encoded.
+//
+// False = the priming pass renders as opaque geometry, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_EFB_ALPHA_PASSES{
+    {System::GFX, "Settings", "RemixGxEfbAlphaPasses"}, true};
+// Keep a mirrored view basis mirrored when re-orthonormalizing it, instead of
+// letting the cross product silently make it right-handed.
+//
+// DEFAULT OFF: correct in principle and a no-op for right-handed input, but it
+// moves light directions in every title and has not been playtested broadly.
+const Info<bool> GFX_REMIX_GX_PRESERVE_HANDEDNESS{
+    {System::GFX, "Settings", "RemixGxPreserveHandedness"}, false};
+// Take the albedo off a later TEV stage when stage 0's texture coordinate is
+// generated from the vertex normal - i.e. when stage 0 samples an environment
+// map rather than the surface.
+//
+// False = stage 0 unconditionally, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP{
+    {System::GFX, "Settings", "RemixGxEnvMapAlbedoSkip"}, true};
+// Take the albedo off a later TEV stage when stage 0 binds a texture its own
+// combiner never references.
+//
+// False = stage 0 unconditionally, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_GX_UNUSED_STAGE_ALBEDO_SKIP{
+    {System::GFX, "Settings", "RemixGxUnusedStageAlbedoSkip"}, true};
 // The same per-stage rasterized-channel rule, applied to orthographic (UI
 // overlay) draws.
 //
@@ -1078,6 +1117,35 @@ const Info<bool> GFX_REMIX_UI_STRICT{{System::GFX, "Settings", "RemixUiStrict"},
 // as before, so False here is the pre-fix painter's algorithm, byte for byte.
 const Info<bool> GFX_REMIX_UI_DEPTH{{System::GFX, "Settings", "RemixUiDepth"}, true};
 
+// Take an additive 2D draw's overlay coverage from the light it actually adds,
+// not from its source alpha.
+//
+// The overlay is composited over the traced frame with straight alpha, so its
+// alpha channel is COVERAGE - how much of the traced pixel this layer replaces.
+// Additive blending has no coverage of its own: on console the draw adds
+// `src_rgb * src_alpha` to the framebuffer and hides nothing, so a texel that
+// adds black is invisible no matter what its alpha says. Charging coverage to
+// source alpha therefore makes a black additive texel fully OPAQUE and BLACK.
+//
+// Skyward Sword is the extreme case. Its bloom composite is a full-screen
+// SRC_ALPHA/ONE quad whose TEV chain resolves alpha to 1.0 over a mostly black
+// texture, so the whole 608x456 image was stamped opaque black over the scene -
+// the game rendered as a black screen with only the HUD visible. The two
+// existing levers cannot reach it: the pre-world filter needs a frame with no
+// world geometry (this arrives after ~980 world draws) and the full-screen
+// opaque filter needs blending off or One/Zero (this is SRC_ALPHA/One). It was
+// measured firing three times a frame while the screen stayed black.
+//
+// Coverage becomes max(added_r, added_g, added_b), the brightest channel the
+// draw contributes. Black adds nothing and takes no coverage, so the traced
+// scene survives; a bright flash still adds and still covers, unchanged. Dim
+// glows get proportionally more transparent, which is the same correction in
+// the small - previously they punched a near-black hole in the scene.
+//
+// False = charge coverage to source alpha, the pre-fix behaviour.
+const Info<bool> GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE{
+    {System::GFX, "Settings", "RemixUiAdditiveLightCoverage"}, true};
+
 // Show the game's whole 2D layer as world geometry instead of compositing it.
 //
 // This is the click-to-tag view, and it used to be automatic: opening the
@@ -1337,6 +1405,52 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "1 and nothing on stage 0, so the whole surface used to arrive untextured. A draw that "
            "samples on stage 0 behaves exactly as before.",
            Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_UNUSED_STAGE_ALBEDO_SKIP, "Skip albedo from an unused texture stage",
+           "Take the albedo from a later combiner stage when stage 0 binds a texture but never "
+           "references it in its own arithmetic. Such a texmap contributes nothing to the picture, "
+           "so shipping it as the material albedo hands Remix a texture the game does not draw "
+           "with. Super Mario Galaxy's characters are this shape - Mario arrived wearing a 64x64 "
+           "near-white mask while his real 128x256 texture sat unused on a later stage.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP, "Skip environment-map albedo",
+           "Take the albedo from a later combiner stage when stage 0's coordinate is generated "
+           "from the vertex normal. Such a stage samples an environment map - a canned reflection "
+           "- not the surface, and only one texture reaches Remix. Measured on Skyward Sword, 80% "
+           "of traced draws wore a 32x32 reflection while their real texture sat unused on a later "
+           "stage. Dropping the reflection is doubly right here: it is exactly what a path tracer "
+           "replaces with a real one.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_PRESERVE_HANDEDNESS, "Preserve mirrored camera handedness",
+           "Keep a mirrored view basis mirrored when it is re-orthonormalized. A cross product is "
+           "right-handed by construction, so rebuilding the third row from one throws a reflection "
+           "away. Geometry hides this - the image is invariant to the view matrix - but light "
+           "directions go through its inverse and do not cancel, so they swing while the scene "
+           "looks right. Helpful for Star Wars: The Force Unleashed, whose modelview measures "
+           "det -1 every frame. OFF by default: it is a no-op for right-handed input, but it "
+           "moves lighting in every title and is not yet widely tested.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_EFB_ALPHA_PASSES, "EFB alpha mask passes",
+           "Handle the two-pass EFB-alpha-mask idiom. A game primes a per-pixel stencil in the "
+           "framebuffer alpha with a colour-less pass, then blends against it. There is no "
+           "destination alpha here to honour, so the priming pass is dropped and the pass that "
+           "follows is cut to the mask instead - by its own source alpha where they share a "
+           "texture, or by combining the two where they do not. Verified in-game on The Wind "
+           "Waker, where it fixes the eyes, the eyebrows and a black bar across the face.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_LIT_CHANNEL_TEXGEN, "Light Color0/Color1 texture coordinates",
+           "Run the console's per-vertex lighting when a texture coordinate is generated from a "
+           "lit colour channel. Such a coordinate is an INDEX into a toon ramp, not a colour, so "
+           "substituting the raw vertex colour collapses every vertex onto one texel and the "
+           "surface renders flat. Isolated A/B on The Wind Waker: characters flat yellow before, "
+           "correct red and dark grey after.",
+           Group::GxSemantics),
+    Toggle(&GFX_REMIX_GX_RAMP_ALBEDO_SKIP, "Skip toon-ramp albedo",
+           "Take the albedo from a later combiner stage when stage 0's coordinate is generated "
+           "from a lit channel. A Color0/Color1 texgen means stage 0 samples a shading ramp, not "
+           "the surface, and only one texture reaches Remix - so handing it the ramp paints the "
+           "model in the ramp. Shading is the path tracer's job. Verified in-game on The Wind "
+           "Waker, whose cel-shaded characters are the case this exists for.",
+           Group::GxSemantics),
     Toggle(&GFX_REMIX_GX_RAS_CHANNEL, "Per-stage colour channel (world)",
            "Take the vertex colour channel from the combiner stage that actually uses it rather "
            "than from stage 0. The console names that channel per stage, and the stage that reads "
@@ -1493,11 +1607,14 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "the risk is that a game legitimately composing its menu this way loses the menu.",
            Group::UiOverlay),
     Toggle(&GFX_REMIX_UI_DROP_PRE_WORLD_BLANK, "Drop framebuffer-clear rectangles",
-           "Drop untextured 2D draws that arrive before any world geometry in the frame. Those are "
-           "screen clears, not UI: the console draws the scene over them, but this backend "
-           "composites 2D ON TOP of the traced image, so they land over everything and paint the "
-           "screen flat. This is the SpongeBob white-box fix. Genuine UI is textured, so it is "
-           "unaffected.",
+           "Drop screen-clear rectangles that arrive before any world geometry in the frame. Those "
+           "are clears, not UI: the console draws the scene over them, but this backend composites "
+           "2D ON TOP of the traced image, so they land over everything and paint the screen flat. "
+           "This is the SpongeBob white-box fix. Two shapes count as a clear - untextured, and "
+           "opaque-with-depth-write carrying a placeholder texture of 16x16 or smaller (Mario "
+           "Kart: Double Dash's in-race clear is a full-screen quad on a 4x4 texture, which the "
+           "untextured test alone let through). Real 2D artwork is neither, so a genuine "
+           "background is unaffected.",
            Group::UiOverlay),
     Toggle(&GFX_REMIX_UI_TAG_ROUTING, "Route 2D draws by Remix texture tags",
            "Let the Remix dev menu decide what happens to each 2D draw. Tag a texture 'UI Texture' "
@@ -1543,6 +1660,15 @@ constexpr auto REMIX_SETTINGS_META = std::to_array<RemixSettingMeta>({
            "submits its HUD background after its text and lets the z test sort them, so without "
            "this the background paints over the text. Ordinary 2D draws have the test off and are "
            "untouched. Off restores the pure painter's algorithm.",
+           Group::UiOverlay, Liveness::Live),
+    Toggle(&GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE, "Additive 2D draws cover by the light they add",
+           "Let an additive 2D draw hide the traced scene only as much as it brightens it. "
+           "Additive blending adds light and hides nothing, so a texel adding black is invisible "
+           "on console however opaque its alpha claims to be - charging coverage to that alpha "
+           "paints it as solid black instead. Skyward Sword's full-screen bloom pass did exactly "
+           "that and rendered the game as a black screen with only the HUD showing. Bright "
+           "flashes and glows are unchanged; dim ones stop punching dark holes in the scene. Off "
+           "restores the previous behaviour.",
            Group::UiOverlay, Liveness::Live),
     Toggle(&GFX_REMIX_UI_WORLD_VIEW, "Show the 2D layer in the world (tagging view)",
            "Turn the game's whole 2D layer into clickable world geometry so elements can be "

@@ -32,6 +32,10 @@
 #include "Core/RemixPaths.h"
 
 #include "VideoBackends/Remix/RemixTexture.h"
+// For ResetPendingAlphaMask: the EFB alpha mask a priming pass leaves pending is
+// file-scope state in the vertex manager's translation unit, and Shutdown is
+// what has to drop it.
+#include "VideoBackends/Remix/RemixVertexManager.h"
 // For RemixEFBInterface::DrainAccessCounters and the shared store's colour
 // packer, both of which live with the EFB interface itself.
 #include "VideoBackends/Remix/RemixGfx.h"
@@ -227,8 +231,9 @@ void Normalize3(float* v)
 // frame accumulates error, and the camera extraction in SetupCamera assumes
 // R^-1 == R^T - so left alone the basis would slowly shear and the recovered
 // camera would stop matching the geometry it is meant to frame.
-void AffineOrthonormalize(Affine& m)
+void AffineOrthonormalize(Affine& m, bool preserve_handedness)
 {
+  const float z0[3] = {m[8], m[9], m[10]};
   float x[3] = {m[0], m[1], m[2]};
   float y[3] = {m[4], m[5], m[6]};
   Normalize3(x);
@@ -236,8 +241,28 @@ void AffineOrthonormalize(Affine& m)
   for (int k = 0; k < 3; ++k)
     y[k] -= xy * x[k];
   Normalize3(y);
-  const float z[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2],
-                      x[0] * y[1] - x[1] * y[0]};
+  float z[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2],
+                x[0] * y[1] - x[1] * y[0]};
+  // A cross product is right-handed BY CONSTRUCTION, so rebuilding row 2 from
+  // one silently converts a MIRRORED basis into a right-handed one and throws
+  // the reflection away. Some games hand us exactly that: The Force Unleashed's
+  // modelview measures det -1 on every frame.
+  //
+  // Geometry hides the damage, because the image is invariant to V - world and
+  // camera move together and the picture is unchanged. LIGHTS DO NOT, because a
+  // light's world direction is computed from XF state through V^-1 and never
+  // touches MV, so it does not participate in that cancellation. A reflected V
+  // turns a rotation of +theta into -theta, a 2*theta error against the truth,
+  // which is why TFU's lights measured world/camera 1.79-1.90 where an anchored
+  // light reads 0, and why its shadows swing while its geometry looks right.
+  // Preserving the sign drops the median light drift from 89/123 deg to 5.0/0.8.
+  //
+  // No-op for a right-handed input: the cross product already agrees with row 2.
+  if (preserve_handedness && z[0] * z0[0] + z[1] * z0[1] + z[2] * z0[2] < 0.0f)
+  {
+    for (int k = 0; k < 3; ++k)
+      z[k] = -z[k];
+  }
   m[0] = x[0];  m[1] = x[1];  m[2] = x[2];
   m[4] = y[0];  m[5] = y[1];  m[6] = y[2];
   m[8] = z[0];  m[9] = z[1];  m[10] = z[2];
@@ -960,6 +985,13 @@ bool RemixApi::Initialize(const WindowSystemInfo& wsi)
   m_gx_alpha_mask = Config::Get(Config::GFX_REMIX_GX_ALPHA_MASK);
   m_gx_light_fix = Config::Get(Config::GFX_REMIX_GX_LIGHT_FIX);
   m_gx_ras_channel = Config::Get(Config::GFX_REMIX_GX_RAS_CHANNEL);
+  m_gx_ramp_albedo_skip = Config::Get(Config::GFX_REMIX_GX_RAMP_ALBEDO_SKIP);
+  m_gx_lit_channel_texgen = Config::Get(Config::GFX_REMIX_GX_LIT_CHANNEL_TEXGEN);
+  m_gx_efb_alpha_passes = Config::Get(Config::GFX_REMIX_GX_EFB_ALPHA_PASSES);
+  m_gx_preserve_handedness = Config::Get(Config::GFX_REMIX_GX_PRESERVE_HANDEDNESS);
+  m_gx_envmap_albedo_skip = Config::Get(Config::GFX_REMIX_GX_ENVMAP_ALBEDO_SKIP);
+  m_gx_unused_stage_albedo_skip =
+      Config::Get(Config::GFX_REMIX_GX_UNUSED_STAGE_ALBEDO_SKIP);
   m_trace_colors = Config::Get(Config::GFX_REMIX_TRACE_COLORS);
   m_gx_tev_color = Config::Get(Config::GFX_REMIX_GX_TEV_COLOR);
   m_gx_texture_stage = Config::Get(Config::GFX_REMIX_GX_TEXTURE_STAGE);
@@ -1259,6 +1291,12 @@ void RemixApi::Shutdown()
 
   m_after_frame_event.reset();
   DestroyAllHandles();
+  // Synthesized masked albedos are ours, not the texture cache's, so nothing
+  // else will ever free them.
+  m_masked_textures.clear();
+  // The other half of the same idiom: a mask a priming pass left pending lives
+  // in file-scope state in the vertex manager, which nothing else tears down.
+  ResetPendingAlphaMask();
 
   // dxvk_RegisterD3D9Device TRANSFERS OWNERSHIP of the device and its
   // IDirect3D9Ex to the runtime. It stores the raw pointers without taking a
@@ -2023,6 +2061,63 @@ void RemixApi::PollRuntimeTagState()
   // auto-switch preference drives the tagging view from it, and that has to
   // keep working with routing off so a tag can be placed before the routing
   // that consumes it is switched on.
+}
+
+const RemixTexture* RemixApi::MaskedAlbedo(const RemixTexture& colour,
+                                           const std::vector<u8>& mask_pixels, u32 mask_width,
+                                           u32 mask_height, u64 mask_hash)
+{
+  const u32 width = colour.GetWidth();
+  const u32 height = colour.GetHeight();
+  if (width != mask_width || height != mask_height)
+    return nullptr;
+
+  const std::vector<u8>& colour_pixels = colour.GetPixels();
+  if (colour_pixels.empty() || colour_pixels.size() != mask_pixels.size())
+    return nullptr;
+
+  // Keyed on the PAIR: the same colour image masked two different ways is two
+  // different images, and the same pair must resolve to one texture every frame
+  // or the mesh would re-materialise continuously.
+  const u64 key = colour.GetContentHash() ^ (mask_hash * 0x9E3779B97F4A7C15ULL);
+  if (const auto it = m_masked_textures.find(key); it != m_masked_textures.end())
+    return it->second.get();
+
+  std::vector<u8> combined = colour_pixels;
+  for (size_t i = 3; i < combined.size(); i += 4)
+    combined[i] = mask_pixels[i];
+
+  // Load() repacks and hashes exactly as it does for a decoded game texture, so
+  // the result is indistinguishable from one downstream - same upload path, same
+  // content-hash identity, same LRU.
+  TextureConfig config = colour.GetConfig();
+  auto texture = std::make_unique<RemixTexture>(config);
+  texture->Load(0, width, height, width, combined.data(), combined.size(), 0);
+  if (!texture->HasData())
+    return nullptr;
+
+  // Bounded, because nothing else bounds it. Every distinct (colour, mask) pair
+  // adds a full decoded image that only Shutdown frees, while the game's own
+  // texture cache is busy evicting the sources - so a long session in a title
+  // that masks many characters would grow this without limit.
+  //
+  // Dropped wholesale rather than by LRU: the map exists to keep a mesh's
+  // material stable frame to frame, and everything still on screen is re-made
+  // on the next draw that needs it. A cap this size is not reached by any title
+  // measured here, so the cliff is a backstop rather than a working behaviour.
+  constexpr size_t MAX_MASKED_TEXTURES = 512;
+  if (m_masked_textures.size() >= MAX_MASKED_TEXTURES)
+  {
+    WARN_LOG_FMT(VIDEO,
+                 "Remix: synthesized masked-albedo cache hit {} entries and was dropped. If this "
+                 "repeats, the EFB alpha mask idiom is matching far more pairs than expected.",
+                 m_masked_textures.size());
+    m_masked_textures.clear();
+  }
+
+  const RemixTexture* result = texture.get();
+  m_masked_textures.emplace(key, std::move(texture));
+  return result;
 }
 
 u64 RemixApi::GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
@@ -3166,6 +3261,9 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
     call.texture.pixels = texture->GetPixels().data();
     // Identity for the unchanged-frame cache; the pointer above is not one.
     call.texture.content_hash = texture->GetContentHash();
+    // Carried explicitly so the rasterizer can check the buffer against the
+    // dimensions rather than trusting width*height*4 to be readable.
+    call.texture.pixels_size = texture->GetPixels().size();
     call.texture.width = texture->GetWidth();
     call.texture.height = texture->GetHeight();
     // GX TexMode0 filter: 0 = near, anything else is some flavour of linear.
@@ -3189,10 +3287,38 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // [0 0 256 256] - the exact rect of the EFB copy it feeds - and both carry
   // vertex colour 0xffffffff. They are the white screen and the white box.
   //
-  // Untextured is load-bearing: real 2D content is textured, so this cannot
-  // swallow a menu or a HUD element. The pre-world test is what separates a
-  // clear from a legitimate 2D layer drawn after the scene.
-  if (!tag_bypass && m_ui_drop_pre_world_blank && call.texture.pixels == nullptr)
+  // Untextured was believed load-bearing here - "real 2D content is textured,
+  // so this cannot swallow a menu or a HUD element". That holds for BFBB and
+  // Wind Waker and is FALSE for Mario Kart: Double Dash, whose in-race clear is
+  // a full-screen quad carrying a 4x4 texture. It sailed past this test and
+  // painted the whole overlay white over the traced frame.
+  //
+  // So take a second shape as well: blending disabled AND depth write enabled.
+  // Neither bit can be faked by 2D content. Blending disabled means the draw
+  // OVERWRITES, and in a layer composited over an already-finished image an
+  // opaque overwrite can only destroy what is under it - there is nothing in
+  // the overlay for it to legitimately cover. Writing depth is something no 2D
+  // overlay draw does at all. Measured on MK:DD frame 5003: of the 76 UI draws
+  // taken, this quad is the ONLY one with either bit set - every HUD element is
+  // blend-enabled with depth write off.
+  //
+  // ...and require the texture to be a PLACEHOLDER, not artwork. Those two bits
+  // alone would take a legitimate full-screen background that a game happens to
+  // draw opaque with z-write left on, which is a real shape - and on a frame
+  // with no world content that background IS the screen, so dropping it leaves
+  // the HUD floating over nothing. What a clear actually carries is a stand-in:
+  // MK:DD's is 4x4. No background art is 16x16 or smaller, so that bound
+  // separates the two without needing to know either game.
+  //
+  // The pre-world test below is still what separates a clear from a legitimate
+  // 2D layer drawn after the scene, and it does the real work in all shapes.
+  constexpr u32 MAX_PLACEHOLDER_TEXELS = 16 * 16;
+  const bool placeholder_texture =
+      static_cast<u32>(call.texture.width) * call.texture.height <= MAX_PLACEHOLDER_TEXELS;
+  const bool clear_shaped =
+      call.texture.pixels == nullptr ||
+      (!blend.blend_enabled && blend.depth_write && placeholder_texture);
+  if (!tag_bypass && m_ui_drop_pre_world_blank && clear_shaped)
   {
     if (m_frame_world_draws == 0)
     {
@@ -3616,6 +3742,11 @@ bool RemixApi::SubmitUiDraw(const std::vector<remixapi_HardcodedVertex>& vertice
   // composite in submission order, exactly as they did before the plane
   // existed - no tagged HUD measured so far z-tests meaningfully (RE4: ztest 0
   // on all nine).
+  // Additive coverage rule, stamped per draw for the same reason the depth
+  // fields are: the rasterizer stays a pure function of the DrawCall and never
+  // learns a knob exists.
+  call.additive_light_coverage = m_ui_additive_light_coverage;
+
   if (m_ui_depth && blend.depth_test && !perspective)
   {
     call.depth_test = true;
@@ -4276,12 +4407,27 @@ void RemixApi::EstimateView()
   // A classified skybox votes for the camera's ROTATION delta with the
   // translation missing - not a useless hypothesis but an actively wrong one,
   // which poisons the translation consensus every time the camera moves. Drop
-  // it. Only in tagging mode: mode 1 has to leave the estimate untouched, or its
-  // log-only promise is not worth anything.
+  // it.
+  //
+  // This used to be gated at >= 2, "only in tagging mode: mode 1 has to leave
+  // the estimate untouched, or its log-only promise is not worth anything".
+  // That justification was false. Mode 1 is not log-only and never was: with
+  // RemixSkyAtInfinity, which defaults on, classification already MOVES the
+  // geometry at >= 1 - as the note on that setting says outright. So the
+  // exclusion was withheld to protect a promise mode 1 does not keep, while the
+  // poisoning it prevents ran at the default.
+  //
+  // Measured on Skyward Sword (SOUE01) at mode 1, same scene, parked vs running:
+  //   w_stable   94.3% -> 0.9%      tie_breaks 0 -> 44
+  //   runner-up  0     -> 3/frame   (exactly the size of the classified set)
+  // The runner-up bloc appears only once the camera translates and is exactly
+  // the sky's own size. Parked, a skybox's translation-free delta happens to BE
+  // correct, which is why this hides in any capture taken standing still.
+  //
   // m_view_samples is keyed by MESH hash while the classified set holds GEOMETRY
   // hashes, so this has to go through the mesh record to translate rather than
   // erasing by key directly.
-  if (m_sky_auto_detect >= 2)
+  if (m_sky_auto_detect >= 1)
   {
     for (auto it = m_view_samples.begin(); it != m_view_samples.end();)
     {
@@ -4420,7 +4566,7 @@ void RemixApi::EstimateView()
 
     m_view_miss_streak = 0;
     m_view = AffineMultiply(delta, m_view);
-    AffineOrthonormalize(m_view);
+    AffineOrthonormalize(m_view, m_gx_preserve_handedness);
   }
   else if (deltas.size() >= 2)
   {
@@ -4830,7 +4976,7 @@ void RemixApi::ResolveDominantModelview()
   m_modelview_camera = AffineMultiply(m_modelview_top, m_modelview_world_offset);
   // Belt and braces: SetupCamera extracts the basis assuming R^-1 == R^T, and
   // AffineIsRigid above only holds the rows to 0.02.
-  AffineOrthonormalize(m_modelview_camera);
+  AffineOrthonormalize(m_modelview_camera, m_gx_preserve_handedness);
   m_modelview_camera_valid = true;
 }
 
@@ -6108,6 +6254,10 @@ void RemixApi::RefreshLiveConfig()
   // DrawCall), so live for the same A/B reason: on-vs-off is how a wrong-order
   // HUD is diagnosed without a restart.
   m_ui_depth = Config::Get(Config::GFX_REMIX_UI_DEPTH);
+  // Stamped into every recorded DrawCall, so live for the same reason the depth
+  // fields are: on-vs-off is the whole diagnosis for a scene hidden behind an
+  // additive full-screen pass.
+  m_ui_additive_light_coverage = Config::Get(Config::GFX_REMIX_UI_ADDITIVE_LIGHT_COVERAGE);
   // The tagging view has to be live or it is useless: flip on, click, flip off.
   m_ui_world_view = Config::Get(Config::GFX_REMIX_UI_WORLD_VIEW);
   // The quarter-screen fixes. Both are consumed per draw against state learned

@@ -546,6 +546,42 @@ u8 ToVkDstFactor(DstBlendFactor factor)
 // when a colour factor is asked of the alpha equation. Straight out of
 // RenderState.cpp:78-108, and load-bearing: leaving DstAlpha in place on an
 // RGB8 target makes the runtime read a blend mode the console never performed.
+// Stand the SOURCE alpha in for a destination-alpha factor. There is no
+// destination alpha channel on this backend to honour, but a game using the
+// EFB-alpha-mask idiom primes that alpha in an earlier, colour-less pass drawing
+// the SAME geometry with the SAME texture - so the mask it blends against is
+// that texture's own alpha, and feeding the source alpha reproduces the shape
+// the mask encoded using data we still have.
+//
+// Wind Waker's eyes and eyebrows: with the mask gone their quad covered Link's
+// face in the eye texture's black surround; with this, the texture's alpha cuts
+// it back to the eye shape.
+SrcBlendFactor DstAlphaAsSrcAlpha(SrcBlendFactor factor)
+{
+  switch (factor)
+  {
+  case SrcBlendFactor::DstAlpha:
+    return SrcBlendFactor::SrcAlpha;
+  case SrcBlendFactor::InvDstAlpha:
+    return SrcBlendFactor::InvSrcAlpha;
+  default:
+    return factor;
+  }
+}
+
+DstBlendFactor DstAlphaAsSrcAlpha(DstBlendFactor factor)
+{
+  switch (factor)
+  {
+  case DstBlendFactor::DstAlpha:
+    return DstBlendFactor::SrcAlpha;
+  case DstBlendFactor::InvDstAlpha:
+    return DstBlendFactor::InvSrcAlpha;
+  default:
+    return factor;
+  }
+}
+
 SrcBlendFactor RemoveDstAlphaUsage(SrcBlendFactor factor)
 {
   switch (factor)
@@ -1041,6 +1077,29 @@ u32 ApplyTevColorFold(const TevColorFold& fold, u32 color)
   return out;
 }
 
+// The mask a colour-less pass primed the EFB alpha with, for the colour pass
+// that follows to be cut to. Deliberately not cleared per frame: the only thing
+// that consumes it is a draw blending on destination alpha whose own albedo is
+// opaque and the same size, which is the idiom itself and nothing else.
+//
+// The PIXELS are copied rather than the texture borrowed. The priming pass and
+// the colour pass are different draws, and the texture cache is free to evict
+// the mask in between - a borrowed pointer here would be read after free, which
+// is the same defect the UI rasterizer's texel arena exists to prevent. One
+// mask per frame, so the copy is not worth avoiding.
+std::vector<u8> s_pending_alpha_mask_pixels;
+u32 s_pending_alpha_mask_width = 0;
+u32 s_pending_alpha_mask_height = 0;
+u64 s_pending_alpha_mask_hash = 0;
+// ...and the frame it was primed in. A mask is only meaningful to draws in the
+// SAME frame: the EFB alpha it stands for is cleared between frames on console,
+// so letting one survive into the next frame would let an unrelated object be
+// cut to the shape of whatever was masked last frame.
+// u64 to match FrameIndex(). Narrowing it to u32 would let frame N and frame
+// N + 2^32 compare equal, which is the one comparison this guard exists to get
+// right.
+u64 s_pending_alpha_mask_frame = ~0ull;
+
 void ResolveBlend(DrawBlendState& out, FrameStats& stats)
 {
   const BlendMode& mode = bpmem.blendmode;
@@ -1077,6 +1136,17 @@ void ResolveBlend(DrawBlendState& out, FrameStats& stats)
     {
       src = RemoveDstAlphaUsage(src);
       dst = RemoveDstAlphaUsage(dst);
+    }
+    else if (g_remix_api->GxEfbAlphaPassesEnabled() &&
+             (src == SrcBlendFactor::DstAlpha || src == SrcBlendFactor::InvDstAlpha ||
+              dst == DstBlendFactor::DstAlpha || dst == DstBlendFactor::InvDstAlpha))
+    {
+      // The target HAS an alpha channel, so the hardware kept the destination-
+      // alpha factor - and we have no such channel to honour it with. Stand the
+      // source's own alpha in for the mask; see DstAlphaAsSrcAlpha.
+      src = DstAlphaAsSrcAlpha(src);
+      dst = DstAlphaAsSrcAlpha(dst);
+      ++stats.dst_alpha_substituted;
     }
     // The alpha equation cannot reference a colour, and note the crossover: the
     // SOURCE factor loses its destination-colour term and vice versa.
@@ -1203,6 +1273,264 @@ bool IsIdentityTexMatrix(const float* m)
          m[5] == 1.0f && m[6] == 0.0f && m[7] == 0.0f;
 }
 
+// Whether a TEV stage's COLOUR combiner actually references the texture it has
+// bound. A stage can be texture-ENABLED and still never mention TEXC/TEXA in its
+// arithmetic, in which case the texmap it names contributes nothing to the
+// picture and is the wrong thing to hand Remix as albedo.
+//
+// This is a stronger test than the two coordinate hatches below, which key on
+// what a coordinate is generated FROM - a lit-channel ramp, a normal-sourced env
+// map - and so infer from a side channel what a texture is for. The combiner
+// says outright whether the texture matters.
+//
+// Alpha-only use is deliberately NOT counted. A stage sampling its texture purely
+// for TevAlphaArg::TexAlpha is using it as a mask, and a mask is not the surface
+// colour - which is the exact mistake being corrected here.
+bool StageUsesItsTexture(u32 stage)
+{
+  if (stage >= 16)
+    return false;
+  const auto& cc = bpmem.combiners[stage].colorC;
+  const auto uses = [](u32 arg) { return arg == 8 || arg == 9; };  // TEXC, TEXA
+  return uses(static_cast<u32>(cc.a.Value())) || uses(static_cast<u32>(cc.b.Value())) ||
+         uses(static_cast<u32>(cc.c.Value())) || uses(static_cast<u32>(cc.d.Value()));
+}
+
+// Whether a texture coordinate is generated from the vertex NORMAL, which is how
+// an environment map is addressed: the normal picks the reflection texel.
+bool IsNormalSourcedCoord(u32 coord)
+{
+  if (coord >= xfmem.numTexGen.numTexGens || coord >= 8)
+    return false;
+  // SourceRow::Normal is the input row, distinct from texgentype: an env map is
+  // a REGULAR texgen whose source row happens to be the normal. Testing the type
+  // misses it entirely, which is why this went unnoticed.
+  return xfmem.texMtxInfo[coord].sourcerow == SourceRow::Normal;
+}
+
+// Whether a texture coordinate is GENERATED FROM a lit colour channel, which is
+// how a cel-shaded draw addresses its toon ramp: the lighting result becomes the
+// lookup into a gradient. A texture sampled through such a coordinate is a
+// shading gradient, not the surface.
+bool IsLitChannelCoord(u32 coord)
+{
+  if (coord >= xfmem.numTexGen.numTexGens || coord >= 8)
+    return false;
+  const TexGenType type = xfmem.texMtxInfo[coord].texgentype;
+  return type == TexGenType::Color0 || type == TexGenType::Color1;
+}
+
+// ---- GX per-vertex lighting ---------------------------------------------
+//
+// Ported from the software renderer's TransformUnit (CalculateLightAttn,
+// LightColor, LightAlpha and TransformColor - TransformUnit.cpp:194-401),
+// which is this tree's reference implementation of the GX lighting pipe.
+//
+// This exists ONLY to serve Color0/Color1 texgen. For the RASTER colour the
+// translator still ships the material colour and lets the path tracer light the
+// surface, which is the right call there. It is the wrong call here: a
+// Color0/Color1 texgen does not consume the lit channel as a colour, it
+// consumes it as an INDEX into a toon ramp. Substituting the raw vertex colour
+// - or white, when the vertex format carries no colour attribute at all -
+// collapses every vertex onto a single texel and the surface renders flat.
+// Wind Waker's characters are the case that exposed this, but it is a whole
+// CLASS of cel-shaded GameCube/Wii titles, not one game's quirk.
+
+float Dot3(const float* a, const float* b)
+{
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// True when the vector had enough length to normalize. The reference divides
+// unconditionally and leans on an == Vec3(0,0,0) test to catch the degenerate
+// case, which a 0/0 NaN slips straight through. A NaN here would leave as a
+// texture coordinate, so report the failure rather than propagate it.
+bool NormalizeChecked(float* v)
+{
+  const float length = std::sqrt(Dot3(v, v));
+  if (!(length > 1e-8f))
+    return false;
+  v[0] /= length;
+  v[1] /= length;
+  v[2] /= length;
+  return true;
+}
+
+float SafeDivide(float n, float d)
+{
+  return (d == 0.0f) ? (n > 0.0f ? 1.0f : 0.0f) : n / d;
+}
+
+// XF register colours - matColor, ambColor and Light::color - are stored with
+// ALPHA in the low byte, i.e. memory order A, B, G, R. Vertex-buffer colours
+// are the other way round, memory order R, G, B, A. Handing one to the other's
+// reader swaps red and blue, and on a ramp lookup that never looks like a
+// colour error, only like the wrong texel.
+void ReadXfRegisterColor(u32 reg, float* out_rgba)
+{
+  out_rgba[0] = static_cast<float>((reg >> 24) & 0xFFu);
+  out_rgba[1] = static_cast<float>((reg >> 16) & 0xFFu);
+  out_rgba[2] = static_cast<float>((reg >> 8) & 0xFFu);
+  out_rgba[3] = static_cast<float>(reg & 0xFFu);
+}
+
+// Attenuation for one light, and normalizes ldir in place the way the caller's
+// diffuse term expects. Mirrors CalculateLightAttn.
+float LightAttenuation(const Light& light, float* ldir, const float* normal,
+                       const LitChannel& chan)
+{
+  switch (chan.attnfunc)
+  {
+  case AttenuationFunc::Spec:
+  {
+    NormalizeChecked(ldir);
+    const float facing =
+        Dot3(ldir, normal) >= 0.0f ? std::max(0.0f, Dot3(light.ddir, normal)) : 0.0f;
+    const float att_len[3] = {1.0f, facing, facing * facing};
+    float dist_attn[3] = {light.distatt[0], light.distatt[1], light.distatt[2]};
+    if (chan.diffusefunc != DiffuseFunc::None)
+      NormalizeChecked(dist_attn);
+    return SafeDivide(std::max(0.0f, Dot3(att_len, light.cosatt)), Dot3(att_len, dist_attn));
+  }
+
+  case AttenuationFunc::Spot:
+  {
+    const float dist2 = Dot3(ldir, ldir);
+    const float dist = std::sqrt(dist2);
+    if (!NormalizeChecked(ldir))
+      return 0.0f;
+    const float spot = std::max(0.0f, Dot3(ldir, light.ddir));
+    const float cos_attn =
+        light.cosatt[0] + (light.cosatt[1] * spot) + (light.cosatt[2] * spot * spot);
+    const float dist_attn =
+        light.distatt[0] + (light.distatt[1] * dist) + (light.distatt[2] * dist2);
+    return SafeDivide(std::max(0.0f, cos_attn), dist_attn);
+  }
+
+  case AttenuationFunc::None:
+  case AttenuationFunc::Dir:
+  default:
+    // A light pointing straight at the surface it is already on has no
+    // direction to offer; the reference substitutes the normal.
+    if (!NormalizeChecked(ldir))
+    {
+      ldir[0] = normal[0];
+      ldir[1] = normal[1];
+      ldir[2] = normal[2];
+    }
+    return 1.0f;
+  }
+}
+
+// The diffuse weight the two accumulators share.
+float DiffuseScale(const LitChannel& chan, float attn, const float* ldir, const float* normal)
+{
+  switch (chan.diffusefunc)
+  {
+  case DiffuseFunc::Sign:
+    return attn * Dot3(ldir, normal);
+  case DiffuseFunc::Clamp:
+    return attn * std::max(0.0f, Dot3(ldir, normal));
+  case DiffuseFunc::None:
+  default:
+    return attn;
+  }
+}
+
+// Mirrors LightColor. Position and normal are MODELVIEW space - GX lights live
+// in view space, so feeding object-space attributes here lights the model in
+// whatever pose the artist modelled it, not the pose it is in.
+void AccumulateLightColor(const Light& light, const float* position, const float* normal,
+                          const LitChannel& chan, float* acc_rgb)
+{
+  float ldir[3] = {light.dpos[0] - position[0], light.dpos[1] - position[1],
+                   light.dpos[2] - position[2]};
+  const float scale = DiffuseScale(chan, LightAttenuation(light, ldir, normal, chan), ldir, normal);
+
+  // Light::color is A, B, G, R in memory order.
+  acc_rgb[0] += static_cast<float>(light.color[3]) * scale;
+  acc_rgb[1] += static_cast<float>(light.color[2]) * scale;
+  acc_rgb[2] += static_cast<float>(light.color[1]) * scale;
+}
+
+// Mirrors LightAlpha, which weights the light's ALPHA byte rather than its RGB.
+void AccumulateLightAlpha(const Light& light, const float* position, const float* normal,
+                          const LitChannel& chan, float& acc_alpha)
+{
+  float ldir[3] = {light.dpos[0] - position[0], light.dpos[1] - position[1],
+                   light.dpos[2] - position[2]};
+  const float scale = DiffuseScale(chan, LightAttenuation(light, ldir, normal, chan), ldir, normal);
+
+  acc_alpha += static_cast<float>(light.color[0]) * scale;
+}
+
+// One XF colour channel's lit result as RGBA in 0..255. Mirrors TransformColor,
+// which computes both channels unconditionally rather than gating on
+// numColorChans - kept that way deliberately, so a game that points a texgen at
+// a channel it never declared still gets the value hardware would have given it.
+void ComputeLitChannel(u32 chan, const float* mv_position, const float* mv_normal,
+                       const float* vertex_rgba, float* out_rgba)
+{
+  const LitChannel& colorchan = xfmem.color[chan];
+  const LitChannel& alphachan = xfmem.alpha[chan];
+
+  float mat_reg[4];
+  ReadXfRegisterColor(xfmem.matColor[chan], mat_reg);
+  float amb_reg[4];
+  ReadXfRegisterColor(xfmem.ambColor[chan], amb_reg);
+
+  float mat[4];
+  for (int i = 0; i < 3; ++i)
+    mat[i] = (colorchan.matsource == MatSource::Vertex) ? vertex_rgba[i] : mat_reg[i];
+  mat[3] = (alphachan.matsource == MatSource::Vertex) ? vertex_rgba[3] : mat_reg[3];
+
+  if (colorchan.enablelighting)
+  {
+    float acc[3];
+    for (int i = 0; i < 3; ++i)
+      acc[i] = (colorchan.ambsource == AmbSource::Vertex) ? vertex_rgba[i] : amb_reg[i];
+
+    const u32 mask = colorchan.GetFullLightMask();
+    for (u32 i = 0; i < 8; ++i)
+    {
+      if (mask & (1u << i))
+        AccumulateLightColor(xfmem.lights[i], mv_position, mv_normal, colorchan, acc);
+    }
+
+    // The (l + (l >> 7)) term maps 0..255 onto a 0..256 multiplier so that a
+    // fully lit channel reproduces the material colour exactly.
+    for (int i = 0; i < 3; ++i)
+    {
+      const int l = std::clamp(static_cast<int>(acc[i]), 0, 255);
+      out_rgba[i] = static_cast<float>((static_cast<int>(mat[i]) * (l + (l >> 7))) >> 8);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < 3; ++i)
+      out_rgba[i] = mat[i];
+  }
+
+  if (alphachan.enablelighting)
+  {
+    float acc = (alphachan.ambsource == AmbSource::Vertex) ? vertex_rgba[3] : amb_reg[3];
+
+    const u32 mask = alphachan.GetFullLightMask();
+    for (u32 i = 0; i < 8; ++i)
+    {
+      if (mask & (1u << i))
+        AccumulateLightAlpha(xfmem.lights[i], mv_position, mv_normal, alphachan, acc);
+    }
+
+    const int l = std::clamp(static_cast<int>(acc), 0, 255);
+    out_rgba[3] = static_cast<float>((static_cast<int>(mat[3]) * (l + (l >> 7))) >> 8);
+  }
+  else
+  {
+    out_rgba[3] = mat[3];
+  }
+}
+
 bool IsTrivialTexGen(const TexGenState& state)
 {
   if (!state.enabled)
@@ -1226,7 +1554,8 @@ bool IsTrivialTexGen(const TexGenState& state)
 // normalized and lets the sampler scale, and so does Remix.
 void GenerateTexCoord(const TexGenState& state, const u8* vertex,
                       const PortableVertexDeclaration& decl, const float* position,
-                      const float* normal, float* out_uv)
+                      const float* normal, const float* mv_position, const float* mv_normal,
+                      float* out_uv)
 {
   float src[3] = {0.0f, 0.0f, 0.0f};
   switch (state.type)
@@ -1234,18 +1563,46 @@ void GenerateTexCoord(const TexGenState& state, const u8* vertex,
   case TexGenType::Color0:
   case TexGenType::Color1:
   {
-    // The channel colour's first two components become the coordinate. Reading
-    // the vertex attribute rather than a lit channel is the same shortcut taken
-    // for the raster colour: the lighting term is the path tracer's job.
-    const int slot = state.type == TexGenType::Color0 ?
-                         (decl.colors[0].enable ? 0 : -1) :
-                         (decl.colors[1].enable ? 1 : (decl.colors[0].enable ? 0 : -1));
-    u32 color = 0xFFFFFFFFu;
-    if (slot >= 0)
-      std::memcpy(&color, vertex + decl.colors[slot].offset, sizeof(u32));
-    // Vertex colours are stored R, G, B, A in memory order.
-    out_uv[0] = static_cast<float>(color & 0xFFu) / 255.0f;
-    out_uv[1] = static_cast<float>((color >> 8) & 0xFFu) / 255.0f;
+    // The LIT channel's R and G become the coordinate - see the note above
+    // ComputeLitChannel for why the lighting has to be evaluated here rather
+    // than deferred to the path tracer like the raster colour is.
+    const u32 chan = state.type == TexGenType::Color0 ? 0u : 1u;
+
+    // A channel may name the vertex as its material or ambient source on a
+    // format that carries no colour for it. White is the benign stand-in and
+    // matches what the rest of this translator assumes for a missing colour.
+    //
+    // Which attribute feeds the channel is VertexSlotForChannel's job, not
+    // `decl.colors[chan]`. The two differ whenever the attributes are not
+    // populated in order: a vertex carrying only colour1 has it redirected to
+    // channel 0 by the hardware, so indexing by channel would read a disabled
+    // attribute and stand white in for a colour that is right there.
+    const int color_slot = VertexSlotForChannel(decl, chan);
+    float vertex_rgba[4] = {255.0f, 255.0f, 255.0f, 255.0f};
+    if (color_slot >= 0)
+    {
+      u32 color = 0xFFFFFFFFu;
+      std::memcpy(&color, vertex + decl.colors[color_slot].offset, sizeof(u32));
+      // Vertex colours are stored R, G, B, A in memory order.
+      vertex_rgba[0] = static_cast<float>(color & 0xFFu);
+      vertex_rgba[1] = static_cast<float>((color >> 8) & 0xFFu);
+      vertex_rgba[2] = static_cast<float>((color >> 16) & 0xFFu);
+      vertex_rgba[3] = static_cast<float>((color >> 24) & 0xFFu);
+    }
+
+    if (!g_remix_api->GxLitChannelTexGenEnabled())
+    {
+      // Pre-fix behaviour: the raw vertex colour stands in for the lit channel,
+      // which reads one texel of the ramp for the whole surface.
+      out_uv[0] = vertex_rgba[0] / 255.0f;
+      out_uv[1] = vertex_rgba[1] / 255.0f;
+      return;
+    }
+
+    float lit[4];
+    ComputeLitChannel(chan, mv_position, mv_normal, vertex_rgba, lit);
+    out_uv[0] = lit[0] / 255.0f;
+    out_uv[1] = lit[1] / 255.0f;
     return;
   }
   case TexGenType::EmbossMap:
@@ -1567,6 +1924,19 @@ UiPlacement ComputeUiPlacement()
 }
 }  // namespace
 
+void ResetPendingAlphaMask()
+{
+  // shrink_to_fit as well as clear: a mask is a full decoded image, and holding
+  // that capacity for a game that is no longer running is the same waste the
+  // masked-albedo cache is cleared to avoid.
+  s_pending_alpha_mask_pixels.clear();
+  s_pending_alpha_mask_pixels.shrink_to_fit();
+  s_pending_alpha_mask_width = 0;
+  s_pending_alpha_mask_height = 0;
+  s_pending_alpha_mask_hash = 0;
+  s_pending_alpha_mask_frame = ~0ull;
+}
+
 VertexManager::VertexManager() = default;
 
 VertexManager::~VertexManager() = default;
@@ -1740,6 +2110,45 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     return;
   }
 
+  // The MASK-PRIMING half of the EFB-alpha-mask idiom, which the rule above lets
+  // through whenever the target has an alpha channel. A game wanting a per-pixel
+  // stencil first draws with colour writes OFF to prime the EFB's alpha, then
+  // draws again blending against that alpha. The priming pass puts no colour on
+  // screen on console - that is the whole point of it - but the test above
+  // demands a draw write neither colour NOR alpha, so on an RGBA6_Z24 target
+  // (which is exactly what such a game selects, because it needs the alpha) the
+  // priming pass survived and was submitted as opaque geometry.
+  //
+  // Wind Waker's Link is the case this exists for: measured from the game's own
+  // command stream, its head texture is drawn colour_update=false /
+  // alpha_update=true, 18 draws a frame, and that is what painted a solid black
+  // bar across his eyes and eyebrows.
+  //
+  // The masked pass that follows is NOT dropped - dropping it removed Link's
+  // eyes altogether, because it carries colour_update TRUE and is what actually
+  // paints them. It is instead re-based onto the source's own alpha, in
+  // ResolveBlend; see DstAlphaAsSrcAlpha.
+  if (g_remix_api->GxEfbAlphaPassesEnabled() && !writes_colour)
+  {
+    // Remember what this pass primed the mask WITH before dropping it. When the
+    // colour pass that follows carries an opaque texture of its own, this is the
+    // only place the shape it should take exists.
+    if (bpmem.tevorders[0].getEnable(0) != 0)
+    {
+      const RemixTexture* mask = g_remix_api->GetBoundTexture(bpmem.tevorders[0].getTexMap(0));
+      if (mask != nullptr && mask->HasData() && mask->MinAlpha() < 255)
+      {
+        s_pending_alpha_mask_pixels = mask->GetPixels();
+        s_pending_alpha_mask_width = mask->GetWidth();
+        s_pending_alpha_mask_height = mask->GetHeight();
+        s_pending_alpha_mask_hash = mask->GetContentHash();
+        s_pending_alpha_mask_frame = g_remix_api->FrameIndex();
+      }
+    }
+    ++stats.skipped_alpha_only;
+    return;
+  }
+
   // Scissored away entirely. Every reference clips every draw - the software
   // rasterizer rejects pixels outside the scissor rect (Rasterizer.cpp:364-365)
   // and the hardware backends set the scissor per draw (BPFunctions.cpp:103-104)
@@ -1817,6 +2226,106 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       break;
     }
   }
+  // Stage 0 samples a toon RAMP, not the surface. A Color0/Color1 texgen
+  // generates the coordinate from the lit channel - so the image it names is a
+  // shading gradient. Only one texture reaches Remix as the albedo, and handing
+  // it the ramp paints the model in the ramp: Wind Waker's characters came out
+  // flat yellow. Shading is the path tracer's job, so take the real texture off
+  // a later stage and let the ramp go. Measured on Wind Waker: 97.6% of
+  // lit-channel draws (3926 of 4022) took their albedo from the ramp stage.
+  else if (stage0_textured && g_remix_api->GxRampAlbedoSkipEnabled() &&
+           IsLitChannelCoord(bpmem.tevorders[0].getTexCoord(0)))
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      // Another ramp stage is no better than the first one.
+      if (IsLitChannelCoord(bpmem.tevorders[stage >> 1].getTexCoord(stage & 1)))
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_stage = stage;
+      ++stats.texture_ramp_skipped;
+      break;
+    }
+    // No non-ramp stage to fall back on: keep stage 0 rather than drop the
+    // draw's texturing entirely, which is the lesser of the two wrongs.
+  }
+  // Stage 0 samples an ENVIRONMENT MAP - a texture indexed by the vertex normal.
+  // Structurally identical to the ramp case above: the image stage 0 names is a
+  // shading term, not the surface, and only one texture reaches Remix.
+  //
+  // Measured on Skyward Sword: 6060 of 7529 traced draws (80.5%) had a
+  // normal-sourced stage 0 with a real-UV texmap available, and the median
+  // albedo went from 1024 to 16384 texels. It presented as "all world geometry
+  // is flat solid colour" - every surface wearing a 32x32 reflection while its
+  // real texture, up to 256x256, sat unused on a later stage.
+  //
+  // Dropping the reflection is doubly right here: a baked env map is exactly
+  // what a path tracer replaces with a real one.
+  else if (stage0_textured && g_remix_api->GxEnvMapAlbedoSkipEnabled() &&
+           IsNormalSourcedCoord(bpmem.tevorders[0].getTexCoord(0)))
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      const u32 coord = bpmem.tevorders[stage >> 1].getTexCoord(stage & 1);
+      // Another env map, or a ramp, is no better than the stage we are leaving.
+      if (IsNormalSourcedCoord(coord) || IsLitChannelCoord(coord))
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_stage = stage;
+      ++stats.texture_envmap_skipped;
+      break;
+    }
+    // Nothing better to fall back on: keep stage 0. A canned reflection as
+    // albedo is wrong, but an untextured draw is worse, and the same "lesser of
+    // two wrongs" reasoning as the ramp branch applies.
+  }
+  // Stage 0 binds a texture and its combiner NEVER REFERENCES IT. The texmap it
+  // names contributes nothing to the picture, so handing it to Remix as albedo
+  // ships a texture the game does not draw with.
+  //
+  // Super Mario Galaxy's characters are this shape:
+  //   stage 0: lerp(ZERO, C0, RAS) + C0       tm1   <- no TEX anywhere in it
+  //   stage 1: lerp(ZERO, RAS, APREV) + CPREV tm0
+  //   stage 2: lerp(C1, TEX, RAS) + CPREV     tm0   <- the texture is used HERE
+  // so Mario arrived wearing a 64x64 near-white mask (mean 243,243,243) while
+  // his real 128x256 texture sat on tm0 unused. Measured on RMGE01: 3540 draws,
+  // median albedo 4096 -> 16384 texels, largest swap 4096 -> 32768 on 1164 draws.
+  //
+  // This branch is LAST on purpose. It is strictly stronger than the two
+  // coordinate hatches above - they infer a texture's PURPOSE from its
+  // coordinate, while this reads whether it is used at all - so it likely
+  // subsumes both. Those two are narrower and already playtested in-game, and
+  // demoting them now would reopen closed questions. Consolidating is a
+  // follow-up with its own A/B, not a side effect of this change.
+  else if (stage0_textured && g_remix_api->GxUnusedStageAlbedoSkipEnabled() &&
+           !StageUsesItsTexture(0))
+  {
+    const u32 tev_stages = std::min<u32>(bpmem.genMode.numtevstages + 1, 16);
+    for (u32 stage = 1; stage < tev_stages; ++stage)
+    {
+      if (bpmem.tevorders[stage >> 1].getEnable(stage & 1) == 0)
+        continue;
+      // The stage has to USE its texture, or we would only be moving the same
+      // mistake one stage along.
+      if (!StageUsesItsTexture(stage))
+        continue;
+      const u32 coord = bpmem.tevorders[stage >> 1].getTexCoord(stage & 1);
+      if (IsNormalSourcedCoord(coord) || IsLitChannelCoord(coord))
+        continue;
+      albedo_texmap = bpmem.tevorders[stage >> 1].getTexMap(stage & 1);
+      albedo_stage = stage;
+      ++stats.texture_unused_stage_skipped;
+      break;
+    }
+    // No stage uses a texture at all: keep stage 0 rather than dropping
+    // texturing, the same lesser-of-two-wrongs as the branches above.
+  }
   const RemixTexture* albedo = nullptr;
   u8 filter_mode = 1;   // MDL Filter::Linear
   u8 wrap_mode_u = 1;   // MDL WrapMode::Repeat
@@ -1851,7 +2360,15 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       // before this change, so falling back to that is strictly no worse -
       // whereas skipping it would make geometry disappear that used to be
       // visible, which is a regression dressed up as a fix.
-      if (stage0_textured)
+      //
+      // `albedo_stage == 0` is the test, NOT `stage0_textured`. The two agreed
+      // while the only redirect was the one for an untextured stage 0, which
+      // cannot fire when stage0_textured is true. The albedo-purpose rules
+      // below redirect a draw whose stage 0 IS textured, so stage0_textured no
+      // longer implies that `albedo` came from stage 0 - and dropping the draw
+      // over a later stage's missing texture is exactly the regression this
+      // guard exists to prevent.
+      if (stage0_textured && albedo_stage == 0)
       {
         ++stats.skipped_efb_texture;
         return;
@@ -1891,7 +2408,12 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     // here through a later stage rendered untextured before, and making
     // geometry disappear that used to be visible would be a regression dressed
     // up as a fix.
-    else if (stage0_textured && g_remix_api->EfbDestinationDiscarded(texture_addr))
+    // Gated on `albedo_stage == 0` for the same reason as the test above:
+    // `texture_addr` is the address of whichever stage the albedo came from, so
+    // without it a later stage sampling a discarded destination would drop a
+    // draw whose stage 0 is perfectly fine.
+    else if (stage0_textured && albedo_stage == 0 &&
+             g_remix_api->EfbDestinationDiscarded(texture_addr))
     {
       ++stats.skipped_efb_discarded;
       return;
@@ -1913,8 +2435,54 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
   // opposed to `albedo`, which is now whichever stage actually shades the draw.
   // Keeping the two apart is what lets the later-stage lookup above be a pure
   // shading change.
+  //
+  // Looked up from `stage0_texmap` rather than read off `albedo`, and that is
+  // load-bearing twice over. `albedo` is a later stage's texture whenever one of
+  // the albedo-purpose rules redirected it - which on Skyward Sword is 80.5% of
+  // traced draws - so hashing it would silently swap the identity of most of the
+  // scene and stop a tagged sky matching the sky list. And the fallback above
+  // resets `albedo_stage` to 0 after nulling `albedo`, so the stage the albedo
+  // came from cannot be reconstructed here either.
+  const RemixTexture* const stage0_texture =
+      stage0_textured ? g_remix_api->GetBoundTexture(stage0_texmap) : nullptr;
   const u64 stage0_texture_hash =
-      stage0_textured && albedo != nullptr ? albedo->GetContentHash() : 0;
+      stage0_texture != nullptr ? stage0_texture->GetContentHash() : 0;
+
+  // The EFB-alpha-mask idiom, completed. A colour-less pass just primed a mask
+  // using a texture that HAS alpha, and this draw blends against that mask while
+  // its own texture is fully opaque - so the shape it is supposed to take exists
+  // only in the mask. Combine them, because a material here can carry opacity
+  // nowhere except in its albedo's alpha.
+  //
+  // Wind Waker's eyebrows never reach this: their mask and their colour are the
+  // same texture, so the rebase in ResolveBlend already finds the shape and
+  // MinAlpha() is 0. Its eyes do, because the two are different textures.
+  //
+  // Computed AFTER stage0_texture_hash deliberately - that hash is an identity
+  // decision (the sky list keys on it) and must keep naming the game's own
+  // texture, not a combination this backend invented.
+  if (!s_pending_alpha_mask_pixels.empty() &&
+      s_pending_alpha_mask_frame == g_remix_api->FrameIndex() && albedo != nullptr &&
+      albedo->MinAlpha() == 255 && g_remix_api->GxEfbAlphaPassesEnabled() &&
+      bpmem.blendmode.blend_enable &&
+      (bpmem.blendmode.src_factor == SrcBlendFactor::DstAlpha ||
+       bpmem.blendmode.src_factor == SrcBlendFactor::InvDstAlpha ||
+       bpmem.blendmode.dst_factor == DstBlendFactor::DstAlpha ||
+       bpmem.blendmode.dst_factor == DstBlendFactor::InvDstAlpha))
+  {
+    if (const RemixTexture* masked = g_remix_api->MaskedAlbedo(
+            *albedo, s_pending_alpha_mask_pixels, s_pending_alpha_mask_width,
+            s_pending_alpha_mask_height, s_pending_alpha_mask_hash))
+    {
+      albedo = masked;
+      ++stats.dst_alpha_masked;
+    }
+    // The mask is deliberately NOT cleared here. One priming pass serves every
+    // colour draw that follows it, and Wind Waker's two eyes are exactly that:
+    // two colour draws sharing one mask. Consuming it on the first left the
+    // second eye unmasked - a white quad on one side of Link's face and a
+    // correct eye on the other.
+  }
 
   u8 alpha_test_type = 7;
   u8 alpha_reference = 0;
@@ -2014,6 +2582,18 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
     if (!IsTrivialTexGen(texgen))
       ++stats.texgen_nontrivial;
   }
+
+  // A Color0/Color1 texgen turns the lit channel into a texture coordinate, so
+  // those draws - and only those - have to pay for GX lighting per vertex. It
+  // wants MODELVIEW space, which neither branch of the vertex loop below leaves
+  // lying around: the bake branch transforms into it but the skinned branch
+  // deliberately keeps object space, so compute it separately for this purpose.
+  const bool texgen_needs_lighting =
+      texgen.enabled && g_remix_api->GxLitChannelTexGenEnabled() &&
+      (texgen.type == TexGenType::Color0 || texgen.type == TexGenType::Color1);
+  const u32 default_matrix_index =
+      uniform_matrix ? uniform_matrix_index :
+                       static_cast<u32>(g_main_cp_state.matrix_index_a.PosNormalMtxIdx);
 
   // Which XF lights this draw switches on, and what each one means to it. Both
   // live on the referencing CHANNEL rather than on the light, so both are
@@ -2336,8 +2916,31 @@ void VertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_v
       dst.normal[2] = normal[2];
     }
 
+    // Modelview position and normal, for GX lighting only. The normal defaults
+    // to facing the viewer so an unlit-but-normal-less vertex still lands on a
+    // defined ramp texel rather than whatever the diffuse dot happens to be.
+    float mv_position[3] = {0.0f, 0.0f, 0.0f};
+    float mv_normal[3] = {0.0f, 0.0f, 1.0f};
+    if (texgen_needs_lighting)
+    {
+      u32 lighting_matrix_index = default_matrix_index;
+      if (per_vertex_matrix)
+      {
+        std::memcpy(&lighting_matrix_index, src + decl.posmtx.offset, sizeof(u32));
+        lighting_matrix_index &= 0x3f;
+      }
+
+      const float* const lighting_matrix = &xfmem.posMatrices[lighting_matrix_index * 4];
+      TransformPosition(lighting_matrix, position, mv_position);
+      if (has_normals)
+      {
+        TransformNormal3(NormalMatrixFor(lighting_matrix_index), normal, mv_normal);
+        Normalize(mv_normal);
+      }
+    }
+
     if (texgen.enabled)
-      GenerateTexCoord(texgen, src, decl, position, normal, dst.texcoord);
+      GenerateTexCoord(texgen, src, decl, position, normal, mv_position, mv_normal, dst.texcoord);
     else if (texcoord_components > 0)
       ReadFloats(src + decl.texcoords[texcoord_slot].offset, dst.texcoord, texcoord_components);
 

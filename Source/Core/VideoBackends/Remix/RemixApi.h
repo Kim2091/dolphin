@@ -58,6 +58,9 @@ struct FrameStats
   // Draws that write neither colour nor alpha, or whose alpha test can never
   // pass. Depth-only geometry in a backend that has no depth buffer.
   u32 skipped_invisible = 0;
+  u32 skipped_alpha_only = 0;
+  u32 dst_alpha_substituted = 0;
+  u32 dst_alpha_masked = 0;
   u32 meshes_created = 0;
   u32 instances_drawn = 0;
   u32 sky_draws = 0;
@@ -135,6 +138,9 @@ struct FrameStats
   // stage 0 samples nothing. Wind Waker's sea is the case this exists for: a
   // register lerp on stage 0 and the water texture on stage 1.
   u32 texture_later_stage = 0;
+  u32 texture_ramp_skipped = 0;
+  u32 texture_envmap_skipped = 0;
+  u32 texture_unused_stage_skipped = 0;
 
   // Draws whose stage-0 texture coordinate went through GX texgen, and how many
   // of those produced something a raw read of attribute 0 would not have. A game
@@ -917,6 +923,12 @@ public:
   // stage 0 consumes it, which is the pre-fix behaviour. On, each half takes the
   // channel named by the stage that actually reads ras.
   bool GxRasChannelEnabled() const { return m_gx_ras_channel; }
+  bool GxRampAlbedoSkipEnabled() const { return m_gx_ramp_albedo_skip; }
+  bool GxLitChannelTexGenEnabled() const { return m_gx_lit_channel_texgen; }
+  bool GxEfbAlphaPassesEnabled() const { return m_gx_efb_alpha_passes; }
+  bool GxPreserveHandednessEnabled() const { return m_gx_preserve_handedness; }
+  bool GxEnvMapAlbedoSkipEnabled() const { return m_gx_envmap_albedo_skip; }
+  bool GxUnusedStageAlbedoSkipEnabled() const { return m_gx_unused_stage_albedo_skip; }
   bool UiRasChannelEnabled() const { return m_ui_ras_channel; }
 
   // False submits world draws the console scissored down to nothing, which is
@@ -987,6 +999,16 @@ public:
   // path can ask "is this mesh classified sky?" BEFORE it picks a material -
   // which it must, because the answer decides whether the material is emissive,
   // and the material then feeds the mesh hash.
+  // Colour texture with the mask's alpha substituted in, cached so the same pair
+  // resolves to one texture every frame. Null when the two disagree on size, or
+  // when the combination cannot be uploaded.
+  //
+  // The mask arrives as BYTES, not as a texture: its producer and its consumer
+  // are different draws, and the texture cache may evict it in between.
+  const RemixTexture* MaskedAlbedo(const RemixTexture& colour,
+                                   const std::vector<u8>& mask_pixels, u32 mask_width,
+                                   u32 mask_height, u64 mask_hash);
+
   static u64 GeometryHash(const std::vector<remixapi_HardcodedVertex>& vertices,
                           const std::vector<u32>& indices);
 
@@ -1626,6 +1648,17 @@ private:
   bool m_gx_alpha_mask = true;
   bool m_gx_light_fix = true;
   bool m_gx_ras_channel = true;
+  bool m_gx_ramp_albedo_skip = true;
+  bool m_gx_lit_channel_texgen = true;
+  bool m_gx_efb_alpha_passes = true;
+  bool m_gx_preserve_handedness = false;
+  bool m_gx_envmap_albedo_skip = true;
+  bool m_gx_unused_stage_albedo_skip = true;
+  // Textures this backend synthesized by combining a colour with a mask. Keyed
+  // on the pair so a mesh does not re-materialise every frame. Released in
+  // Shutdown: these are full decoded images, and without that they would
+  // accumulate for the life of the process and survive into the next game.
+  std::unordered_map<u64, std::unique_ptr<RemixTexture>> m_masked_textures;
   bool m_ui_ras_channel = true;
   bool m_world_scissor_skip = true;
   bool m_trace_colors = false;
@@ -1824,6 +1857,12 @@ private:
   // same argument). Off zeroes the depth fields in every recorded DrawCall, so
   // the rasterizer runs the pure painter's algorithm it always ran.
   bool m_ui_depth = true;
+  // Charge an additive 2D draw's overlay coverage to the light it adds rather
+  // than to its source alpha (RemixUiAdditiveLightCoverage). Per-draw-consumed
+  // like the depth fields, so Live for the same A/B reason: a game blacked out
+  // by a full-screen additive pass is diagnosed by flipping this, not by a
+  // rebuild.
+  bool m_ui_additive_light_coverage = true;
   // The click-to-tag world view (RemixUiWorldView), Live for the same reason:
   // flip on to tag, off to play, no restart.
   bool m_ui_world_view = false;

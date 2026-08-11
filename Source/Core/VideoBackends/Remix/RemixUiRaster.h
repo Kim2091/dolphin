@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -68,6 +69,15 @@ public:
     // content under a stable address), while the content hash is exactly what
     // "same pixels" means. Zero for an untextured draw.
     u64 content_hash = 0;
+    // Bytes actually readable at `pixels`. Carried explicitly rather than
+    // recomputed as width*height*4, so the sampler can verify the buffer really
+    // is as large as the dimensions claim instead of trusting them: a texture
+    // whose buffer is short is treated as untextured rather than over-read.
+    //
+    // Deliberately NOT part of the draw cache's key: `content_hash` is taken
+    // over the buffer that is actually there, so a short buffer already hashes
+    // differently from a full one of the same declared dimensions.
+    size_t pixels_size = 0;
     u32 width = 0;
     u32 height = 0;
     bool bilinear = true;
@@ -153,6 +163,14 @@ public:
     // CompareMode numbering, Never = 0 .. Always = 7, same as the alpha test.
     u8 depth_func = 7;
     bool depth_write = false;
+
+    // Additive draws only. Take the coverage this draw writes into the overlay's
+    // alpha channel from the light it actually adds, rather than from its source
+    // alpha. Additive blending hides nothing on console, so a texel adding black
+    // must stay invisible here too; source alpha is the WEIGHT of the addition,
+    // not a statement about how much of the frame behind it is gone. False is
+    // the old behaviour, kept as a same-build A/B.
+    bool additive_light_coverage = true;
   };
 
   UiRasterizer();
@@ -266,6 +284,37 @@ private:
 
   std::vector<RecordedDraw> m_draws;
   size_t m_draw_count = 0;
+
+  // Texels owned by US, for the frame. A recorded draw is replayed in Flush,
+  // long after Draw returned, but the pixels handed to Draw belong to the
+  // texture cache - which is free to evict that texture, or re-Load it (which
+  // reallocates its buffer), in the meantime. Borrowing the pointer therefore
+  // let a draw read freed memory, which showed up as an access violation inside
+  // Sample. Draw copies the texels here and repoints the recorded call at the
+  // copy, so a replay can only ever read storage this class controls.
+  //
+  // Recycled frame to frame, like m_draws and its vertex vectors: a HUD must not
+  // allocate every frame. Growing the outer vector moves the inner ones, but a
+  // moved std::vector keeps its heap buffer, so pointers already handed out this
+  // frame stay valid.
+  std::vector<std::vector<u8>> m_texels;
+  size_t m_texel_count = 0;
+  // Texture CONTENT hash -> slot in m_texels, so a HUD drawing twenty elements
+  // from one atlas copies it once. Cleared every Begin, so an entry can only be
+  // reused within a single frame.
+  //
+  // Keyed on the hash rather than on the source POINTER, which is not an
+  // identity: within one frame the texture cache can free one texture and
+  // allocate another at the same address, and two same-size neighbours - a pair
+  // of 64x64 icons is 16384 bytes either way - would then share a slot and the
+  // second would draw the first one's pixels. Re-checking the size does not
+  // separate those; the content hash is exactly "same pixels", which is the
+  // only thing that justifies sharing a copy.
+  std::unordered_map<u64, size_t> m_texel_slots;
+  // Draws dropped because the buffer was shorter than width*height*4 claimed.
+  // Reported once per frame rather than per draw - a broken texture is usually
+  // broken on every draw that uses it.
+  u32 m_short_texture_draws = 0;
   // See SetPreWorldFilter. Read by every band worker during a Flush and written
   // only between flushes, so it needs no synchronisation of its own.
   bool m_pre_world_filter = false;
