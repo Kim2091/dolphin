@@ -1,0 +1,35 @@
+Dolphin + RTX Remix — portable test build
+=========================================
+
+Version:      {{VERSION}}
+Built:        {{DATE}}
+
+Emulator
+  Repository: {{DOLPHIN_REPO}}
+  Branch:     {{DOLPHIN_BRANCH}}
+  Commit:     {{DOLPHIN_COMMIT}}
+              "{{DOLPHIN_SUBJECT}}"
+  Binaries:   Dolphin.exe, DolphinNoGUI.exe, DolphinTool.exe, Updater.exe
+
+Remix runtime ({{RUNTIME_DLL_NAME}})
+  Repository: {{RUNTIME_REPO}}
+  Branch:     {{RUNTIME_BRANCH}}
+  Commit:     {{RUNTIME_COMMIT}}
+  Identifies: {{RUNTIME_VERSION_STRING}}
+  Built:      {{RUNTIME_BUILT}}
+  Size:       {{RUNTIME_SIZE}} bytes
+  SHA-256:    {{RUNTIME_SHA256}}
+
+  NOTE: the runtime is named {{RUNTIME_DLL_NAME}}, not d3d9.dll. That is
+  deliberate and it is load-bearing; see README section 2.
+
+This is a fork with its own ABI line. A stock RTX Remix release substituted for
+the runtime will fail at load with INCOMPATIBLE_VERSION. The ABI number alone
+does not identify a build — different forks have shipped the same 0.1000.0 from
+different lineages. The "Identifies" string above is read out of the shipped DLL
+and is the reliable marker; you can confirm it yourself with:
+
+    grep -aoE "remix-[a-zA-Z0-9._/-]*\+[0-9a-f]{7,}" {{RUNTIME_DLL_NAME}}
+
+If you are reporting a bug, quote the Version and Commit above — the DLL/EXE
+file date is not a reliable way to tell builds apart.

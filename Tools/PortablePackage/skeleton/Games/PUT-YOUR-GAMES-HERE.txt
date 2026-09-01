@@ -1,0 +1,2 @@
+Put your own dumped .iso / .rvz / .gcm files in this folder.
+No game content is included with this build.
